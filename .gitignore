@@ -1,0 +1,13 @@
+/target/
+/.env
+/*.db
+/*.db-shm
+/*.db-wal
+/.idea/
+/.vscode/
+
+
+/.backup.lock
+/.migrate.lock
+/backups/
+/secrets/
