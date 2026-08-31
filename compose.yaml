@@ -1,0 +1,65 @@
+name: agentmail
+
+services:
+  agentmail:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms: [linux/amd64]
+    image: ${AGENTMAIL_IMAGE:-agentmail:local}
+    platform: linux/amd64
+    env_file:
+      - ./.env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 18080
+      DATABASE_URL: sqlite:///var/lib/agentmail/agentmail.db
+      LOGIN_CLIENT_SECRET_FILE: /run/secrets/login_client_secret
+      GMAIL_CLIENT_SECRET_FILE: /run/secrets/gmail_client_secret
+      CREDENTIAL_ENCRYPTION_KEYRING_FILE: /run/secrets/credential_encryption_keyring
+      SESSION_CSRF_SECRET_FILE: /run/secrets/session_csrf_secret
+    ports:
+      - "127.0.0.1:${AGENTMAIL_PORT:-18080}:18080"
+    volumes:
+      - agentmail-data:/var/lib/agentmail
+      - ${AGENTMAIL_BACKUP_DIR:-./backups}:/var/backups/agentmail
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    secrets:
+      - source: login_client_secret
+        target: login_client_secret
+        mode: 0400
+      - source: gmail_client_secret
+        target: gmail_client_secret
+        mode: 0400
+      - source: credential_encryption_keyring
+        target: credential_encryption_keyring
+        mode: 0400
+      - source: session_csrf_secret
+        target: session_csrf_secret
+        mode: 0400
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:18080/health/live"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  agentmail-data:
+
+secrets:
+  login_client_secret:
+    file: ./secrets/login_client_secret
+  gmail_client_secret:
+    file: ./secrets/gmail_client_secret
+  credential_encryption_keyring:
+    file: ./secrets/credential_encryption_keyring
+  session_csrf_secret:
+    file: ./secrets/session_csrf_secret

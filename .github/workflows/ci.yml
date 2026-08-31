@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Format, check and test
+        run: |
+          cargo fmt --all -- --check
+          cargo check --all-targets --all-features --locked
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+          cargo test --all-features --locked
+
+      - name: Install cargo-audit and cargo-deny
+        run: |
+          cargo install --locked cargo-audit --version 0.21.1
+          cargo install --locked cargo-deny --version 0.18.3
+
+      - name: Dependency audit and policy
+        run: |
+          cargo audit
+          cargo deny check
+
+      - name: Build amd64 image
+        run: docker build --platform linux/amd64 --tag agentmail:ci .
+
+      - name: Container smoke check
+        run: |
+          test "$(docker image inspect agentmail:ci --format '{{.Architecture}}')" = amd64
+          test "$(docker run --rm --entrypoint /usr/bin/id agentmail:ci --user)" = 'uid=10001(agentmail) gid=10001(agentmail) groups=10001(agentmail)'
+
+      - name: Container vulnerability scan
+        run: |
+          if docker scout version >/dev/null 2>&1; then
+            docker scout cves --exit-code 1 agentmail:ci
+          else
+            echo 'Docker Scout unavailable; configure an approved scanner with a pinned action SHA.' >&2
+            exit 1
+          fi
