@@ -139,6 +139,29 @@ pub struct NewOwnerSession {
     pub absolute_expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
+
+/// Durable invitation metadata. The token field is always a SHA-256 digest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Invitation {
+    pub id: crate::domain::identity::InvitationId,
+    pub target_email: String,
+    pub token_hash: String,
+    pub invited_by: UserId,
+    pub expires_at: DateTime<Utc>,
+    pub accepted_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Hash-only input for creating an invitation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewInvitation {
+    pub id: crate::domain::identity::InvitationId,
+    pub target_email: String,
+    pub token_hash: String,
+    pub invited_by: UserId,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
 pub struct EncryptedRefreshToken(String);
 
 impl EncryptedRefreshToken {
@@ -261,6 +284,142 @@ impl Repository {
             .fetch_optional(&self.pool)
             .await?;
         row.map(user_from_row).transpose()
+    }
+
+    pub async fn create_invitation(
+        &self,
+        invitation: &NewInvitation,
+    ) -> Result<Invitation, RepositoryError> {
+        let target_email = normalize_email(&invitation.target_email)
+            .map_err(|_| RepositoryError::InvalidValue("invalid invitation email".to_owned()))?;
+        validate_token_hash(&invitation.token_hash, "invitation token hash")?;
+        if invitation.expires_at <= invitation.created_at {
+            return Err(RepositoryError::InvalidValue(
+                "invitation expiry must be in the future".to_owned(),
+            ));
+        }
+        let result = sqlx::query("INSERT INTO invitations (id,target_email,token_hash,invited_by,expires_at,created_at) SELECT ?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM users WHERE id=? AND role='owner' AND status='active')")
+            .bind(invitation.id.to_string())
+            .bind(&target_email)
+            .bind(&invitation.token_hash)
+            .bind(invitation.invited_by.to_string())
+            .bind(encode_time(invitation.expires_at))
+            .bind(encode_time(invitation.created_at))
+            .bind(invitation.invited_by.to_string())
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(RepositoryError::InvalidValue(
+                "owner is not active".to_owned(),
+            ));
+        }
+        Ok(Invitation {
+            id: invitation.id,
+            target_email,
+            token_hash: invitation.token_hash.clone(),
+            invited_by: invitation.invited_by,
+            expires_at: invitation.expires_at,
+            accepted_at: None,
+            created_at: invitation.created_at,
+        })
+    }
+
+    pub async fn list_invitations(
+        &self,
+        owner_id: UserId,
+    ) -> Result<Vec<Invitation>, RepositoryError> {
+        let owner: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM users WHERE id=? AND role='owner' AND status='active'",
+        )
+        .bind(owner_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        if owner.is_none() {
+            return Err(RepositoryError::InvalidValue(
+                "owner is not active".to_owned(),
+            ));
+        }
+        let rows = sqlx::query(
+            "SELECT id,target_email,token_hash,invited_by,expires_at,accepted_at,created_at FROM invitations WHERE invited_by=? ORDER BY created_at DESC,id",
+        )
+        .bind(owner_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(invitation_from_row).collect()
+    }
+
+    /// Atomically consume an invitation and create its Member. UPDATE
+    /// RETURNING makes concurrent claims have at most one winner.
+    pub async fn claim_invitation(
+        &self,
+        token_hash: &str,
+        verified_email: &str,
+        google_sub: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<(Invitation, User)>, RepositoryError> {
+        validate_token_hash(token_hash, "invitation token hash")?;
+        let verified_email = normalize_email(verified_email)
+            .map_err(|_| RepositoryError::InvalidValue("invalid verified email".to_owned()))?;
+        if google_sub.trim().is_empty() {
+            return Err(RepositoryError::InvalidValue(
+                "google subject is empty".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("UPDATE invitations SET accepted_at=? WHERE token_hash=? AND target_email=? AND accepted_at IS NULL AND expires_at > ? AND EXISTS (SELECT 1 FROM users WHERE users.id=invitations.invited_by AND users.role='owner' AND users.status='active') RETURNING id,target_email,token_hash,invited_by,expires_at,accepted_at,created_at")
+            .bind(encode_time(now))
+            .bind(token_hash)
+            .bind(&verified_email)
+            .bind(encode_time(now))
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let invitation = invitation_from_row(row)?;
+        let user = User::new(google_sub, &verified_email, UserRole::Member, now)
+            .map_err(|_| RepositoryError::InvalidValue("invalid member identity".to_owned()))?;
+        sqlx::query("INSERT INTO users (id,google_sub,login_email,role,status,last_activity_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)")
+            .bind(user.id.to_string())
+            .bind(&user.google_sub)
+            .bind(&user.email)
+            .bind(user_role(user.role))
+            .bind(user_status(user.status))
+            .bind(user.last_activity_at.map(encode_time))
+            .bind(encode_time(user.created_at))
+            .bind(encode_time(user.updated_at))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some((invitation, user)))
+    }
+
+    /// Revoke an unaccepted invitation. Deletion is the schema's revocation
+    /// representation because invitations have no separate revoked_at field.
+    pub async fn revoke_invitation(
+        &self,
+        owner_id: UserId,
+        invitation_id: crate::domain::identity::InvitationId,
+    ) -> Result<bool, RepositoryError> {
+        let owner: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM users WHERE id=? AND role='owner' AND status='active'",
+        )
+        .bind(owner_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        if owner.is_none() {
+            return Err(RepositoryError::InvalidValue(
+                "owner is not active".to_owned(),
+            ));
+        }
+        let result = sqlx::query(
+            "DELETE FROM invitations WHERE id=? AND invited_by=? AND accepted_at IS NULL",
+        )
+        .bind(invitation_id.to_string())
+        .bind(owner_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Atomically create the sole initial Owner. The conditional INSERT is a
@@ -1011,6 +1170,18 @@ fn web_session_from_row(r: sqlx::sqlite::SqliteRow) -> Result<WebSession, Reposi
         absolute_expires_at: parse_time(r.try_get("absolute_expires_at")?)?,
         created_at: parse_time(r.try_get("created_at")?)?,
         last_seen_at: parse_time(r.try_get("last_seen_at")?)?,
+    })
+}
+
+fn invitation_from_row(r: sqlx::sqlite::SqliteRow) -> Result<Invitation, RepositoryError> {
+    Ok(Invitation {
+        id: crate::domain::identity::InvitationId::from_uuid(parse_uuid(r.try_get("id")?)?),
+        target_email: r.try_get("target_email")?,
+        token_hash: r.try_get("token_hash")?,
+        invited_by: UserId::from_uuid(parse_uuid(r.try_get("invited_by")?)?),
+        expires_at: parse_time(r.try_get("expires_at")?)?,
+        accepted_at: parse_opt_time(r.try_get("accepted_at")?)?,
+        created_at: parse_time(r.try_get("created_at")?)?,
     })
 }
 fn connection_from_row(r: sqlx::sqlite::SqliteRow) -> Result<GmailConnection, RepositoryError> {

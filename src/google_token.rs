@@ -366,7 +366,7 @@ mod tests {
     fn client(endpoint: Url) -> GoogleTokenClient {
         GoogleTokenClient::with_endpoint(
             Client::builder()
-                .timeout(Duration::from_millis(40))
+                .timeout(Duration::from_millis(250))
                 .build()
                 .unwrap(),
             endpoint,
@@ -472,7 +472,7 @@ mod tests {
             None,
             r#"{"access_token":"access","token_type":"Bearer","expires_in":3600}"#,
             &[],
-            Some(Duration::from_millis(100)),
+            Some(Duration::from_millis(500)),
         )
         .await;
         let error = client(endpoint)

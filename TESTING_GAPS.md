@@ -1,12 +1,12 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果见提交记录：Rust 严格 Clippy、69 项领域/配置/数据库/OAuth/repository/治理测试、3 项 HTTP 安全契约测试、5 项 REST/MCP 契约测试，以及隔离 SQLite 的 migrate/status/backup CLI smoke。
+本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果见提交记录：Rust 严格 Clippy、76 项领域/配置/数据库/OAuth/repository/治理测试、3 项 HTTP 安全契约测试、5 项 REST/MCP 契约测试，以及隔离 SQLite 的 migrate/status/backup CLI smoke。
 
 ## A. 尚未实现，因此目前无法执行的测试
 
 ### A1. Google OIDC 登录与邀请制 control plane
 
-- 缺口：state/nonce/PKCE、回调单次消费、claims 语义验证、固定 callback token exchange、原子 Owner+session transaction、hash-only session repository 和 control-plane 应用服务已实现；Google JWKS 签名 verifier、邀请、session cookie/CSRF middleware 与 control plane 页面尚未接入 HTTP。
+- 缺口：state/nonce/PKCE、回调单次消费、claims 语义验证、固定 callback token exchange、原子 Owner+session transaction、hash-only session repository 和 control-plane 应用服务已实现；邀请 token/hash、原子接受/Member 创建与撤销 service 已实现；Google JWKS 签名 verifier、邀请/session cookie/CSRF middleware 与 control plane 页面尚未接入 HTTP。
 - 实现后测试：用 fake OIDC server 覆盖成功、错误 state/nonce、错误 issuer/audience、过期 token、未验证 email、邀请 email 不一致、邀请重放、session idle/absolute expiry 和 CSRF；再用 Dev Project 浏览器登录。
 - 命令目标：`cargo test --test oidc_contract --all-features`。
 - 通过标准：所有失败在创建用户/session 前被拒绝；数据库和日志不出现 authorization code、state、nonce、access token 或 ID token。
@@ -20,7 +20,7 @@
 
 ### A3. 数据库 repository 与 control plane CRUD
 
-- 缺口：SQLite repository 已覆盖 users/connections/access keys/grants/managed drafts/audit/首次授权 ledger；HTTP 已从 repository 认证持久化 key、校验 grant 并列出获授权 Connections，但 control plane CRUD 与完整 transport 持久化装配尚未完成，当前 production `serve` 没有可用 Access Key 管理入口。
+- 缺口：SQLite repository 已覆盖 users/invitations/sessions/connections/access keys/grants/managed drafts/audit/首次授权 ledger；HTTP 已从 repository 认证持久化 key、校验 grant 并列出获授权 Connections，但 control plane CRUD 与完整 transport 持久化装配尚未完成，当前 production `serve` 没有可用 Access Key 管理入口。
 - 实现后测试：临时 SQLite 覆盖 Owner/Member、邀请、Connection、key create/rotate/revoke、grant 变更、账号删除与跨重启恢复。
 - 命令目标：`cargo test --test repository_roundtrip --all-features`。
 - 通过标准：重启后状态不丢失；key/confirmation/session 只存 hash；唯一 Owner、唯一 Gmail sub 与 first-authorization ledger 约束生效。

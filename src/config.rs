@@ -72,6 +72,10 @@ pub struct AppConfig {
     pub database_url: String,
     pub session_secret: SecretString,
     pub csrf_secret: SecretString,
+    pub google_login_client_id: String,
+    pub google_gmail_client_id: String,
+    pub google_login_client_secret: SecretString,
+    pub google_gmail_client_secret: SecretString,
     pub encryption_keyring: Keyring,
 }
 
@@ -85,6 +89,10 @@ impl fmt::Debug for AppConfig {
             .field("database_url", &self.database_url)
             .field("session_secret", &"[REDACTED]")
             .field("csrf_secret", &"[REDACTED]")
+            .field("google_login_client_id", &self.google_login_client_id)
+            .field("google_gmail_client_id", &self.google_gmail_client_id)
+            .field("google_login_client_secret", &"[REDACTED]")
+            .field("google_gmail_client_secret", &"[REDACTED]")
             .field("encryption_keyring", &"[REDACTED]")
             .finish()
     }
@@ -105,16 +113,31 @@ impl AppConfig {
             .parse()?;
         let public_base_url = required(&mut values, "PUBLIC_BASE_URL")
             .and_then(|v| parse_url(v, "PUBLIC_BASE_URL"))?;
-        if environment == Environment::Production && public_base_url.scheme() != "https" {
+        let host = public_base_url.host_str();
+        let local_http = matches!(host, Some("localhost" | "127.0.0.1" | "::1" | "[::1]"));
+        let valid_scheme = public_base_url.scheme() == "https"
+            || (matches!(environment, Environment::Development | Environment::Test)
+                && public_base_url.scheme() == "http"
+                && local_http);
+        if host.is_none() || !valid_scheme {
             return Err(ConfigError::Invalid {
                 field: "PUBLIC_BASE_URL",
-                reason: "production requires an https URL".to_owned(),
+                reason: "must use https with a host, or development/test http localhost".to_owned(),
             });
         }
         if public_base_url.username() != "" || public_base_url.password().is_some() {
             return Err(ConfigError::Invalid {
                 field: "PUBLIC_BASE_URL",
                 reason: "credentials are not allowed".to_owned(),
+            });
+        }
+        if public_base_url.query().is_some()
+            || public_base_url.fragment().is_some()
+            || !matches!(public_base_url.path(), "" | "/")
+        {
+            return Err(ConfigError::Invalid {
+                field: "PUBLIC_BASE_URL",
+                reason: "must not contain a query, fragment, or non-root path".to_owned(),
             });
         }
         let owner_email = required(&mut values, "OWNER_EMAIL")?;
@@ -156,6 +179,20 @@ impl AppConfig {
         let csrf_secret = SecretString::from(csrf_value);
         validate_secret("SESSION_SECRET", &session_secret)?;
         validate_secret("CSRF_SECRET", &csrf_secret)?;
+        let google_login_client_id = required(&mut values, "GOOGLE_LOGIN_CLIENT_ID")?;
+        let google_gmail_client_id = required(&mut values, "GOOGLE_GMAIL_CLIENT_ID")?;
+        let google_login_client_secret = SecretString::from(client_secret_value(
+            &mut values,
+            "LOGIN_CLIENT_SECRET",
+            "LOGIN_CLIENT_SECRET_FILE",
+        )?);
+        let google_gmail_client_secret = SecretString::from(client_secret_value(
+            &mut values,
+            "GMAIL_CLIENT_SECRET",
+            "GMAIL_CLIENT_SECRET_FILE",
+        )?);
+        validate_secret("LOGIN_CLIENT_SECRET", &google_login_client_secret)?;
+        validate_secret("GMAIL_CLIENT_SECRET", &google_gmail_client_secret)?;
         let keyring_value = if values.contains_key("CREDENTIAL_ENCRYPTION_KEYRING")
             || values.contains_key("CREDENTIAL_ENCRYPTION_KEYRING_FILE")
         {
@@ -182,6 +219,10 @@ impl AppConfig {
             database_url,
             session_secret,
             csrf_secret,
+            google_login_client_id,
+            google_gmail_client_id,
+            google_login_client_secret,
+            google_gmail_client_secret,
             encryption_keyring,
         })
     }
@@ -196,6 +237,14 @@ impl AppConfig {
 
     pub fn csrf_secret(&self) -> &[u8] {
         self.csrf_secret.expose_secret().as_bytes()
+    }
+
+    pub fn google_login_callback_url(&self) -> Url {
+        callback_url(&self.public_base_url, "/auth/google/callback")
+    }
+
+    pub fn google_gmail_callback_url(&self) -> Url {
+        callback_url(&self.public_base_url, "/connections/google/callback")
     }
 }
 
@@ -223,6 +272,27 @@ fn secret_value(
         return read_secret_file(Path::new(&path), value_name, MAX_KEYRING_FILE_BYTES, false);
     }
     required(values, value_name)
+}
+
+fn client_secret_value(
+    values: &mut BTreeMap<String, String>,
+    value_name: &'static str,
+    file_name: &'static str,
+) -> Result<String, ConfigError> {
+    let inline = values.remove(value_name);
+    let file = values.remove(file_name);
+    match (inline, file) {
+        (Some(_), Some(_)) => Err(ConfigError::Invalid {
+            field: value_name,
+            reason: format!("cannot be combined with {file_name}"),
+        }),
+        (Some(value), None) if !value.trim().is_empty() => Ok(value),
+        (Some(_), None) => Err(ConfigError::Missing(value_name)),
+        (None, Some(path)) => {
+            read_secret_file(Path::new(&path), value_name, MAX_SECRET_BYTES, false)
+        }
+        (None, None) => Err(ConfigError::Missing(value_name)),
+    }
 }
 
 fn secret_pair(values: &mut BTreeMap<String, String>) -> Result<(String, String), ConfigError> {
@@ -336,6 +406,14 @@ fn parse_url(value: String, field: &'static str) -> Result<Url, ConfigError> {
     })
 }
 
+fn callback_url(base: &Url, path: &str) -> Url {
+    let mut callback = base.clone();
+    callback.set_path(path);
+    callback.set_query(None);
+    callback.set_fragment(None);
+    callback
+}
+
 fn validate_secret(field: &'static str, value: &SecretString) -> Result<(), ConfigError> {
     let length = value.expose_secret().len();
     if length < 32 {
@@ -367,6 +445,16 @@ mod tests {
                 "https://agentmail.example".to_owned(),
             ),
             ("OWNER_EMAIL".to_owned(), "owner@example.com".to_owned()),
+            (
+                "GOOGLE_LOGIN_CLIENT_ID".to_owned(),
+                "login-client-id".to_owned(),
+            ),
+            (
+                "GOOGLE_GMAIL_CLIENT_ID".to_owned(),
+                "gmail-client-id".to_owned(),
+            ),
+            ("LOGIN_CLIENT_SECRET".to_owned(), "l".repeat(32)),
+            ("GMAIL_CLIENT_SECRET".to_owned(), "g".repeat(32)),
             ("SESSION_SECRET".to_owned(), "s".repeat(32)),
             ("CSRF_SECRET".to_owned(), "c".repeat(32)),
             (
@@ -458,6 +546,199 @@ mod tests {
         let config = AppConfig::from_map(map()).unwrap();
         let rendered = format!("{config:?}");
         assert!(!rendered.contains(&"s".repeat(32)));
+        assert!(!rendered.contains(&"l".repeat(32)));
+        assert!(!rendered.contains(&"g".repeat(32)));
+        assert!(rendered.contains("login-client-id"));
         assert_eq!(config.active_encryption_key_version(), 1);
+    }
+
+    #[test]
+    fn google_oauth_configuration_rejects_missing_or_empty_values() {
+        let mut values = map();
+        values.remove("GOOGLE_LOGIN_CLIENT_ID");
+        assert!(matches!(
+            AppConfig::from_map(values),
+            Err(ConfigError::Missing("GOOGLE_LOGIN_CLIENT_ID"))
+        ));
+
+        let mut values = map();
+        values.insert("GMAIL_CLIENT_SECRET".into(), String::new());
+        assert!(matches!(
+            AppConfig::from_map(values),
+            Err(ConfigError::Missing("GMAIL_CLIENT_SECRET"))
+        ));
+    }
+
+    #[test]
+    fn google_client_secret_files_use_size_permission_and_exclusivity_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let login = dir.path().join("login");
+        let gmail = dir.path().join("gmail");
+        std::fs::write(
+            &login,
+            format!(
+                "{}
+",
+                "l".repeat(32)
+            ),
+        )
+        .unwrap();
+        std::fs::write(&gmail, "g".repeat(32)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&login, &gmail] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+
+        let mut values = map();
+        values.remove("LOGIN_CLIENT_SECRET");
+        values.remove("GMAIL_CLIENT_SECRET");
+        values.insert(
+            "LOGIN_CLIENT_SECRET_FILE".into(),
+            login.display().to_string(),
+        );
+        values.insert(
+            "GMAIL_CLIENT_SECRET_FILE".into(),
+            gmail.display().to_string(),
+        );
+        let config = AppConfig::from_map(values).unwrap();
+        assert_eq!(
+            config.google_login_client_secret.expose_secret(),
+            &"l".repeat(32)
+        );
+        assert_eq!(
+            config.google_gmail_client_secret.expose_secret(),
+            &"g".repeat(32)
+        );
+
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "").unwrap();
+        let mut values = map();
+        values.remove("LOGIN_CLIENT_SECRET");
+        values.insert(
+            "LOGIN_CLIENT_SECRET_FILE".into(),
+            empty.display().to_string(),
+        );
+        assert!(matches!(
+            AppConfig::from_map(values),
+            Err(ConfigError::SecretFile {
+                field: "LOGIN_CLIENT_SECRET",
+                reason: "file is empty"
+            })
+        ));
+
+        let oversized = dir.path().join("oversized");
+        std::fs::write(&oversized, vec![b'x'; MAX_SECRET_BYTES + 1]).unwrap();
+        let mut values = map();
+        values.remove("LOGIN_CLIENT_SECRET");
+        values.insert(
+            "LOGIN_CLIENT_SECRET_FILE".into(),
+            oversized.display().to_string(),
+        );
+        assert!(matches!(
+            AppConfig::from_map(values),
+            Err(ConfigError::SecretFile {
+                field: "LOGIN_CLIENT_SECRET",
+                reason: "file is too large"
+            })
+        ));
+
+        let missing = dir.path().join("missing");
+        let mut values = map();
+        values.remove("LOGIN_CLIENT_SECRET");
+        values.insert(
+            "LOGIN_CLIENT_SECRET_FILE".into(),
+            missing.display().to_string(),
+        );
+        assert!(matches!(
+            AppConfig::from_map(values),
+            Err(ConfigError::SecretFile {
+                field: "LOGIN_CLIENT_SECRET",
+                reason: "file is unavailable"
+            })
+        ));
+
+        let mut values = map();
+        values.insert(
+            "LOGIN_CLIENT_SECRET_FILE".into(),
+            login.display().to_string(),
+        );
+        assert!(matches!(
+            AppConfig::from_map(values),
+            Err(ConfigError::Invalid {
+                field: "LOGIN_CLIENT_SECRET",
+                ..
+            })
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let insecure = dir.path().join("insecure");
+            std::fs::write(&insecure, "i".repeat(32)).unwrap();
+            std::fs::set_permissions(&insecure, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let mut values = map();
+            values.remove("LOGIN_CLIENT_SECRET");
+            values.insert(
+                "LOGIN_CLIENT_SECRET_FILE".into(),
+                insecure.display().to_string(),
+            );
+            assert!(matches!(
+                AppConfig::from_map(values),
+                Err(ConfigError::SecretFile {
+                    field: "LOGIN_CLIENT_SECRET",
+                    reason: "file permissions must not grant group or other access"
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn callback_urls_are_fixed_and_base_url_is_unambiguous() {
+        let config = AppConfig::from_map(map()).unwrap();
+        assert_eq!(
+            config.google_login_callback_url().as_str(),
+            "https://agentmail.example/auth/google/callback"
+        );
+        assert_eq!(
+            config.google_gmail_callback_url().as_str(),
+            "https://agentmail.example/connections/google/callback"
+        );
+
+        let mut development = map();
+        development.insert("APP_ENV".into(), "development".into());
+        development.insert("PUBLIC_BASE_URL".into(), "http://localhost:3000".into());
+        assert!(AppConfig::from_map(development).is_ok());
+
+        for base in ["http://remote.example", "file:///", "https:///"] {
+            let mut values = map();
+            values.insert("APP_ENV".into(), "development".into());
+            values.insert("PUBLIC_BASE_URL".into(), base.to_owned());
+            assert!(matches!(
+                AppConfig::from_map(values),
+                Err(ConfigError::Invalid {
+                    field: "PUBLIC_BASE_URL",
+                    ..
+                })
+            ));
+        }
+
+        for base in [
+            "https://agentmail.example/?next=evil",
+            "https://agentmail.example/base",
+            "https://agentmail.example/#fragment",
+        ] {
+            let mut values = map();
+            values.insert("PUBLIC_BASE_URL".into(), base.to_owned());
+            assert!(matches!(
+                AppConfig::from_map(values),
+                Err(ConfigError::Invalid {
+                    field: "PUBLIC_BASE_URL",
+                    ..
+                })
+            ));
+        }
     }
 }

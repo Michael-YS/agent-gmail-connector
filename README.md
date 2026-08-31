@@ -1,6 +1,6 @@
 # AgentMail
 
-AgentMail 是一个面向 agent 的 Gmail 安全访问层。当前仓库已经实现 Rust/Axum 服务骨架、SQLite schema 与显式迁移、secret 文件加载、refresh token 信封加密、Access Key/grant 领域模型、OAuth/OIDC 的 state/nonce/PKCE 与 claims 语义核心、固定 callback 的 Google token exchange/refresh client、原子 Owner bootstrap 与 hash-only web session/control-plane 应用服务、SQLite repository、限流/无内容审计数据模型、共享 mailbox 读取服务、带响应上限和 MIME 安全处理的 Gmail 只读 HTTP client、REST 消息搜索 OpenAPI、最小 MCP JSON-RPC 搜索工具、managed draft 与两阶段发送状态机、fake Gmail adapter、健康检查，以及容器/迁移工件。
+AgentMail 是一个面向 agent 的 Gmail 安全访问层。当前仓库已经实现 Rust/Axum 服务骨架、SQLite schema 与显式迁移、secret 文件加载、refresh token 信封加密、Access Key/grant 领域模型、OAuth/OIDC 的 state/nonce/PKCE 与 claims 语义核心、固定 callback 的 Google token exchange/refresh client、原子 Owner bootstrap、hash-only web session/control-plane 应用服务、一次性邀请制与 Google 双 client 安全配置、SQLite repository、限流/无内容审计数据模型、共享 mailbox 读取服务、带响应上限和 MIME 安全处理的 Gmail 只读 HTTP client、REST 消息搜索 OpenAPI、最小 MCP JSON-RPC 搜索工具、managed draft 与两阶段发送状态机、fake Gmail adapter、健康检查，以及容器/迁移工件。
 
 重要：当前版本仍不是可投入生产的完整 v1。Google JWKS 签名 adapter 与 HTTP callback、真实 Gmail credential/adapter 装配、control plane HTTP CRUD、完整 MCP Streamable HTTP/rmcp、MIME 附件和发布供应链尚未实现或尚未完成真实环境验证；详见 [TESTING_GAPS.md](TESTING_GAPS.md)。当前 `serve` 使用 SQLite repository 处理已持久化的机器凭据和授权，但仍使用 fake Gmail adapter，也没有可用的 control plane 管理入口，不能连接真实 Gmail。不要把本仓库当前提交部署为真实邮件服务。
 

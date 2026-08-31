@@ -8,6 +8,7 @@ pub mod google_gmail;
 pub mod google_token;
 pub mod governance;
 pub mod http;
+pub mod invitations;
 pub mod mailbox_service;
 pub mod oauth;
 pub mod repository;
