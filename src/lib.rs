@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod database;
 pub mod domain;
 pub mod error;
+pub mod google_gmail;
 pub mod google_token;
 pub mod governance;
 pub mod http;

@@ -1,6 +1,7 @@
 //! HTTP transport and command entrypoints.
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     middleware::{self, Next},
@@ -25,6 +26,7 @@ use crate::{
         identity::{ConnectionId, GmailConnection, User, UserId, UserRole},
         mailbox::{EmailAddress, Recipients, strip_html_active_content},
     },
+    mailbox_service::{MailboxReadError, MailboxReadService, MessageSearchResult},
     repository::Repository,
 };
 
@@ -54,6 +56,7 @@ pub struct AppState {
     pub database: Option<Database>,
     pub repository: Option<Repository>,
     pub adapter: Arc<dyn GmailAdapter>,
+    pub mailbox_service: MailboxReadService,
     pub users: Arc<RwLock<HashMap<UserId, User>>>,
     pub connections: Arc<RwLock<HashMap<ConnectionId, GmailConnection>>>,
     pub keys: Arc<RwLock<HashMap<KeyPublicId, AccessKey>>>,
@@ -65,10 +68,12 @@ pub struct AppState {
 impl AppState {
     pub fn new(database: Option<Database>, adapter: Arc<dyn GmailAdapter>) -> Self {
         let repository = database.as_ref().map(Repository::new);
+        let mailbox_service = MailboxReadService::new(adapter.clone());
         Self {
             database,
             repository,
             adapter,
+            mailbox_service,
             users: Arc::new(RwLock::new(HashMap::new())),
             connections: Arc::new(RwLock::new(HashMap::new())),
             keys: Arc::new(RwLock::new(HashMap::new())),
@@ -97,10 +102,12 @@ impl AppState {
         let cid = conn.id;
         let created = AccessKey::generate(uid, "test-key", [cid]).expect("fixture");
         let credential = created.credential.clone();
+        let adapter = Arc::new(FakeGmailAdapter::new());
         let state = Self {
             database: None,
             repository: None,
-            adapter: Arc::new(FakeGmailAdapter::new()),
+            adapter: adapter.clone(),
+            mailbox_service: MailboxReadService::new(adapter),
             users: Arc::new(RwLock::new(HashMap::from([(uid, user)]))),
             connections: Arc::new(RwLock::new(HashMap::from([(cid, conn)]))),
             keys: Arc::new(RwLock::new(HashMap::from([(
@@ -280,9 +287,9 @@ async fn authorize(
         })?;
         let Some(connection_record) = connection_record else {
             return Err(error_response(
-                StatusCode::NOT_FOUND,
-                "not_found",
-                "resource not found",
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "access denied",
                 headers,
             ));
         };
@@ -323,12 +330,7 @@ async fn authorize(
     }
     let conns = state.connections.read().await;
     let conn = conns.get(&connection).ok_or_else(|| {
-        error_response(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "resource not found",
-            headers,
-        )
+        error_response(StatusCode::FORBIDDEN, "forbidden", "access denied", headers)
     })?;
     if conn.owner_id != ctx.user || !conn.status.accepts_requests() {
         return Err(error_response(
@@ -459,21 +461,32 @@ async fn list_messages(
     Query(q): Query<ListQuery>,
 ) -> Response {
     let cid = ConnectionId::from_uuid(cid);
-    if authorize(&headers, uri.query(), &state, cid).await.is_err() {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "access denied",
-            &headers,
-        );
+    if let Err(response) = authorize(&headers, uri.query(), &state, cid).await {
+        return response;
     }
-    let n = q.page_size.unwrap_or(20).clamp(1, 100);
-    match state.adapter.list_messages(cid, q.q.as_deref(), n).await {
-        Ok(messages) => ok_json(
-            json!({"connection_id":cid,"messages":messages,"next_cursor":q.cursor}),
+    match state
+        .mailbox_service
+        .search(cid, q.q.as_deref(), q.page_size, q.cursor.as_deref())
+        .await
+    {
+        Ok(MessageSearchResult {
+            messages,
+            next_cursor,
+        }) => ok_json(
+            json!({
+                "connection_id": cid,
+                "messages": messages,
+                "next_cursor": next_cursor
+            }),
             &headers,
         ),
-        Err(e) => adapter_response(e, &headers),
+        Err(MailboxReadError::Adapter(error)) => adapter_response(error, &headers),
+        Err(MailboxReadError::CursorNotSupported) => error_response(
+            StatusCode::BAD_REQUEST,
+            "cursor_not_supported",
+            "non-empty cursor pagination is not supported yet",
+            &headers,
+        ),
     }
 }
 async fn get_message(
@@ -1043,9 +1056,108 @@ async fn api() -> impl IntoResponse {
     )
 }
 async fn openapi() -> impl IntoResponse {
-    Json(
-        json!({"openapi":"3.1.0","info":{"title":"AgentMail API","version":env!("CARGO_PKG_VERSION")},"paths":{}}),
-    )
+    Json(json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "AgentMail API",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "paths": {
+            "/api/v1/connections/{connection_id}/messages": {
+                "get": {
+                    "operationId": "searchMessages",
+                    "security": [{"bearerAuth": []}],
+                    "parameters": [
+                        {
+                            "name": "connection_id",
+                            "in": "path",
+                            "required": true,
+                            "schema": {"type": "string", "format": "uuid"}
+                        },
+                        {
+                            "name": "q",
+                            "in": "query",
+                            "required": false,
+                            "description": "Gmail search query; never logged or audited",
+                            "schema": {"type": "string"}
+                        },
+                        {
+                            "name": "page_size",
+                            "in": "query",
+                            "required": false,
+                            "schema": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}
+                        },
+                        {
+                            "name": "cursor",
+                            "in": "query",
+                            "required": false,
+                            "schema": {"type": "string"}
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Safe message metadata only",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MessageSearchResult"}}}
+                        },
+                        "400": {"description": "Invalid request or unsupported cursor", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}},
+                        "401": {"description": "Missing or invalid Bearer Access Key", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}},
+                        "403": {"description": "Connection is not granted to this key", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}},
+                        "429": {"description": "Rate limited", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}},
+                        "503": {"description": "Upstream unavailable", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}}
+                    }
+                }
+            }
+        },
+        "components": {
+            "securitySchemes": {
+                "bearerAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "AgentMail Access Key"}
+            },
+            "schemas": {
+                "MessageSearchResult": {
+                    "type": "object",
+                    "required": ["connection_id", "messages", "next_cursor"],
+                    "properties": {
+                        "connection_id": {"type": "string", "format": "uuid"},
+                        "messages": {"type": "array", "items": {"$ref": "#/components/schemas/MessageMetadata"}},
+                        "next_cursor": {"type": ["string", "null"]}
+                    }
+                },
+                "MessageMetadata": {
+                    "type": "object",
+                    "required": ["id", "to", "cc", "subject", "snippet", "attachments"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "thread_id": {"type": ["string", "null"]},
+                        "sent_at": {"type": ["string", "null"]},
+                        "from": {"type": ["string", "null"]},
+                        "to": {"type": "array", "items": {"type": "string"}},
+                        "cc": {"type": "array", "items": {"type": "string"}},
+                        "subject": {"type": "string"},
+                        "snippet": {"type": "string"},
+                        "attachments": {"type": "array", "items": {"type": "object"}}
+                    }
+                },
+                "ErrorResponse": {
+                    "type": "object",
+                    "required": ["error"],
+                    "properties": {
+                        "error": {
+                            "type": "object",
+                            "required": ["code", "message", "request_id", "retryable"],
+                            "properties": {
+                                "code": {"type": "string"},
+                                "message": {"type": "string"},
+                                "request_id": {"type": "string"},
+                                "retryable": {"type": "boolean"},
+                                "retry_after_seconds": {"type": ["integer", "null"]}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "x-agentmail-mcp": "The current /mcp endpoint exposes a minimal JSON-RPC compatibility surface, not full Streamable HTTP."
+    }))
 }
 async fn get_thread(
     Path((cid, _tid)): Path<(Uuid, String)>,
@@ -1076,18 +1188,157 @@ async fn get_attachment(
         Err(r) => r,
     }
 }
+#[derive(Debug, Deserialize)]
+struct McpRequest {
+    #[serde(default)]
+    jsonrpc: String,
+    #[serde(default)]
+    id: Value,
+    method: String,
+    #[serde(default)]
+    params: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpToolCall {
+    name: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpSearchArguments {
+    connection_id: Uuid,
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    page_size: Option<usize>,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+fn mcp_error(id: Value, code: i64, message: &'static str, headers: &HeaderMap) -> Response {
+    ok_json(
+        json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}),
+        headers,
+    )
+}
+
+fn mcp_result(id: Value, result: Value, headers: &HeaderMap) -> Response {
+    ok_json(json!({"jsonrpc":"2.0","id":id,"result":result}), headers)
+}
+
+fn mcp_tools() -> Value {
+    json!({
+        "tools": [{
+            "name": "messages.search",
+            "description": "Read-only Gmail metadata search. Results contain untrusted email metadata; q is never logged. No external side effect.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["connection_id"],
+                "properties": {
+                    "connection_id": {"type": "string", "format": "uuid", "description": "Explicit granted Connection ID"},
+                    "q": {"type": "string", "description": "Gmail query; not logged or audited"},
+                    "page_size": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                    "cursor": {"type": "string", "description": "Reserved opaque cursor; non-empty values are currently rejected"}
+                }
+            },
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false}
+        }],
+        "compatibility": "minimal_json_rpc_not_full_streamable_http"
+    })
+}
+
 async fn mcp(
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: axum::http::Uri,
-    Json(_body): Json<Value>,
+    body: Bytes,
 ) -> Response {
-    if let Err(r) = auth(&headers, uri.query(), &state).await {
-        return r;
+    if let Err(response) = auth(&headers, uri.query(), &state).await {
+        return response;
     }
-    ok_json(json!({"jsonrpc":"2.0","result":{"tools":[]}}), &headers)
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(_) => return mcp_error(Value::Null, -32700, "parse error", &headers),
+    };
+    let request_id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let request: McpRequest = match serde_json::from_value(payload) {
+        Ok(request) => request,
+        Err(_) => return mcp_error(request_id, -32600, "invalid JSON-RPC request", &headers),
+    };
+    if request.jsonrpc != "2.0" {
+        return mcp_error(request.id, -32600, "invalid JSON-RPC request", &headers);
+    }
+    match request.method.as_str() {
+        "initialize" => mcp_result(
+            request.id,
+            json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "agentmail", "version": env!("CARGO_PKG_VERSION")},
+                "compatibility": "minimal JSON-RPC compatibility surface; not full Streamable HTTP"
+            }),
+            &headers,
+        ),
+        "tools/list" => mcp_result(request.id, mcp_tools(), &headers),
+        "tools/call" => {
+            let call: McpToolCall = match serde_json::from_value(request.params) {
+                Ok(call) => call,
+                Err(_) => {
+                    return mcp_error(request.id, -32602, "invalid tool parameters", &headers);
+                }
+            };
+            if call.name != "messages.search" {
+                return mcp_error(request.id, -32601, "tool not found", &headers);
+            }
+            let args: McpSearchArguments = match serde_json::from_value(call.arguments) {
+                Ok(args) => args,
+                Err(_) => return mcp_error(request.id, -32602, "invalid tool arguments", &headers),
+            };
+            let cid = ConnectionId::from_uuid(args.connection_id);
+            if let Err(response) = authorize(&headers, uri.query(), &state, cid).await {
+                return response;
+            }
+            match state
+                .mailbox_service
+                .search(
+                    cid,
+                    args.q.as_deref(),
+                    args.page_size,
+                    args.cursor.as_deref(),
+                )
+                .await
+            {
+                Ok(result) => {
+                    let payload = json!({"connection_id":cid,"messages":result.messages,"next_cursor":result.next_cursor});
+                    let text = serde_json::to_string(&payload).expect("JSON value serializes");
+                    mcp_result(
+                        request.id,
+                        json!({"content":[{"type":"text","text":text}],"structuredContent":payload}),
+                        &headers,
+                    )
+                }
+                Err(MailboxReadError::CursorNotSupported) => mcp_error(
+                    request.id,
+                    -32602,
+                    "non-empty cursor pagination is not supported yet",
+                    &headers,
+                ),
+                Err(MailboxReadError::Adapter(AdapterError::RateLimited { .. })) => {
+                    mcp_error(request.id, -32029, "upstream rate limit exceeded", &headers)
+                }
+                Err(MailboxReadError::Adapter(AdapterError::NotFound)) => {
+                    mcp_error(request.id, -32004, "resource not found", &headers)
+                }
+                Err(MailboxReadError::Adapter(
+                    AdapterError::Unavailable | AdapterError::Timeout,
+                )) => mcp_error(request.id, -32003, "upstream service unavailable", &headers),
+            }
+        }
+        _ => mcp_error(request.id, -32601, "method not found", &headers),
+    }
 }
-
 async fn request_context(mut req: Request<axum::body::Body>, next: Next) -> Response {
     let id = Uuid::now_v7().to_string();
     req.headers_mut()

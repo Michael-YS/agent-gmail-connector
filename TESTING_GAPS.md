@@ -1,19 +1,19 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果见提交记录：Rust 严格 Clippy、64 项领域/配置/数据库/OAuth/repository/治理测试、3 项 HTTP 安全契约测试，以及隔离 SQLite 的 migrate/status/backup CLI smoke。
+本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果见提交记录：Rust 严格 Clippy、69 项领域/配置/数据库/OAuth/repository/治理测试、3 项 HTTP 安全契约测试、5 项 REST/MCP 契约测试，以及隔离 SQLite 的 migrate/status/backup CLI smoke。
 
 ## A. 尚未实现，因此目前无法执行的测试
 
 ### A1. Google OIDC 登录与邀请制 control plane
 
-- 缺口：state/nonce/PKCE、回调单次消费、claims 语义验证、固定 callback token exchange、原子 Owner bootstrap 和 hash-only session repository 已实现；Google JWKS 签名 verifier、邀请、session cookie/CSRF middleware 与 control plane 页面尚未接入 HTTP。
+- 缺口：state/nonce/PKCE、回调单次消费、claims 语义验证、固定 callback token exchange、原子 Owner+session transaction、hash-only session repository 和 control-plane 应用服务已实现；Google JWKS 签名 verifier、邀请、session cookie/CSRF middleware 与 control plane 页面尚未接入 HTTP。
 - 实现后测试：用 fake OIDC server 覆盖成功、错误 state/nonce、错误 issuer/audience、过期 token、未验证 email、邀请 email 不一致、邀请重放、session idle/absolute expiry 和 CSRF；再用 Dev Project 浏览器登录。
 - 命令目标：`cargo test --test oidc_contract --all-features`。
 - 通过标准：所有失败在创建用户/session 前被拒绝；数据库和日志不出现 authorization code、state、nonce、access token 或 ID token。
 
 ### A2. Gmail OAuth Connection 与真实 Google adapter
 
-- 缺口：offline consent URL、granted-scope 完整性和带超时/稳定错误的 refresh client 已实现；Connection callback 装配、refresh token 生命周期、reauthorize/revoke 与真实 Gmail REST adapter 尚未实现，当前 server 使用 `FakeGmailAdapter`。
+- 缺口：offline consent URL、granted-scope 完整性和带超时/稳定错误的 refresh client 已实现；带 8 MiB 响应上限、稳定错误、MIME plain-first/HTML 清理的 Gmail 消息搜索/读取 client 已实现；Connection callback、refresh token 生命周期、reauthorize/revoke、credential provider 和 `GmailAdapter` 装配尚未实现，当前 server 仍使用 `FakeGmailAdapter`。
 - 实现后测试：fake Google server 覆盖部分授权、refresh、invalid_grant、429/5xx/Retry-After、timeout、revoke；Dev 账号完成连接、搜索、读取、线程和附件流。
 - 命令目标：`cargo test --test gmail_adapter --all-features`，以及人工 `scripts/smoke-gmail.sh --prepare-only`。
 - 通过标准：缺少 `gmail.readonly` 或 `gmail.compose` 不创建 Connection；refresh token 仅以 XChaCha20-Poly1305 envelope 入库；查询和邮件内容不进日志。
@@ -34,7 +34,7 @@
 
 ### A5. 完整 REST OpenAPI 与 rmcp schema
 
-- 缺口：`/api/openapi.json` 的 paths 仍为空，`/mcp` 仅返回空 tools；尚未集成 rmcp Streamable HTTP 和 snapshot。
+- 缺口：OpenAPI 已描述消息搜索且 REST/MCP 复用认证、grant 与 `MailboxReadService`，最小 JSON-RPC 已实现 `messages.search`；其余 REST paths/tools、rmcp Streamable HTTP、session lifecycle 与 schema snapshot 尚未实现。
 - 实现后测试：导出 OpenAPI/MCP schema，运行 snapshot 与真实 MCP client；比较 HTTP/MCP 的领域字段和错误码。
 - 命令目标：`cargo test --test transport_contract --all-features`，`cargo test --test mcp_schema --all-features`。
 - 通过标准：tools 标明邮件内容不可信和发送需用户许可；MCP 与 REST 共享认证、grant、状态机和审计逻辑。

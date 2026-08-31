@@ -124,6 +124,21 @@ pub struct NewWebSession {
     pub absolute_expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
+
+/// Atomic Owner bootstrap/login input. Session credentials are already
+/// digests; plaintext values never cross the repository boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewOwnerSession {
+    pub expected_owner_email: String,
+    pub google_sub: String,
+    pub verified_email: String,
+    pub session_id: SessionId,
+    pub token_hash: String,
+    pub csrf_token_hash: String,
+    pub idle_expires_at: DateTime<Utc>,
+    pub absolute_expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
 pub struct EncryptedRefreshToken(String);
 
 impl EncryptedRefreshToken {
@@ -292,6 +307,113 @@ impl Repository {
             return Err(RepositoryError::Conflict);
         }
         Ok(user)
+    }
+
+    /// Atomically bootstrap or re-authenticate the sole Owner and create a
+    /// session. Any session insert failure rolls back a newly inserted user.
+    pub async fn bootstrap_owner_with_session(
+        &self,
+        request: &NewOwnerSession,
+    ) -> Result<(User, WebSession), RepositoryError> {
+        let expected_owner_email = normalize_email(&request.expected_owner_email)
+            .map_err(|_| RepositoryError::InvalidValue("invalid owner email".to_owned()))?;
+        let verified_email = normalize_email(&request.verified_email)
+            .map_err(|_| RepositoryError::InvalidValue("invalid verified email".to_owned()))?;
+        if expected_owner_email != verified_email {
+            return Err(RepositoryError::InvalidValue(
+                "owner email mismatch".to_owned(),
+            ));
+        }
+        if request.google_sub.trim().is_empty() {
+            return Err(RepositoryError::InvalidValue(
+                "google subject is empty".to_owned(),
+            ));
+        }
+        validate_token_hash(&request.token_hash, "session token hash")?;
+        validate_token_hash(&request.csrf_token_hash, "CSRF token hash")?;
+        if request.idle_expires_at <= request.created_at
+            || request.absolute_expires_at <= request.created_at
+        {
+            return Err(RepositoryError::InvalidValue(
+                "session expiry must be in the future".to_owned(),
+            ));
+        }
+
+        let mut candidate = User::new(
+            &request.google_sub,
+            &verified_email,
+            UserRole::Owner,
+            request.created_at,
+        )
+        .map_err(|_| RepositoryError::InvalidValue("invalid owner identity".to_owned()))?;
+        candidate.touch(request.created_at);
+        let mut tx = self.pool.begin().await?;
+
+        let inserted = sqlx::query(
+            "INSERT INTO users (id,google_sub,login_email,role,status,last_activity_at,created_at,updated_at) SELECT ?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM users WHERE role='owner')",
+        )
+        .bind(candidate.id.to_string())
+        .bind(&candidate.google_sub)
+        .bind(&candidate.email)
+        .bind(user_role(candidate.role))
+        .bind(user_status(candidate.status))
+        .bind(candidate.last_activity_at.map(encode_time))
+        .bind(encode_time(candidate.created_at))
+        .bind(encode_time(candidate.updated_at))
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+
+        let user = if inserted {
+            candidate
+        } else {
+            let row = sqlx::query(
+                "SELECT id,google_sub,login_email,role,status,last_activity_at,created_at,updated_at FROM users WHERE role='owner' LIMIT 1",
+            )
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(RepositoryError::Conflict)?;
+            let owner = user_from_row(row)?;
+            if owner.google_sub != request.google_sub
+                || owner.email != verified_email
+                || owner.role != UserRole::Owner
+                || owner.status != UserStatus::Active
+            {
+                return Err(RepositoryError::InvalidValue(
+                    "owner identity mismatch".to_owned(),
+                ));
+            }
+            owner
+        };
+
+        let id = request.session_id.to_string();
+        sqlx::query("INSERT INTO web_sessions (id,token_hash,user_id,csrf_token_hash,idle_expires_at,absolute_expires_at,created_at,last_seen_at) VALUES (?,?,?,?,?,?,?,?)")
+            .bind(&id)
+            .bind(&request.token_hash)
+            .bind(user.id.to_string())
+            .bind(&request.csrf_token_hash)
+            .bind(encode_time(request.idle_expires_at))
+            .bind(encode_time(request.absolute_expires_at))
+            .bind(encode_time(request.created_at))
+            .bind(encode_time(request.created_at))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        let user_id = user.id;
+        Ok((
+            user,
+            WebSession {
+                id: request.session_id,
+                user_id,
+                token_hash: request.token_hash.clone(),
+                csrf_token_hash: request.csrf_token_hash.clone(),
+                idle_expires_at: request.idle_expires_at,
+                absolute_expires_at: request.absolute_expires_at,
+                created_at: request.created_at,
+                last_seen_at: request.created_at,
+            },
+        ))
     }
 
     pub async fn insert_web_session(
@@ -1095,6 +1217,81 @@ mod tests {
         assert_eq!(owners, 1);
     }
 
+    #[tokio::test]
+    async fn owner_and_first_session_are_atomic_and_returning_login_is_allowed() {
+        let repository = repository().await;
+        let now = Utc::now();
+        let member = User::new("member-sub", "member@example.com", UserRole::Member, now).unwrap();
+        repository.insert_user(&member).await.unwrap();
+        let duplicate_session_id = SessionId::new();
+        repository
+            .insert_web_session(&NewWebSession {
+                id: duplicate_session_id,
+                user_id: member.id,
+                token_hash: hash_token("existing-session"),
+                csrf_token_hash: hash_token("existing-csrf"),
+                idle_expires_at: now + Duration::minutes(10),
+                absolute_expires_at: now + Duration::hours(1),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+
+        let failed = repository
+            .bootstrap_owner_with_session(&NewOwnerSession {
+                expected_owner_email: "owner@example.com".to_owned(),
+                google_sub: "owner-sub".to_owned(),
+                verified_email: "owner@example.com".to_owned(),
+                session_id: duplicate_session_id,
+                token_hash: hash_token("failed-session"),
+                csrf_token_hash: hash_token("failed-csrf"),
+                idle_expires_at: now + Duration::minutes(10),
+                absolute_expires_at: now + Duration::hours(1),
+                created_at: now,
+            })
+            .await;
+        assert!(failed.is_err());
+        let owner_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role='owner'")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(owner_count, 0);
+
+        let first = repository
+            .bootstrap_owner_with_session(&NewOwnerSession {
+                expected_owner_email: "owner@example.com".to_owned(),
+                google_sub: "owner-sub".to_owned(),
+                verified_email: "owner@example.com".to_owned(),
+                session_id: SessionId::new(),
+                token_hash: hash_token("owner-session-one"),
+                csrf_token_hash: hash_token("owner-csrf-one"),
+                idle_expires_at: now + Duration::minutes(10),
+                absolute_expires_at: now + Duration::hours(1),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        let returning = repository
+            .bootstrap_owner_with_session(&NewOwnerSession {
+                expected_owner_email: "owner@example.com".to_owned(),
+                google_sub: "owner-sub".to_owned(),
+                verified_email: "OWNER@example.com".to_owned(),
+                session_id: SessionId::new(),
+                token_hash: hash_token("owner-session-two"),
+                csrf_token_hash: hash_token("owner-csrf-two"),
+                idle_expires_at: now + Duration::minutes(10),
+                absolute_expires_at: now + Duration::hours(1),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.0.id, returning.0.id);
+        let owner_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role='owner'")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(owner_count, 1);
+    }
     #[tokio::test]
     async fn web_sessions_are_hash_only_expire_and_follow_user_status() {
         let repository = repository().await;
