@@ -9,7 +9,8 @@ use crate::{
         },
         delivery::{DraftId, DraftVersion, ManagedDraft, ManagedDraftState},
         identity::{
-            ConnectionId, ConnectionStatus, GmailConnection, User, UserId, UserRole, UserStatus,
+            ConnectionId, ConnectionStatus, GmailConnection, SessionId, User, UserId, UserRole,
+            UserStatus, normalize_email,
         },
     },
     governance::AuditEvent,
@@ -95,6 +96,33 @@ pub struct OAuthTransactionClaim {
     pub target_connection: Option<ConnectionId>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+}
+
+/// Durable browser session metadata. Both bearer values are already one-way
+/// digests; plaintext session/CSRF values never cross this boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WebSession {
+    pub id: SessionId,
+    pub user_id: UserId,
+    pub token_hash: String,
+    pub csrf_token_hash: String,
+    pub idle_expires_at: DateTime<Utc>,
+    pub absolute_expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+}
+
+/// Input for a new browser session. Token fields must contain SHA-256
+/// digests, never the plaintext values sent to a browser.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewWebSession {
+    pub id: SessionId,
+    pub user_id: UserId,
+    pub token_hash: String,
+    pub csrf_token_hash: String,
+    pub idle_expires_at: DateTime<Utc>,
+    pub absolute_expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
 }
 pub struct EncryptedRefreshToken(String);
 
@@ -210,6 +238,149 @@ impl Repository {
         let row = sqlx::query("SELECT id,google_sub,login_email,role,status,last_activity_at,created_at,updated_at FROM users WHERE google_sub=?").bind(sub).fetch_optional(&self.pool).await?;
         row.map(user_from_row).transpose()
     }
+    pub async fn find_user_by_email(&self, email: &str) -> Result<Option<User>, RepositoryError> {
+        let email = normalize_email(email)
+            .map_err(|_| RepositoryError::InvalidValue("invalid email".to_owned()))?;
+        let row = sqlx::query("SELECT id,google_sub,login_email,role,status,last_activity_at,created_at,updated_at FROM users WHERE login_email=?")
+            .bind(email)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(user_from_row).transpose()
+    }
+
+    /// Atomically create the sole initial Owner. The conditional INSERT is a
+    /// single SQLite write, so concurrent bootstrap attempts have one winner.
+    pub async fn bootstrap_owner(
+        &self,
+        expected_owner_email: &str,
+        google_sub: &str,
+        verified_email: &str,
+        now: DateTime<Utc>,
+    ) -> Result<User, RepositoryError> {
+        let expected_owner_email = normalize_email(expected_owner_email)
+            .map_err(|_| RepositoryError::InvalidValue("invalid owner email".to_owned()))?;
+        let verified_email = normalize_email(verified_email)
+            .map_err(|_| RepositoryError::InvalidValue("invalid verified email".to_owned()))?;
+        if expected_owner_email != verified_email {
+            return Err(RepositoryError::InvalidValue(
+                "owner email mismatch".to_owned(),
+            ));
+        }
+        if google_sub.trim().is_empty() {
+            return Err(RepositoryError::InvalidValue(
+                "google subject is empty".to_owned(),
+            ));
+        }
+
+        let mut user = User::new(google_sub, &verified_email, UserRole::Owner, now)
+            .map_err(|_| RepositoryError::InvalidValue("invalid owner identity".to_owned()))?;
+        user.touch(now);
+        let result = sqlx::query(
+            "INSERT INTO users (id,google_sub,login_email,role,status,last_activity_at,created_at,updated_at) SELECT ?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM users WHERE role='owner')",
+        )
+        .bind(user.id.to_string())
+        .bind(&user.google_sub)
+        .bind(&user.email)
+        .bind(user_role(user.role))
+        .bind(user_status(user.status))
+        .bind(user.last_activity_at.map(encode_time))
+        .bind(encode_time(user.created_at))
+        .bind(encode_time(user.updated_at))
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(RepositoryError::Conflict);
+        }
+        Ok(user)
+    }
+
+    pub async fn insert_web_session(
+        &self,
+        session: &NewWebSession,
+    ) -> Result<WebSession, RepositoryError> {
+        validate_token_hash(&session.token_hash, "session token hash")?;
+        validate_token_hash(&session.csrf_token_hash, "CSRF token hash")?;
+        if session.idle_expires_at <= session.created_at
+            || session.absolute_expires_at <= session.created_at
+        {
+            return Err(RepositoryError::InvalidValue(
+                "session expiry must be in the future".to_owned(),
+            ));
+        }
+        sqlx::query("INSERT INTO web_sessions (id,token_hash,user_id,csrf_token_hash,idle_expires_at,absolute_expires_at,created_at,last_seen_at) VALUES (?,?,?,?,?,?,?,?)")
+            .bind(session.id.to_string())
+            .bind(&session.token_hash)
+            .bind(session.user_id.to_string())
+            .bind(&session.csrf_token_hash)
+            .bind(encode_time(session.idle_expires_at))
+            .bind(encode_time(session.absolute_expires_at))
+            .bind(encode_time(session.created_at))
+            .bind(encode_time(session.created_at))
+            .execute(&self.pool)
+            .await?;
+        Ok(WebSession {
+            id: session.id,
+            user_id: session.user_id,
+            token_hash: session.token_hash.clone(),
+            csrf_token_hash: session.csrf_token_hash.clone(),
+            idle_expires_at: session.idle_expires_at,
+            absolute_expires_at: session.absolute_expires_at,
+            created_at: session.created_at,
+            last_seen_at: session.created_at,
+        })
+    }
+
+    pub async fn lookup_web_session(
+        &self,
+        token_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<WebSession>, RepositoryError> {
+        validate_token_hash(token_hash, "session token hash")?;
+        let row = sqlx::query("SELECT s.id,s.token_hash,s.user_id,s.csrf_token_hash,s.idle_expires_at,s.absolute_expires_at,s.created_at,s.last_seen_at FROM web_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.idle_expires_at > ? AND s.absolute_expires_at > ? AND u.status='active'")
+            .bind(token_hash)
+            .bind(encode_time(now))
+            .bind(encode_time(now))
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(web_session_from_row).transpose()
+    }
+
+    /// Refresh idle expiry while leaving the absolute expiry unchanged.
+    pub async fn touch_web_session(
+        &self,
+        token_hash: &str,
+        now: DateTime<Utc>,
+        idle_expires_at: DateTime<Utc>,
+    ) -> Result<bool, RepositoryError> {
+        validate_token_hash(token_hash, "session token hash")?;
+        if idle_expires_at <= now {
+            return Err(RepositoryError::InvalidValue(
+                "session expiry must be in the future".to_owned(),
+            ));
+        }
+        let now = encode_time(now);
+        let requested_idle = encode_time(idle_expires_at);
+        let result = sqlx::query("UPDATE web_sessions SET idle_expires_at = CASE WHEN ? < absolute_expires_at THEN ? ELSE absolute_expires_at END, last_seen_at=? WHERE token_hash=? AND idle_expires_at > ? AND absolute_expires_at > ? AND EXISTS (SELECT 1 FROM users WHERE users.id=web_sessions.user_id AND users.status='active')")
+            .bind(&requested_idle)
+            .bind(&requested_idle)
+            .bind(&now)
+            .bind(token_hash)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn delete_web_session(&self, token_hash: &str) -> Result<bool, RepositoryError> {
+        validate_token_hash(token_hash, "session token hash")?;
+        let result = sqlx::query("DELETE FROM web_sessions WHERE token_hash=?")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn update_user(&self, user: &User) -> Result<bool, RepositoryError> {
         let result = sqlx::query("UPDATE users SET google_sub=?,login_email=?,role=?,status=?,last_activity_at=?,updated_at=? WHERE id=?").bind(&user.google_sub).bind(&user.email).bind(user_role(user.role)).bind(user_status(user.status)).bind(user.last_activity_at.map(encode_time)).bind(encode_time(user.updated_at)).bind(user.id.to_string()).execute(&self.pool).await?;
         Ok(result.rows_affected() == 1)
@@ -684,6 +855,12 @@ fn parse_opt_time(v: Option<String>) -> Result<Option<DateTime<Utc>>, Repository
 fn parse_uuid(v: String) -> Result<Uuid, RepositoryError> {
     Uuid::parse_str(&v).map_err(|_| RepositoryError::InvalidValue("invalid UUID".into()))
 }
+fn validate_token_hash(value: &str, field: &'static str) -> Result<(), RepositoryError> {
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(RepositoryError::InvalidValue(field.to_owned()));
+    }
+    Ok(())
+}
 fn scopes_json(v: &[String]) -> Result<String, RepositoryError> {
     serde_json::to_string(v).map_err(|_| RepositoryError::Corrupt("scopes"))
 }
@@ -700,6 +877,18 @@ fn user_from_row(r: sqlx::sqlite::SqliteRow) -> Result<User, RepositoryError> {
         last_activity_at: parse_opt_time(r.try_get("last_activity_at")?)?,
         created_at: parse_time(r.try_get("created_at")?)?,
         updated_at: parse_time(r.try_get("updated_at")?)?,
+    })
+}
+fn web_session_from_row(r: sqlx::sqlite::SqliteRow) -> Result<WebSession, RepositoryError> {
+    Ok(WebSession {
+        id: SessionId::from_uuid(parse_uuid(r.try_get("id")?)?),
+        token_hash: r.try_get("token_hash")?,
+        user_id: UserId::from_uuid(parse_uuid(r.try_get("user_id")?)?),
+        csrf_token_hash: r.try_get("csrf_token_hash")?,
+        idle_expires_at: parse_time(r.try_get("idle_expires_at")?)?,
+        absolute_expires_at: parse_time(r.try_get("absolute_expires_at")?)?,
+        created_at: parse_time(r.try_get("created_at")?)?,
+        last_seen_at: parse_time(r.try_get("last_seen_at")?)?,
     })
 }
 fn connection_from_row(r: sqlx::sqlite::SqliteRow) -> Result<GmailConnection, RepositoryError> {
@@ -820,6 +1009,250 @@ mod tests {
                 .email,
             "mail@example.com"
         );
+    }
+
+    #[tokio::test]
+    async fn owner_bootstrap_requires_matching_verified_email_and_is_unique() {
+        let repository = repository().await;
+        let now = Utc::now();
+        let mismatch = repository
+            .bootstrap_owner("owner@example.com", "owner-sub", "other@example.com", now)
+            .await;
+        assert!(
+            matches!(mismatch, Err(RepositoryError::InvalidValue(message)) if message == "owner email mismatch")
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let created = repository
+            .bootstrap_owner("Owner@Example.com", "owner-sub", "OWNER@example.com", now)
+            .await
+            .unwrap();
+        assert_eq!(created.role, UserRole::Owner);
+        assert_eq!(created.email, "owner@example.com");
+        assert!(created.last_activity_at.is_some());
+        assert_eq!(
+            repository
+                .find_user_by_email(" OWNER@EXAMPLE.COM ")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            created.id
+        );
+        assert_eq!(
+            repository
+                .find_user_by_google_sub("owner-sub")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            created.id
+        );
+        assert!(matches!(
+            repository
+                .bootstrap_owner("owner@example.com", "other-sub", "owner@example.com", now)
+                .await,
+            Err(RepositoryError::Conflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn owner_bootstrap_has_one_concurrent_winner() {
+        let dir = tempdir().unwrap();
+        let database = Database::connect(format!(
+            "sqlite://{}",
+            dir.path().join("bootstrap.db").display()
+        ))
+        .await
+        .unwrap();
+        database.migrate().await.unwrap();
+        let repository = Repository::new(&database);
+        let now = Utc::now();
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let repository = repository.clone();
+            tasks.push(tokio::spawn(async move {
+                repository
+                    .bootstrap_owner("owner@example.com", "owner-sub", "owner@example.com", now)
+                    .await
+            }));
+        }
+        let mut winners = 0;
+        for task in tasks {
+            if task.await.unwrap().is_ok() {
+                winners += 1;
+            }
+        }
+        assert_eq!(winners, 1);
+        let owners: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role='owner'")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(owners, 1);
+    }
+
+    #[tokio::test]
+    async fn web_sessions_are_hash_only_expire_and_follow_user_status() {
+        let repository = repository().await;
+        let now = Utc::now();
+        let user = repository
+            .bootstrap_owner("owner@example.com", "owner-sub", "owner@example.com", now)
+            .await
+            .unwrap();
+        let plaintext = "session-secret";
+        let csrf_plaintext = "csrf-secret";
+        let token_hash = hash_token(plaintext);
+        let csrf_token_hash = hash_token(csrf_plaintext);
+        assert!(
+            repository
+                .insert_web_session(&NewWebSession {
+                    id: SessionId::new(),
+                    user_id: user.id,
+                    token_hash: plaintext.to_owned(),
+                    csrf_token_hash: csrf_token_hash.clone(),
+                    idle_expires_at: now + Duration::minutes(10),
+                    absolute_expires_at: now + Duration::hours(1),
+                    created_at: now,
+                })
+                .await
+                .is_err()
+        );
+        let session = NewWebSession {
+            id: SessionId::new(),
+            user_id: user.id,
+            token_hash: token_hash.clone(),
+            csrf_token_hash: csrf_token_hash.clone(),
+            idle_expires_at: now + Duration::minutes(10),
+            absolute_expires_at: now + Duration::hours(1),
+            created_at: now,
+        };
+        repository.insert_web_session(&session).await.unwrap();
+        let stored_token: String = sqlx::query_scalar("SELECT token_hash FROM web_sessions")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let stored_csrf: String = sqlx::query_scalar("SELECT csrf_token_hash FROM web_sessions")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(stored_token, token_hash);
+        assert_eq!(stored_csrf, csrf_token_hash);
+        assert!(!stored_token.contains(plaintext));
+        assert!(!stored_csrf.contains(csrf_plaintext));
+        assert!(repository.lookup_web_session(plaintext, now).await.is_err());
+
+        let active = repository
+            .lookup_web_session(&token_hash, now + Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.user_id, user.id);
+        assert!(
+            repository
+                .touch_web_session(
+                    &token_hash,
+                    now + Duration::minutes(1),
+                    now + Duration::hours(2)
+                )
+                .await
+                .unwrap()
+        );
+        let touched = repository
+            .lookup_web_session(&token_hash, now + Duration::minutes(2))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(touched.idle_expires_at, touched.absolute_expires_at);
+        assert_eq!(touched.absolute_expires_at, now + Duration::hours(1));
+
+        let idle_hash = hash_token("idle-session");
+        repository
+            .insert_web_session(&NewWebSession {
+                id: SessionId::new(),
+                user_id: user.id,
+                token_hash: idle_hash.clone(),
+                csrf_token_hash: hash_token("idle-csrf"),
+                idle_expires_at: now + Duration::minutes(1),
+                absolute_expires_at: now + Duration::hours(1),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .lookup_web_session(&idle_hash, now + Duration::minutes(2))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !repository
+                .touch_web_session(
+                    &idle_hash,
+                    now + Duration::minutes(2),
+                    now + Duration::hours(1)
+                )
+                .await
+                .unwrap()
+        );
+
+        let absolute_hash = hash_token("absolute-session");
+        repository
+            .insert_web_session(&NewWebSession {
+                id: SessionId::new(),
+                user_id: user.id,
+                token_hash: absolute_hash.clone(),
+                csrf_token_hash: hash_token("absolute-csrf"),
+                idle_expires_at: now + Duration::hours(1),
+                absolute_expires_at: now + Duration::minutes(2),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .lookup_web_session(&absolute_hash, now + Duration::minutes(3))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !repository
+                .touch_web_session(
+                    &absolute_hash,
+                    now + Duration::minutes(3),
+                    now + Duration::hours(1)
+                )
+                .await
+                .unwrap()
+        );
+
+        let mut revoked = user.clone();
+        assert!(revoked.begin_revoke(now + Duration::minutes(4)));
+        repository.update_user(&revoked).await.unwrap();
+        assert!(
+            repository
+                .lookup_web_session(&token_hash, now + Duration::minutes(4))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !repository
+                .touch_web_session(
+                    &token_hash,
+                    now + Duration::minutes(4),
+                    now + Duration::hours(1)
+                )
+                .await
+                .unwrap()
+        );
+        assert!(repository.delete_web_session(&token_hash).await.unwrap());
+        assert!(!repository.delete_web_session(&token_hash).await.unwrap());
     }
 
     #[tokio::test]
