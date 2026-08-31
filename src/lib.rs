@@ -4,4 +4,7 @@ pub mod crypto;
 pub mod database;
 pub mod domain;
 pub mod error;
+pub mod governance;
 pub mod http;
+pub mod oauth;
+pub mod repository;

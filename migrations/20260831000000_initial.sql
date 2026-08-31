@@ -42,6 +42,7 @@ CREATE TABLE oauth_transactions (
     initiated_by TEXT REFERENCES users(id) ON DELETE SET NULL,
     target_connection_id TEXT REFERENCES gmail_connections(id) ON DELETE SET NULL,
     expires_at TEXT NOT NULL,
+    consumed_at TEXT,
     created_at TEXT NOT NULL
 );
 CREATE INDEX oauth_transactions_expires_idx ON oauth_transactions(expires_at);

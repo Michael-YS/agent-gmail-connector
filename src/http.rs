@@ -25,6 +25,7 @@ use crate::{
         identity::{ConnectionId, GmailConnection, User, UserId, UserRole},
         mailbox::{EmailAddress, Recipients, strip_html_active_content},
     },
+    repository::Repository,
 };
 
 #[derive(Debug, Clone, Subcommand)]
@@ -51,6 +52,7 @@ pub enum DatabaseCommand {
 #[derive(Clone)]
 pub struct AppState {
     pub database: Option<Database>,
+    pub repository: Option<Repository>,
     pub adapter: Arc<dyn GmailAdapter>,
     pub users: Arc<RwLock<HashMap<UserId, User>>>,
     pub connections: Arc<RwLock<HashMap<ConnectionId, GmailConnection>>>,
@@ -62,8 +64,10 @@ pub struct AppState {
 }
 impl AppState {
     pub fn new(database: Option<Database>, adapter: Arc<dyn GmailAdapter>) -> Self {
+        let repository = database.as_ref().map(Repository::new);
         Self {
             database,
+            repository,
             adapter,
             users: Arc::new(RwLock::new(HashMap::new())),
             connections: Arc::new(RwLock::new(HashMap::new())),
@@ -95,6 +99,7 @@ impl AppState {
         let credential = created.credential.clone();
         let state = Self {
             database: None,
+            repository: None,
             adapter: Arc::new(FakeGmailAdapter::new()),
             users: Arc::new(RwLock::new(HashMap::from([(uid, user)]))),
             connections: Arc::new(RwLock::new(HashMap::from([(cid, conn)]))),
@@ -184,6 +189,32 @@ async fn auth(
             headers,
         )
     })?;
+    if let Some(repository) = &state.repository {
+        let key = repository
+            .authenticate_access_key(credential)
+            .await
+            .map_err(|_| {
+                error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "authentication required",
+                    headers,
+                )
+            })?
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "authentication required",
+                    headers,
+                )
+            })?;
+        return Ok(AuthContext {
+            key: key.id,
+            user: key.owner_id,
+            generation: key.generation,
+        });
+    }
     let keys = state.keys.read().await;
     let key = keys.get(&parsed.public_id).ok_or_else(|| {
         error_response(
@@ -222,6 +253,62 @@ async fn authorize(
     connection: ConnectionId,
 ) -> Result<AuthContext, Response> {
     let ctx = auth(headers, query, state).await?;
+    if let Some(repository) = &state.repository {
+        let user = repository.get_user(ctx.user).await.map_err(|_| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "service temporarily unavailable",
+                headers,
+            )
+        })?;
+        if !user.is_some_and(|u| u.status.accepts_requests()) {
+            return Err(error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "access denied",
+                headers,
+            ));
+        }
+        let connection_record = repository.get_connection(connection).await.map_err(|_| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "service temporarily unavailable",
+                headers,
+            )
+        })?;
+        let Some(connection_record) = connection_record else {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "resource not found",
+                headers,
+            ));
+        };
+        if connection_record.owner_id != ctx.user
+            || !connection_record.status.accepts_requests()
+            || !repository
+                .access_key_allows(ctx.key, connection)
+                .await
+                .map_err(|_| {
+                    error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "service_unavailable",
+                        "service temporarily unavailable",
+                        headers,
+                    )
+                })?
+        {
+            return Err(error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "access denied",
+                headers,
+            ));
+        }
+        return Ok(ctx);
+    }
     let users = state.users.read().await;
     if !users
         .get(&ctx.user)
@@ -310,6 +397,45 @@ async fn list_connections(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Some(repository) = &state.repository {
+        let user = match repository.get_user(ctx.user).await {
+            Ok(Some(user)) if user.status.accepts_requests() => user,
+            Ok(_) => {
+                return error_response(
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "access denied",
+                    &headers,
+                );
+            }
+            Err(_) => {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service_unavailable",
+                    "service temporarily unavailable",
+                    &headers,
+                );
+            }
+        };
+        let connections = match repository
+            .list_active_connections_for_access_key(ctx.key, user.id)
+            .await
+        {
+            Ok(connections) => connections,
+            Err(_) => {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service_unavailable",
+                    "service temporarily unavailable",
+                    &headers,
+                );
+            }
+        };
+        return ok_json(
+            json!({"connections":connections.iter().map(view_connection).collect::<Vec<_>>() }),
+            &headers,
+        );
+    }
     let keys = state.keys.read().await;
     let allowed: Vec<_> = keys
         .values()
@@ -429,6 +555,12 @@ struct DraftRequest {
     bcc: Vec<String>,
     #[serde(default)]
     thread_id: Option<String>,
+    #[serde(default)]
+    expected_version: Option<String>,
+}
+#[derive(Deserialize, Default)]
+struct ExpectedVersionQuery {
+    expected_version: Option<String>,
 }
 fn parse_recipients(r: &DraftRequest) -> Result<Recipients, &'static str> {
     let parse = |v: &Vec<String>| {
@@ -539,7 +671,25 @@ async fn update_draft(
             &headers,
         );
     }
-    let expected = DraftVersion::new(req.subject.clone()).unwrap_or_else(|_| d.version.clone());
+    let Some(expected_version) = req.expected_version else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "expected_version is required",
+            &headers,
+        );
+    };
+    let expected = match DraftVersion::new(expected_version) {
+        Ok(version) => version,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "invalid expected_version",
+                &headers,
+            );
+        }
+    };
     let content = format!("{}\n{}", req.subject, req.body);
     if d.update(&expected, content).is_err() {
         return error_response(
@@ -556,6 +706,7 @@ async fn delete_draft(
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: axum::http::Uri,
+    Query(query): Query<ExpectedVersionQuery>,
 ) -> Response {
     let cid = ConnectionId::from_uuid(cid);
     if authorize(&headers, uri.query(), &state, cid).await.is_err() {
@@ -592,7 +743,26 @@ async fn delete_draft(
             &headers,
         );
     };
-    if d.delete(&d.version.clone()).is_err() {
+    let Some(expected_version) = query.expected_version else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "expected_version is required",
+            &headers,
+        );
+    };
+    let expected = match DraftVersion::new(expected_version) {
+        Ok(version) => version,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "invalid expected_version",
+                &headers,
+            );
+        }
+    };
+    if d.delete(&expected).is_err() {
         return error_response(
             StatusCode::CONFLICT,
             "draft_changed",
@@ -1039,5 +1209,83 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             axum::serve(listener, router(state)).await?;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::identity::{GMAIL_COMPOSE_SCOPE, GMAIL_READONLY_SCOPE};
+    use crate::repository::Repository;
+    use axum::body::Body;
+    use http::Request;
+    use tower::ServiceExt;
+
+    async fn persisted_state() -> (AppState, String, ConnectionId, ConnectionId) {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        database.migrate().await.unwrap();
+        let repository = Repository::new(&database);
+        let user = User::new(
+            "http-owner",
+            "owner@example.com",
+            UserRole::Owner,
+            Utc::now(),
+        )
+        .unwrap();
+        repository.insert_user(&user).await.unwrap();
+        let scopes = vec![GMAIL_READONLY_SCOPE.into(), GMAIL_COMPOSE_SCOPE.into()];
+        let first =
+            GmailConnection::new(user.id, "http-gmail-1", "first@example.com", scopes.clone())
+                .unwrap();
+        let second =
+            GmailConnection::new(user.id, "http-gmail-2", "second@example.com", scopes).unwrap();
+        repository.insert_connection(&first, None).await.unwrap();
+        repository.insert_connection(&second, None).await.unwrap();
+        let created = AccessKey::generate(user.id, "http-key", [first.id]).unwrap();
+        let credential = created.credential.clone();
+        repository.insert_access_key(&created).await.unwrap();
+        // Construct a fresh state: authentication must not depend on its in-memory maps.
+        let state = AppState::new(Some(database), Arc::new(FakeGmailAdapter::new()));
+        (state, credential, first.id, second.id)
+    }
+
+    #[tokio::test]
+    async fn persisted_access_key_authenticates_in_fresh_state_and_lists_grants() {
+        let (state, credential, first, second) = persisted_state().await;
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/connections")
+                    .header("authorization", format!("Bearer {credential}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let connections = value["connections"].as_array().unwrap();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0]["connection_id"], json!(first));
+        assert_ne!(connections[0]["connection_id"], json!(second));
+    }
+
+    #[tokio::test]
+    async fn persisted_access_key_cannot_access_ungranted_connection() {
+        let (state, credential, _, second) = persisted_state().await;
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/connections/{second}/messages"))
+                    .header("authorization", format!("Bearer {credential}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

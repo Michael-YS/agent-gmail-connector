@@ -1,12 +1,12 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果见提交记录：Rust 严格 Clippy、27 项领域/配置/数据库测试、3 项 HTTP 安全契约测试，以及隔离 SQLite 的 migrate/status/backup CLI smoke。
+本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果见提交记录：Rust 严格 Clippy、52 项领域/配置/数据库/OAuth/repository/治理测试、3 项 HTTP 安全契约测试，以及隔离 SQLite 的 migrate/status/backup CLI smoke。
 
 ## A. 尚未实现，因此目前无法执行的测试
 
 ### A1. Google OIDC 登录与邀请制 control plane
 
-- 缺口：实际 authorization-code + PKCE、state/nonce、JWKS 签名/issuer/audience/expiry/`email_verified` 验证、Owner bootstrap、邀请/session/CSRF 页面尚未接入 HTTP 和数据库 repository。
+- 缺口：state/nonce/PKCE、回调单次消费和 issuer/audience/expiry/`email_verified` 语义验证核心已实现；Google token endpoint/JWKS 签名 verifier、Owner bootstrap、邀请/session/CSRF 页面尚未接入 HTTP 和 repository。
 - 实现后测试：用 fake OIDC server 覆盖成功、错误 state/nonce、错误 issuer/audience、过期 token、未验证 email、邀请 email 不一致、邀请重放、session idle/absolute expiry 和 CSRF；再用 Dev Project 浏览器登录。
 - 命令目标：`cargo test --test oidc_contract --all-features`。
 - 通过标准：所有失败在创建用户/session 前被拒绝；数据库和日志不出现 authorization code、state、nonce、access token 或 ID token。
@@ -20,7 +20,7 @@
 
 ### A3. 数据库 repository 与 control plane CRUD
 
-- 缺口：HTTP `AppState` 仍是内存 HashMap，未从 SQLite 加载 users/connections/keys/drafts；当前 production `serve` 没有可用 Access Key 管理入口。
+- 缺口：SQLite repository 已覆盖 users/connections/access keys/grants/managed drafts/audit/首次授权 ledger；HTTP 已从 repository 认证持久化 key、校验 grant 并列出获授权 Connections，但 control plane CRUD 与完整 transport 持久化装配尚未完成，当前 production `serve` 没有可用 Access Key 管理入口。
 - 实现后测试：临时 SQLite 覆盖 Owner/Member、邀请、Connection、key create/rotate/revoke、grant 变更、账号删除与跨重启恢复。
 - 命令目标：`cargo test --test repository_roundtrip --all-features`。
 - 通过标准：重启后状态不丢失；key/confirmation/session 只存 hash；唯一 Owner、唯一 Gmail sub 与 first-authorization ledger 约束生效。
@@ -41,7 +41,7 @@
 
 ### A6. 限流、审计、账号撤销与清理
 
-- 缺口：持久 rate buckets、读取并发门限、发送时/日额度、无内容审计、30 天清理和完整账号撤销编排尚未接入 transport。
+- 缺口：限流窗口、4 路读取并发、send-unknown refund、无内容 AuditEvent 与 repository 写入已实现；rate bucket 数据库读写、transport 接入、30 天清理和完整账号撤销编排尚未完成。
 - 实现后测试：冻结时间并跨重启验证 120/min、30 prepare/hour、10/hour、50/day、20 recipients；账号/key/grant/Connection revoke 的并发请求立即失败；审计字段白名单快照。
 - 命令目标：`cargo test --test security_flows --all-features`。
 - 通过标准：429 含 retry seconds；日志/审计不包含地址、主题、正文、snippet、附件名、查询或任何 token。
