@@ -21,30 +21,33 @@
 8. `a277988 feat(auth): wire Google OIDC control plane`
 9. `20560ec feat(gmail): wire production read adapter`
 10. `59bfc44 feat(mime): build bounded managed messages`
+11. `06b77b6 feat(gmail): manage production drafts`
 
 `a277988` 已包含真实 Google OIDC/JWKS 校验、统一 OAuth 回调、控制面 HTTP 路由、owner session、原子 OAuth transaction claim、加密 refresh token provider、连接所有权/状态保护，以及真实 Google token/Gmail HTTP client。该提交完成时通过 111 项测试、严格 Clippy 和格式检查。
 
 ## 当前实现断点
 
-- 两个新代码里程碑均已提交；除本进度记录外没有未提交代码。
-- production Gmail read adapter 已完成并验证，不再回退到 fake adapter；draft 操作仍 fail-closed。
+- 三个后续代码里程碑均已提交；除本进度记录外没有未提交代码。
+- production Gmail read adapter 已完成并验证，不再回退到 fake adapter；真实 send 仍 fail-closed。
 - 安全 MIME 构建层已使用 `mail-builder 0.5` 完成：稳定 Message-ID、reply References、reply-all 排除当前主地址、非 ASCII header、安全附件 filename/content-type、inline CID、原始附件与最终编码消息的 25 MiB 双重限制，以及有界 writer。
-- 最新完整验证：110 个 library tests、3 个 HTTP tests、5 个 REST/MCP tests，共 118 项；`git diff --check`、`cargo fmt --check` 和严格 Clippy 均通过。
-- MIME 构建层尚未接入真实 Gmail draft/create/update/send/delete API，也尚未接入 HTTP multipart 附件入口。
+- 无附件 managed draft 已接入真实 Gmail create/update/delete：使用稳定 Message-ID 和安全 MIME，按草稿独立串行化，从 SQLite 恢复重启后的 managed record，保持 expected-version 乐观锁，并对 create 持久化失败做补偿删除、对 delete 404 做幂等成功。
+- Gmail send HTTP client 原语已有端点/编码/错误测试，但 production adapter 继续 fail-closed；在 durable confirmation/outcome 与稳定 Message-ID 的 Sent 对账完成前不得开放真实发送。
+- 最新完整验证：112 个 library tests、4 个 HTTP tests、5 个 REST/MCP tests，共 121 项；`git diff --check`、`cargo fmt --check` 和严格 Clippy 均通过，Terra 最终 diff 复审无发现。
 
 ## 剩余实现里程碑
 
 ### 1. MIME 与附件入口
 
 - MIME 构建层已完成并提交；后续不得回退为手写 MIME。
-- 剩余：将 new、reply、reply-all、forward 编排接入真实 managed draft。
+- new draft 的无附件路径已接入；剩余：reply、reply-all、forward 的完整编排。
 - 剩余：HTTP multipart 上传、已有 Gmail 附件/内嵌图片转发、附件下载流。
 - 已有稳定 Message-ID、In-Reply-To/References、header injection 防护、非 ASCII header、filename/content type 校验、双重 25 MiB 限制和有界 writer 测试。
 
-### 2. Gmail 写入链路
+### 2. Gmail 写入与发送链路
 
-- 接入真实 Gmail send/draft create/update/send/delete API。
-- 将受管 MIME 输出编码为 Gmail raw message。
+- 已接入真实 Gmail draft create/update/delete；Gmail send client 原语已实现但 production 未启用。
+- 已将受管 MIME 输出编码为 Gmail raw message。
+- 剩余：持久化 confirmation/outcome，并在发送响应丢失或进程重启后按稳定 RFC Message-ID 查询 Sent Mail 对账；完成前真实 send 必须 fail-closed。
 - 保持 access-key scope、owner、connection status 和 CSRF/幂等性约束。
 - 不记录 token、邮件正文或附件内容。
 
