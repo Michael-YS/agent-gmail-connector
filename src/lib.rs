@@ -13,6 +13,7 @@ pub mod google_token;
 pub mod governance;
 pub mod http;
 pub mod invitations;
+pub mod live_gmail_adapter;
 pub mod mailbox_service;
 pub mod oauth;
 pub mod repository;

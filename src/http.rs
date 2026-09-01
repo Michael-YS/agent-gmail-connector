@@ -27,8 +27,11 @@ use crate::{
         identity::{ConnectionId, GmailConnection, User, UserId, UserRole},
         mailbox::{EmailAddress, Recipients, strip_html_active_content},
     },
+    gmail_credentials::GmailCredentialProvider,
+    google_gmail::GoogleGmailClient,
     google_oidc::GoogleJwksVerifier,
     google_token::GoogleTokenClient,
+    live_gmail_adapter::LiveGmailAdapter,
     mailbox_service::{MailboxReadError, MailboxReadService, MessageSearchResult},
     repository::Repository,
 };
@@ -1464,6 +1467,16 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 config.google_gmail_client_secret.clone(),
                 config.google_gmail_callback_url(),
             )?;
+            let credentials = Arc::new(GmailCredentialProvider::new(
+                Arc::new(repository.clone()),
+                Arc::new(gmail_token_client.clone()),
+                config.encryption_keyring.clone(),
+            ));
+            let live_adapter = Arc::new(LiveGmailAdapter::new(
+                repository.clone(),
+                credentials,
+                GoogleGmailClient::new()?,
+            ));
             let control_state = ControlHttpState::new(
                 config.clone(),
                 repository,
@@ -1471,8 +1484,10 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 login_token_client,
                 gmail_token_client,
             )?;
-            let state = AppState::new(Some(db), Arc::new(FakeGmailAdapter::new()));
-            let app = router(state).merge(crate::control_http::router(control_state));
+            let state = AppState::new(Some(db), live_adapter);
+            let control_router = crate::control_http::router(control_state)
+                .layer(middleware::from_fn(request_context));
+            let app = router(state).merge(control_router);
             let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".into());
             let port = std::env::var("PORT")
                 .ok()
