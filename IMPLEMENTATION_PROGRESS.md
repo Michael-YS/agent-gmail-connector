@@ -1,0 +1,71 @@
+# AgentMail v1 实现进度
+
+更新时间：2026-09-01
+
+## 当前状态
+
+- 工作分支：`feat/agentmail-v1`
+- 当前实现尚未全部完成。
+- Windows sandbox helper 仍会间歇返回 `helper_unknown_error: setup refresh had errors`；本轮通过用户批准的只读/构建命令和 Codex 标准 `apply_patch` 模式完成工作。
+- 用户已经取消“完成后关闭计算机”的要求；后续不得关机。
+
+## 已提交里程碑
+
+1. `b0b67d2 docs: define AgentMail v1 plan`
+2. `080d519 feat: build AgentMail secure core and API`
+3. `527f501 ops: add hardened deployment and test guide`
+4. `c2d2356 feat: persist auth and governance state`
+5. `a841153 feat: add identity sessions and Google token client`
+6. `9bb0ff9 feat: add control plane and mailbox transports`
+7. `c19ccab feat: add secure invites and OAuth configuration`
+8. `a277988 feat(auth): wire Google OIDC control plane`
+9. `20560ec feat(gmail): wire production read adapter`
+10. `59bfc44 feat(mime): build bounded managed messages`
+
+`a277988` 已包含真实 Google OIDC/JWKS 校验、统一 OAuth 回调、控制面 HTTP 路由、owner session、原子 OAuth transaction claim、加密 refresh token provider、连接所有权/状态保护，以及真实 Google token/Gmail HTTP client。该提交完成时通过 111 项测试、严格 Clippy 和格式检查。
+
+## 当前实现断点
+
+- 两个新代码里程碑均已提交；除本进度记录外没有未提交代码。
+- production Gmail read adapter 已完成并验证，不再回退到 fake adapter；draft 操作仍 fail-closed。
+- 安全 MIME 构建层已使用 `mail-builder 0.5` 完成：稳定 Message-ID、reply References、reply-all 排除当前主地址、非 ASCII header、安全附件 filename/content-type、inline CID、原始附件与最终编码消息的 25 MiB 双重限制，以及有界 writer。
+- 最新完整验证：110 个 library tests、3 个 HTTP tests、5 个 REST/MCP tests，共 118 项；`git diff --check`、`cargo fmt --check` 和严格 Clippy 均通过。
+- MIME 构建层尚未接入真实 Gmail draft/create/update/send/delete API，也尚未接入 HTTP multipart 附件入口。
+
+## 剩余实现里程碑
+
+### 1. MIME 与附件入口
+
+- MIME 构建层已完成并提交；后续不得回退为手写 MIME。
+- 剩余：将 new、reply、reply-all、forward 编排接入真实 managed draft。
+- 剩余：HTTP multipart 上传、已有 Gmail 附件/内嵌图片转发、附件下载流。
+- 已有稳定 Message-ID、In-Reply-To/References、header injection 防护、非 ASCII header、filename/content type 校验、双重 25 MiB 限制和有界 writer 测试。
+
+### 2. Gmail 写入链路
+
+- 接入真实 Gmail send/draft create/update/send/delete API。
+- 将受管 MIME 输出编码为 Gmail raw message。
+- 保持 access-key scope、owner、connection status 和 CSRF/幂等性约束。
+- 不记录 token、邮件正文或附件内容。
+
+### 3. 连接生命周期
+
+- OAuth/连接撤销与本地凭证清除。
+- 凭证失效后的重新授权恢复流程。
+- reconciliation、连接状态刷新和异常恢复。
+
+### 4. 文档与发布验证
+
+- 保持 `README.md` 与真实代码一致，并包含完整部署步骤。
+- `TESTING_GAPS.md` 专门记录尚未完成的测试、前置条件和执行方法。
+- 使用垃圾邮箱账户做真实 Google OAuth/Gmail smoke test，避免批量发送。
+- 完成全量 fmt、Clippy、tests、Docker/部署配置检查。
+- 按逻辑 milestone 分别提交。
+
+## 既定产品边界
+
+- v1 不实现细粒度 Access Key permissions，留给 v2。
+- 不实现 Gmail watch、Pub/Sub 或后台同步。
+- Gmail 用户身份以 Google `sub` 为准。
+- 真实测试使用垃圾邮箱账户，不做批量发送。
+- 敏感凭证不得写入仓库、日志或本文档。
