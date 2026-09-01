@@ -1,6 +1,6 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果见提交记录：Rust 严格 Clippy、105 项领域/配置/数据库/OAuth/JWKS/control-plane/repository/治理测试、3 项 HTTP 安全契约测试、5 项 REST/MCP 契约测试，以及隔离 SQLite 的 migrate/status/backup CLI smoke。
+本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果见提交记录：Rust 严格 Clippy、110 项领域/配置/数据库/OAuth/JWKS/control-plane/repository/治理/MIME 测试、3 项 HTTP 安全契约测试、5 项 REST/MCP 契约测试，以及隔离 SQLite 的 migrate/status/backup CLI smoke。
 
 ## A. 尚未实现，因此目前无法执行的测试
 
@@ -27,7 +27,7 @@
 
 ### A4. MIME、附件与完整 managed draft
 
-- 缺口：mail-builder MIME、reply/reply-all/forward、multipart 流式上传、附件转发/下载、25 MiB 编码后限制和 Sent Message-ID 对账尚未完成。
+- 已实现：mail-builder MIME、稳定 Message-ID、reply References、reply-all 排除当前主地址、非 ASCII header 编码、header/filename/content-type 注入防护，以及原始附件与最终编码消息的 25 MiB 双重限制。缺口：这些构建能力尚未接入真实 Gmail draft transport；multipart 流式上传、附件转发/下载和 Sent Message-ID 对账尚未完成。
 - 实现后测试：非 ASCII headers、header injection、reply references、reply-all 排除当前地址、forward 内嵌图、恶意文件名、MCP 4 MiB、HTTP 25 MiB、超限和响应丢失。
 - 命令目标：`cargo test --test mime_and_drafts --all-features`。
 - 通过标准：非 managed draft 只能读取；版本变化返回 `409 draft_changed`；超时不自动重发，无法对账进入 `send_state_unknown`。

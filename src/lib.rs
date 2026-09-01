@@ -15,5 +15,6 @@ pub mod http;
 pub mod invitations;
 pub mod live_gmail_adapter;
 pub mod mailbox_service;
+pub mod mime;
 pub mod oauth;
 pub mod repository;
