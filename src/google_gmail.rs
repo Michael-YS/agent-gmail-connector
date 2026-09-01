@@ -1,14 +1,14 @@
-//! Narrow, read-only Gmail REST client.
+//! Narrow Gmail REST client for mailbox reads and managed-draft writes.
 //!
 //! This client intentionally accepts an access token per call and never owns
 //! or persists a refresh token.  It returns only a small, safe DTO instead of
-//! exposing Gmail's raw discovery/MIME surface.
+//! exposing Gmail's discovery surface or accepting arbitrary request paths.
 
 use crate::domain::mailbox::strip_html_active_content;
 use base64::Engine as _;
 use reqwest::{Client, StatusCode, Url};
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{fmt, time::Duration};
 
 pub const GMAIL_API_BASE: &str = "https://gmail.googleapis.com/gmail/v1/";
@@ -21,10 +21,14 @@ pub enum GoogleGmailError {
     EmptyAccessToken,
     #[error("message id is invalid")]
     InvalidMessageId,
+    #[error("draft id is invalid")]
+    InvalidDraftId,
     #[error("page size must be between 1 and 500")]
     InvalidPageSize,
     #[error("Gmail authorization must be renewed")]
     ReauthRequired,
+    #[error("Gmail resource was not found")]
+    NotFound,
     #[error("Gmail API rate limited")]
     RateLimited { retry_after_seconds: Option<u64> },
     #[error("Gmail API is unavailable")]
@@ -67,6 +71,19 @@ pub struct GmailMessage {
 pub struct MessageHeader {
     pub name: String,
     pub value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GmailDraft {
+    pub id: String,
+    pub message_id: String,
+    pub thread_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GmailSendResult {
+    pub message_id: String,
+    pub thread_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -224,6 +241,99 @@ impl GoogleGmailClient {
         })
     }
 
+    pub async fn create_draft(
+        &self,
+        access_token: &SecretString,
+        raw_mime: &[u8],
+        thread_id: Option<&str>,
+    ) -> Result<GmailDraft, GoogleGmailError> {
+        validate_access_token(access_token)?;
+        if let Some(thread_id) = thread_id {
+            validate_resource_id(thread_id, GoogleGmailError::InvalidMessageId)?;
+        }
+        let url = self
+            .base_url
+            .join("users/me/drafts")
+            .map_err(|_| GoogleGmailError::InvalidResponse)?;
+        let payload = DraftWriteRequest {
+            message: RawWriteMessage {
+                raw: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw_mime),
+                thread_id,
+            },
+        };
+        let request = self
+            .authorized(self.http.post(url), access_token)?
+            .json(&payload);
+        self.send::<RawDraft>(request).await?.try_into()
+    }
+
+    pub async fn update_draft(
+        &self,
+        access_token: &SecretString,
+        draft_id: &str,
+        raw_mime: &[u8],
+        thread_id: Option<&str>,
+    ) -> Result<GmailDraft, GoogleGmailError> {
+        validate_access_token(access_token)?;
+        validate_resource_id(draft_id, GoogleGmailError::InvalidDraftId)?;
+        if let Some(thread_id) = thread_id {
+            validate_resource_id(thread_id, GoogleGmailError::InvalidMessageId)?;
+        }
+        let url = self
+            .base_url
+            .join(&format!("users/me/drafts/{draft_id}"))
+            .map_err(|_| GoogleGmailError::InvalidResponse)?;
+        let payload = DraftWriteRequest {
+            message: RawWriteMessage {
+                raw: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw_mime),
+                thread_id,
+            },
+        };
+        let request = self
+            .authorized(self.http.put(url), access_token)?
+            .json(&payload);
+        self.send::<RawDraft>(request).await?.try_into()
+    }
+
+    pub async fn delete_draft(
+        &self,
+        access_token: &SecretString,
+        draft_id: &str,
+    ) -> Result<(), GoogleGmailError> {
+        validate_access_token(access_token)?;
+        validate_resource_id(draft_id, GoogleGmailError::InvalidDraftId)?;
+        let url = self
+            .base_url
+            .join(&format!("users/me/drafts/{draft_id}"))
+            .map_err(|_| GoogleGmailError::InvalidResponse)?;
+        let request = self.authorized(self.http.delete(url), access_token)?;
+        self.send_empty(request).await
+    }
+
+    pub async fn send_draft(
+        &self,
+        access_token: &SecretString,
+        draft_id: &str,
+    ) -> Result<GmailSendResult, GoogleGmailError> {
+        validate_access_token(access_token)?;
+        validate_resource_id(draft_id, GoogleGmailError::InvalidDraftId)?;
+        let url = self
+            .base_url
+            .join("users/me/drafts/send")
+            .map_err(|_| GoogleGmailError::InvalidResponse)?;
+        let request = self
+            .authorized(self.http.post(url), access_token)?
+            .json(&DraftSendRequest { id: draft_id });
+        let raw: RawSentMessage = self.send(request).await?;
+        if raw.id.is_empty() {
+            return Err(GoogleGmailError::InvalidResponse);
+        }
+        Ok(GmailSendResult {
+            message_id: raw.id,
+            thread_id: raw.thread_id,
+        })
+    }
+
     fn authorized(
         &self,
         request: reqwest::RequestBuilder,
@@ -238,26 +348,7 @@ impl GoogleGmailClient {
         request: reqwest::RequestBuilder,
     ) -> Result<T, GoogleGmailError> {
         let mut response = request.send().await.map_err(classify_transport_error)?;
-        let status = response.status();
-        if status == StatusCode::UNAUTHORIZED {
-            return Err(GoogleGmailError::ReauthRequired);
-        }
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            let retry_after_seconds = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.trim().parse::<u64>().ok());
-            return Err(GoogleGmailError::RateLimited {
-                retry_after_seconds,
-            });
-        }
-        if status.is_server_error() {
-            return Err(GoogleGmailError::Upstream);
-        }
-        if !status.is_success() {
-            return Err(GoogleGmailError::Upstream);
-        }
+        ensure_success(&response)?;
         if response
             .content_length()
             .is_some_and(|length| length > MAX_JSON_RESPONSE_BYTES as u64)
@@ -273,6 +364,112 @@ impl GoogleGmailClient {
         }
         serde_json::from_slice(&body).map_err(|_| GoogleGmailError::InvalidResponse)
     }
+
+    async fn send_empty(&self, request: reqwest::RequestBuilder) -> Result<(), GoogleGmailError> {
+        let response = request.send().await.map_err(classify_transport_error)?;
+        ensure_success(&response)
+    }
+}
+
+fn ensure_success(response: &reqwest::Response) -> Result<(), GoogleGmailError> {
+    let status = response.status();
+    if status == StatusCode::UNAUTHORIZED {
+        return Err(GoogleGmailError::ReauthRequired);
+    }
+    if status == StatusCode::NOT_FOUND {
+        return Err(GoogleGmailError::NotFound);
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        let retry_after_seconds = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        return Err(GoogleGmailError::RateLimited {
+            retry_after_seconds,
+        });
+    }
+    if status.is_server_error() {
+        return Err(GoogleGmailError::Upstream);
+    }
+    if !status.is_success() {
+        return Err(GoogleGmailError::Upstream);
+    }
+    Ok(())
+}
+
+fn validate_access_token(access_token: &SecretString) -> Result<(), GoogleGmailError> {
+    if access_token.expose_secret().is_empty() {
+        Err(GoogleGmailError::EmptyAccessToken)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_resource_id(value: &str, error: GoogleGmailError) -> Result<(), GoogleGmailError> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct DraftWriteRequest<'a> {
+    message: RawWriteMessage<'a>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RawWriteMessage<'a> {
+    raw: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_id: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct DraftSendRequest<'a> {
+    id: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDraft {
+    id: String,
+    message: Option<RawDraftMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDraftMessage {
+    id: String,
+    #[serde(rename = "threadId")]
+    thread_id: Option<String>,
+}
+
+impl TryFrom<RawDraft> for GmailDraft {
+    type Error = GoogleGmailError;
+
+    fn try_from(raw: RawDraft) -> Result<Self, Self::Error> {
+        let message = raw.message.ok_or(GoogleGmailError::InvalidResponse)?;
+        if raw.id.is_empty() || message.id.is_empty() {
+            return Err(GoogleGmailError::InvalidResponse);
+        }
+        Ok(Self {
+            id: raw.id,
+            message_id: message.id,
+            thread_id: message.thread_id,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSentMessage {
+    id: String,
+    #[serde(rename = "threadId")]
+    thread_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -476,6 +673,84 @@ mod tests {
         (endpoint, handle)
     }
 
+    async fn write_server(
+        expected_method: &str,
+        expected_path: &str,
+        expected_body_fragment: &str,
+        status: u16,
+        body: &str,
+    ) -> (Url, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Url::parse(&format!(
+            "http://{}/gmail/v1/",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let expected_method = expected_method.to_owned();
+        let expected_path = expected_path.to_owned();
+        let expected_body_fragment = expected_body_fragment.to_owned();
+        let body = body.to_owned();
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut expected_length = None;
+            loop {
+                stream.readable().await.unwrap();
+                let mut chunk = [0_u8; 4096];
+                match stream.try_read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => request.extend_from_slice(&chunk[..n]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(error) => panic!("request read failed: {error}"),
+                }
+                if let Some(header_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let header_text = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = header_text
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(str::to_owned)
+                        })
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    expected_length = Some(header_end + 4 + content_length);
+                }
+                if expected_length.is_some_and(|length| request.len() >= length) {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            let first_line = request_text.lines().next().unwrap_or_default();
+            assert_eq!(
+                first_line,
+                format!("{expected_method} {expected_path} HTTP/1.1")
+            );
+            assert!(
+                request_text
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer access-token")
+            );
+            assert!(request_text.contains(&expected_body_fragment));
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let mut written = 0;
+            while written < response.len() {
+                stream.writable().await.unwrap();
+                match stream.try_write(&response.as_bytes()[written..]) {
+                    Ok(n) => written += n,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(error) => panic!("response write failed: {error}"),
+                }
+            }
+        });
+        (endpoint, handle)
+    }
+
     fn client(endpoint: Url) -> GoogleGmailClient {
         GoogleGmailClient::with_base(
             Client::builder()
@@ -533,6 +808,81 @@ mod tests {
         assert_eq!(message.body.as_deref(), Some("hello"));
         assert_eq!(message.headers[0].name, "Subject");
         get_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn draft_writes_use_narrow_endpoints_and_base64url_raw() {
+        let token = SecretString::from("access-token");
+        let (endpoint, server) = write_server(
+            "POST",
+            "/gmail/v1/users/me/drafts",
+            r#""raw":"aGVsbG8","threadId":"thread_1""#,
+            200,
+            r#"{"id":"draft_1","message":{"id":"message_1","threadId":"thread_1"}}"#,
+        )
+        .await;
+        let draft = client(endpoint)
+            .create_draft(&token, b"hello", Some("thread_1"))
+            .await
+            .unwrap();
+        assert_eq!(draft.id, "draft_1");
+        assert_eq!(draft.message_id, "message_1");
+        server.await.unwrap();
+
+        let (endpoint, server) = write_server(
+            "PUT",
+            "/gmail/v1/users/me/drafts/draft_1",
+            r#""raw":"dXBkYXRlZA""#,
+            200,
+            r#"{"id":"draft_1","message":{"id":"message_2"}}"#,
+        )
+        .await;
+        let updated = client(endpoint)
+            .update_draft(&token, "draft_1", b"updated", None)
+            .await
+            .unwrap();
+        assert_eq!(updated.message_id, "message_2");
+        server.await.unwrap();
+
+        let (endpoint, server) = write_server(
+            "POST",
+            "/gmail/v1/users/me/drafts/send",
+            r#""id":"draft_1""#,
+            200,
+            r#"{"id":"sent_1","threadId":"thread_1"}"#,
+        )
+        .await;
+        let sent = client(endpoint)
+            .send_draft(&token, "draft_1")
+            .await
+            .unwrap();
+        assert_eq!(sent.message_id, "sent_1");
+        server.await.unwrap();
+
+        let (endpoint, server) =
+            write_server("DELETE", "/gmail/v1/users/me/drafts/draft_1", "", 204, "").await;
+        client(endpoint)
+            .delete_draft(&token, "draft_1")
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn draft_ids_and_thread_ids_are_validated_before_transport() {
+        let client = GoogleGmailClient::new().unwrap();
+        let token = SecretString::from("access-token");
+        assert_eq!(
+            client.delete_draft(&token, "../draft").await.unwrap_err(),
+            GoogleGmailError::InvalidDraftId
+        );
+        assert_eq!(
+            client
+                .create_draft(&token, b"x", Some("bad/thread"))
+                .await
+                .unwrap_err(),
+            GoogleGmailError::InvalidMessageId
+        );
     }
 
     #[test]
@@ -593,6 +943,12 @@ mod tests {
                 GoogleGmailError::RateLimited {
                     retry_after_seconds: Some(17),
                 },
+            ),
+            (
+                404,
+                None,
+                r#"{"error":{"message":"secret-body"}}"#,
+                GoogleGmailError::NotFound,
             ),
             (
                 500,

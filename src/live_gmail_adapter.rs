@@ -1,18 +1,19 @@
-//! Production Gmail adapter for the narrow read-only surface.
+//! Production Gmail adapter for reads and AgentMail-managed draft writes.
 //!
 //! Access tokens are obtained per connection through [`GmailCredentialProvider`].
-//! Draft methods deliberately fail closed until the managed-draft/MIME adapter is
-//! implemented; production must never fall back to the in-memory fake.
+//! MIME is constructed locally through the bounded safe builder. Production
+//! must never fall back to the in-memory fake.
 
 use crate::{
     adapter::{AdapterError, GmailAdapter, MailDraft, MailMessage},
     domain::{
-        identity::ConnectionId,
-        mailbox::{EmailAddress, MessageMetadata},
+        identity::{ConnectionId, GmailConnection},
+        mailbox::{EmailAddress, MessageMetadata, Recipients},
     },
     gmail_credentials::{CredentialError, GmailCredentialProvider},
     google_gmail::{GmailMessage, GoogleGmailClient, GoogleGmailError, MessageFormat},
     google_token::GoogleTokenClient,
+    mime::{MimeMessage, build_mime},
     repository::Repository,
 };
 use async_trait::async_trait;
@@ -45,6 +46,15 @@ impl LiveGmailAdapter {
         &self,
         connection_id: ConnectionId,
     ) -> Result<SecretString, AdapterError> {
+        self.connection_and_access_token(connection_id)
+            .await
+            .map(|(_, token)| token)
+    }
+
+    async fn connection_and_access_token(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<(GmailConnection, SecretString), AdapterError> {
         let connection = self
             .repository
             .get_connection(connection_id)
@@ -56,7 +66,7 @@ impl LiveGmailAdapter {
             .access_token(connection.owner_id, connection_id)
             .await
         {
-            Ok(token) => Ok(token),
+            Ok(token) => Ok((connection, token)),
             Err(CredentialError::ReauthRequired) => {
                 self.credentials.invalidate(connection_id).await;
                 Err(AdapterError::Unavailable)
@@ -181,26 +191,46 @@ impl GmailAdapter for LiveGmailAdapter {
 
     async fn create_draft(
         &self,
-        _connection: ConnectionId,
-        _draft: MailDraft,
+        connection: ConnectionId,
+        mut draft: MailDraft,
     ) -> Result<MailDraft, AdapterError> {
-        Err(AdapterError::Unavailable)
+        let (connection_record, token) = self.connection_and_access_token(connection).await?;
+        let raw = build_draft_mime(&connection_record, &draft)?;
+        let result = self
+            .gmail
+            .create_draft(&token, &raw, draft.thread_id.as_deref())
+            .await;
+        let created = self.map_gmail_result(connection, result).await?;
+        draft.id = created.id;
+        draft.thread_id = created.thread_id.or(draft.thread_id);
+        Ok(draft)
     }
 
     async fn update_draft(
         &self,
-        _connection: ConnectionId,
-        _draft: MailDraft,
+        connection: ConnectionId,
+        mut draft: MailDraft,
     ) -> Result<MailDraft, AdapterError> {
-        Err(AdapterError::Unavailable)
+        let (connection_record, token) = self.connection_and_access_token(connection).await?;
+        let raw = build_draft_mime(&connection_record, &draft)?;
+        let result = self
+            .gmail
+            .update_draft(&token, &draft.id, &raw, draft.thread_id.as_deref())
+            .await;
+        let updated = self.map_gmail_result(connection, result).await?;
+        draft.id = updated.id;
+        draft.thread_id = updated.thread_id.or(draft.thread_id);
+        Ok(draft)
     }
 
     async fn delete_draft(
         &self,
-        _connection: ConnectionId,
-        _draft_id: &str,
+        connection: ConnectionId,
+        draft_id: &str,
     ) -> Result<(), AdapterError> {
-        Err(AdapterError::Unavailable)
+        let token = self.access_token(connection).await?;
+        let result = self.gmail.delete_draft(&token, draft_id).await;
+        self.map_gmail_result(connection, result).await
     }
 
     async fn send_draft(
@@ -208,8 +238,33 @@ impl GmailAdapter for LiveGmailAdapter {
         _connection: ConnectionId,
         _draft_id: &str,
     ) -> Result<String, AdapterError> {
+        // Fail closed until confirmations/outcomes are durable and a lost send
+        // response can be reconciled by stable RFC Message-ID.
         Err(AdapterError::Unavailable)
     }
+}
+
+fn build_draft_mime(
+    connection: &GmailConnection,
+    draft: &MailDraft,
+) -> Result<Vec<u8>, AdapterError> {
+    if !draft.attachments.is_empty() {
+        return Err(AdapterError::InvalidInput);
+    }
+    let from = EmailAddress::new(&connection.email).map_err(|_| AdapterError::InvalidInput)?;
+    let recipients = Recipients::new(draft.to.clone(), draft.cc.clone(), draft.bcc.clone())
+        .map_err(|_| AdapterError::InvalidInput)?;
+    build_mime(MimeMessage {
+        from,
+        recipients,
+        subject: draft.subject.clone(),
+        text_body: Some(draft.body.clone()),
+        html_body: None,
+        stable_message_id: draft.stable_message_id.clone(),
+        reply_headers: None,
+        attachments: Vec::new(),
+    })
+    .map_err(|_| AdapterError::InvalidInput)
 }
 
 fn spawn_metadata_fetch(
@@ -330,7 +385,9 @@ fn map_gmail_error(error: GoogleGmailError) -> AdapterError {
             retry_after_seconds: retry_after_seconds.unwrap_or(60).max(1),
         },
         GoogleGmailError::Timeout => AdapterError::Timeout,
-        GoogleGmailError::InvalidMessageId => AdapterError::NotFound,
+        GoogleGmailError::InvalidMessageId
+        | GoogleGmailError::InvalidDraftId
+        | GoogleGmailError::NotFound => AdapterError::NotFound,
         GoogleGmailError::EmptyAccessToken
         | GoogleGmailError::ReauthRequired
         | GoogleGmailError::Upstream

@@ -1,6 +1,6 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果见提交记录：Rust 严格 Clippy、110 项领域/配置/数据库/OAuth/JWKS/control-plane/repository/治理/MIME 测试、3 项 HTTP 安全契约测试、5 项 REST/MCP 契约测试，以及隔离 SQLite 的 migrate/status/backup CLI smoke。
+本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果见提交记录：Rust 严格 Clippy、112 项领域/配置/数据库/OAuth/JWKS/control-plane/repository/治理/MIME/Gmail 测试、4 项 HTTP 安全与 managed-draft 契约测试、5 项 REST/MCP 契约测试，以及隔离 SQLite 的 migrate/status/backup CLI smoke。
 
 ## A. 尚未实现，因此目前无法执行的测试
 
@@ -13,7 +13,7 @@
 
 ### A2. Gmail OAuth Connection 与真实 Google adapter
 
-- 已实现：offline consent、完整 scope 校验、Connection callback、加密 refresh token、single-flight access-token cache、`invalid_grant` reauth、原 connection 的 owner/sub 绑定 reauthorize、带 8 MiB 响应上限的 Gmail client，以及 production 只读 `GmailAdapter` 装配。剩余缺口：Google token revoke 与完整 Connection revoke 编排尚未实现；draft/附件路径在真实 adapter 中 fail-closed，等待 A4。
+- 已实现：offline consent、完整 scope 校验、Connection callback、加密 refresh token、single-flight access-token cache、`invalid_grant` reauth、原 connection 的 owner/sub 绑定 reauthorize、带 8 MiB 响应上限的 Gmail client、production 读取 adapter，以及无附件 managed draft 的真实 create/update/delete。剩余缺口：Google token revoke 与完整 Connection revoke 编排尚未实现；真实 send 在 Sent 对账完成前 fail-closed。
 - 实现后测试：fake Google server 覆盖部分授权、refresh、invalid_grant、429/5xx/Retry-After、timeout、revoke；Dev 账号完成连接、搜索、读取、线程和附件流。
 - 命令目标：`cargo test --test gmail_adapter --all-features`，以及人工 `scripts/smoke-gmail.sh --prepare-only`。
 - 通过标准：缺少 `gmail.readonly` 或 `gmail.compose` 不创建 Connection；refresh token 仅以 XChaCha20-Poly1305 envelope 入库；查询和邮件内容不进日志。
@@ -27,7 +27,7 @@
 
 ### A4. MIME、附件与完整 managed draft
 
-- 已实现：mail-builder MIME、稳定 Message-ID、reply References、reply-all 排除当前主地址、非 ASCII header 编码、header/filename/content-type 注入防护，以及原始附件与最终编码消息的 25 MiB 双重限制。缺口：这些构建能力尚未接入真实 Gmail draft transport；multipart 流式上传、附件转发/下载和 Sent Message-ID 对账尚未完成。
+- 已实现：mail-builder MIME、稳定 Message-ID、reply References、reply-all 排除当前主地址、非 ASCII header 编码、header/filename/content-type 注入防护、原始附件与最终编码消息的 25 MiB 双重限制，以及无附件 Gmail draft create/update/delete。缺口：multipart 流式上传、附件转发/下载、durable confirmation/outcome 和 Sent Message-ID 对账尚未完成。
 - 实现后测试：非 ASCII headers、header injection、reply references、reply-all 排除当前地址、forward 内嵌图、恶意文件名、MCP 4 MiB、HTTP 25 MiB、超限和响应丢失。
 - 命令目标：`cargo test --test mime_and_drafts --all-features`。
 - 通过标准：非 managed draft 只能读取；版本变化返回 `409 draft_changed`；超时不自动重发，无法对账进入 `send_state_unknown`。

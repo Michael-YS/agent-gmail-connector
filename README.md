@@ -2,7 +2,7 @@
 
 AgentMail 是一个面向 agent 的 Gmail 安全访问层。当前仓库已经实现 Rust/Axum 服务骨架、SQLite schema 与显式迁移、secret 文件加载、refresh token 信封加密、Access Key/grant 领域模型、OAuth/OIDC 的 state/nonce/PKCE 与 claims 语义核心、固定 callback 的 Google token exchange/refresh client、原子 Owner bootstrap、hash-only web session/control-plane 应用服务、一次性邀请制与 Google 双 client 安全配置、SQLite repository、限流/无内容审计数据模型、共享 mailbox 读取服务、带响应上限和 MIME 安全处理的 Gmail 只读 HTTP client、REST 消息搜索 OpenAPI、最小 MCP JSON-RPC 搜索工具、managed draft 与两阶段发送状态机、production 只读 Gmail adapter，以及带双重 25 MiB 限制的安全 MIME 构建层。
 
-重要：当前版本仍不是可投入生产的完整 v1。真实 RS256/JWKS 验签、Login/Gmail callback、session/CSRF、加密 refresh token、凭据刷新和 REST 邮件搜索/读取已经接入 `serve`；安全 MIME 构建层已实现，但真实 Gmail draft/send transport 仍会 fail-closed，control plane 页面与邀请/Access Key CRUD、完整 MCP Streamable HTTP/rmcp、HTTP multipart 附件入口和发布供应链尚未完成或尚未经过真实环境验证，详见 [TESTING_GAPS.md](TESTING_GAPS.md)。在真实 Gmail 写入 adapter 和剩余安全验收完成前，不要把本仓库部署为真实邮件服务。
+重要：当前版本仍不是可投入生产的完整 v1。真实 RS256/JWKS 验签、Login/Gmail callback、session/CSRF、加密 refresh token、凭据刷新、REST 邮件读取，以及无附件 managed draft 的 Gmail create/update/delete 已接入 `serve`；真实发送仍会 fail-closed，直到 confirmation/outcome 持久化和稳定 Message-ID 的 Sent 对账完成。control plane 页面与邀请/Access Key CRUD、完整 MCP Streamable HTTP/rmcp、HTTP multipart 附件入口和发布供应链也尚未完成或尚未经过真实环境验证，详见 [TESTING_GAPS.md](TESTING_GAPS.md)。在真实发送链路和剩余安全验收完成前，不要把本仓库部署为真实邮件服务。
 
 ## 本地验证
 

@@ -3,7 +3,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -85,4 +85,146 @@ async fn key_grant_cannot_be_bypassed_by_changing_connection_id() {
         .await
         .unwrap();
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn managed_draft_lifecycle_requires_versions_and_replays_sent_outcome() {
+    let (state, credential, connection) = AppState::test_fixture();
+    let app = build_router(state);
+    let authorization = format!("Bearer {credential}");
+    let draft = json!({
+        "subject": "Initial subject",
+        "body": "Initial body",
+        "to": ["recipient@example.com"]
+    });
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/connections/{connection}/drafts"))
+                .header("authorization", &authorization)
+                .header("content-type", "application/json")
+                .body(Body::from(draft.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = response_json(created).await;
+    let draft_id = created["managed_draft"]["id"].as_str().unwrap();
+    let initial_version = created["managed_draft"]["version"].as_str().unwrap();
+    assert_eq!(created["managed_draft"]["state"], "active");
+
+    let updated_request = json!({
+        "subject": "Updated subject",
+        "body": "Updated body",
+        "to": ["recipient@example.com"],
+        "expected_version": initial_version,
+    });
+    let updated = app
+        .clone()
+        .oneshot(
+            Request::patch(format!(
+                "/api/v1/connections/{connection}/drafts/{draft_id}"
+            ))
+            .header("authorization", &authorization)
+            .header("content-type", "application/json")
+            .body(Body::from(updated_request.to_string()))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated = response_json(updated).await;
+    let current_version = updated["managed_draft"]["version"].as_str().unwrap();
+    assert_ne!(current_version, initial_version);
+
+    let stale_update = app
+        .clone()
+        .oneshot(
+            Request::patch(format!(
+                "/api/v1/connections/{connection}/drafts/{draft_id}"
+            ))
+            .header("authorization", &authorization)
+            .header("content-type", "application/json")
+            .body(Body::from(updated_request.to_string()))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale_update.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(stale_update).await["error"]["code"],
+        "draft_changed"
+    );
+
+    let prepared = app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/connections/{connection}/drafts/{draft_id}/prepare-send"
+            ))
+            .header("authorization", &authorization)
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepared.status(), StatusCode::OK);
+    let prepared = response_json(prepared).await;
+    let token = prepared["confirmation_token"].as_str().unwrap();
+
+    let send_body = json!({"confirmation_token": token}).to_string();
+    let sent = app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/connections/{connection}/drafts/{draft_id}/send"
+            ))
+            .header("authorization", &authorization)
+            .header("content-type", "application/json")
+            .body(Body::from(send_body.clone()))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent.status(), StatusCode::OK);
+    let sent = response_json(sent).await;
+    assert_eq!(sent["replayed"], false);
+    assert!(sent["outcome"].get("Sent").is_some());
+
+    let replay = app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/connections/{connection}/drafts/{draft_id}/send"
+            ))
+            .header("authorization", &authorization)
+            .header("content-type", "application/json")
+            .body(Body::from(send_body))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay = response_json(replay).await;
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["outcome"], sent["outcome"]);
+
+    let delete = app
+        .oneshot(
+            Request::delete(format!(
+                "/api/v1/connections/{connection}/drafts/{draft_id}?expected_version={current_version}"
+            ))
+            .header("authorization", &authorization)
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(delete).await["error"]["code"],
+        "draft_changed"
+    );
 }

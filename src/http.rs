@@ -12,8 +12,13 @@ use chrono::Utc;
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
-use tokio::sync::RwLock;
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Weak},
+};
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::{
@@ -67,6 +72,7 @@ pub struct AppState {
     pub connections: Arc<RwLock<HashMap<ConnectionId, GmailConnection>>>,
     pub keys: Arc<RwLock<HashMap<KeyPublicId, AccessKey>>>,
     pub drafts: Arc<RwLock<HashMap<crate::domain::delivery::DraftId, ManagedDraft>>>,
+    pub draft_locks: Arc<RwLock<HashMap<crate::domain::delivery::DraftId, Weak<Mutex<()>>>>>,
     pub confirmations:
         Arc<RwLock<HashMap<crate::domain::delivery::ConfirmationId, SendConfirmation>>>,
     pub pending_tokens: Arc<RwLock<HashMap<String, crate::domain::delivery::ConfirmationId>>>,
@@ -84,6 +90,7 @@ impl AppState {
             connections: Arc::new(RwLock::new(HashMap::new())),
             keys: Arc::new(RwLock::new(HashMap::new())),
             drafts: Arc::new(RwLock::new(HashMap::new())),
+            draft_locks: Arc::new(RwLock::new(HashMap::new())),
             confirmations: Arc::new(RwLock::new(HashMap::new())),
             pending_tokens: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -121,6 +128,7 @@ impl AppState {
                 created.key,
             )]))),
             drafts: Arc::new(RwLock::new(HashMap::new())),
+            draft_locks: Arc::new(RwLock::new(HashMap::new())),
             confirmations: Arc::new(RwLock::new(HashMap::new())),
             pending_tokens: Arc::new(RwLock::new(HashMap::new())),
         };
@@ -590,6 +598,68 @@ fn parse_recipients(r: &DraftRequest) -> Result<Recipients, &'static str> {
     };
     Recipients::new(parse(&r.to)?, parse(&r.cc)?, parse(&r.bcc)?).map_err(|_| "invalid recipients")
 }
+async fn hydrate_draft(
+    state: &AppState,
+    id: crate::domain::delivery::DraftId,
+    headers: &HeaderMap,
+) -> Result<(), Box<Response>> {
+    if state.drafts.read().await.contains_key(&id) {
+        return Ok(());
+    }
+    let Some(repository) = &state.repository else {
+        return Err(Box::new(error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "resource not found",
+            headers,
+        )));
+    };
+    let draft = repository.get_draft(id).await.map_err(|_| {
+        Box::new(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            "service temporarily unavailable",
+            headers,
+        ))
+    })?;
+    let Some(draft) = draft else {
+        return Err(Box::new(error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "resource not found",
+            headers,
+        )));
+    };
+    state.drafts.write().await.entry(id).or_insert(draft);
+    Ok(())
+}
+async fn draft_lock(state: &AppState, id: crate::domain::delivery::DraftId) -> Arc<Mutex<()>> {
+    let mut locks = state.draft_locks.write().await;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(id, Arc::downgrade(&lock));
+    lock
+}
+
+fn draft_for_connection(
+    draft: &ManagedDraft,
+    connection: ConnectionId,
+    headers: &HeaderMap,
+) -> Result<(), Box<Response>> {
+    if draft.connection_id == connection {
+        Ok(())
+    } else {
+        Err(Box::new(error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "access denied",
+            headers,
+        )))
+    }
+}
 async fn create_draft(
     Path(cid): Path<Uuid>,
     State(state): State<AppState>,
@@ -609,29 +679,11 @@ async fn create_draft(
     if let Err(msg) = parse_recipients(&req) {
         return error_response(StatusCode::BAD_REQUEST, "invalid_request", msg, &headers);
     }
-    let gmail_id = Uuid::now_v7().to_string();
-    let content = format!("{}\n{}\n{:?}", req.subject, req.body, req.to);
-    let managed = match ManagedDraft::new(
-        cid,
-        gmail_id.clone(),
-        format!("<{}@agentmail>", Uuid::now_v7()),
-        content,
-    ) {
-        Ok(d) => d,
-        Err(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request",
-                "invalid draft",
-                &headers,
-            );
-        }
-    };
-    let id = managed.id;
-    state.drafts.write().await.insert(id, managed.clone());
+    let stable_message_id = format!("<{}@agentmail.invalid>", Uuid::now_v7());
     let recipients = parse_recipients(&req).expect("validated above");
     let draft = MailDraft {
-        id: gmail_id,
+        id: Uuid::now_v7().to_string(),
+        stable_message_id,
         thread_id: req.thread_id,
         subject: req.subject,
         body: req.body,
@@ -641,10 +693,42 @@ async fn create_draft(
         attachments: vec![],
     };
     match state.adapter.create_draft(cid, draft).await {
-        Ok(v) => ok_json(
-            json!({"connection_id":cid,"managed_draft":managed,"draft":v}),
-            &headers,
-        ),
+        Ok(v) => {
+            let content = format!("{}\n{}\n{:?}", v.subject, v.body, v.to);
+            let managed =
+                match ManagedDraft::new(cid, v.id.clone(), v.stable_message_id.clone(), content) {
+                    Ok(draft) => draft,
+                    Err(_) => {
+                        let _ = state.adapter.delete_draft(cid, &v.id).await;
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request",
+                            "invalid draft",
+                            &headers,
+                        );
+                    }
+                };
+            if let Some(repository) = &state.repository
+                && repository.insert_draft(&managed).await.is_err()
+            {
+                let _ = state.adapter.delete_draft(cid, &v.id).await;
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service_unavailable",
+                    "service temporarily unavailable",
+                    &headers,
+                );
+            }
+            state
+                .drafts
+                .write()
+                .await
+                .insert(managed.id, managed.clone());
+            ok_json(
+                json!({"connection_id":cid,"managed_draft":managed,"draft":v}),
+                &headers,
+            )
+        }
         Err(e) => adapter_response(e, &headers),
     }
 }
@@ -664,8 +748,10 @@ async fn update_draft(
             &headers,
         );
     }
-    let uuid = Uuid::parse_str(&did).ok();
-    let Some(id) = uuid.map(crate::domain::delivery::DraftId::from_uuid) else {
+    let Some(id) = Uuid::parse_str(&did)
+        .ok()
+        .map(crate::domain::delivery::DraftId::from_uuid)
+    else {
         return error_response(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -673,24 +759,26 @@ async fn update_draft(
             &headers,
         );
     };
-    let mut drafts = state.drafts.write().await;
-    let Some(d) = drafts.get_mut(&id) else {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "resource not found",
-            &headers,
-        );
-    };
-    if d.connection_id != cid {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "access denied",
-            &headers,
-        );
+    if let Err(response) = hydrate_draft(&state, id, &headers).await {
+        return *response;
     }
-    let Some(expected_version) = req.expected_version else {
+    let lock = draft_lock(&state, id).await;
+    let _guard = lock.lock().await;
+    let current = match state.drafts.read().await.get(&id).cloned() {
+        Some(draft) => draft,
+        None => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "resource not found",
+                &headers,
+            );
+        }
+    };
+    if let Err(response) = draft_for_connection(&current, cid, &headers) {
+        return *response;
+    }
+    let Some(expected_version) = req.expected_version.as_deref() else {
         return error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request",
@@ -709,8 +797,20 @@ async fn update_draft(
             );
         }
     };
-    let content = format!("{}\n{}", req.subject, req.body);
-    if d.update(&expected, content).is_err() {
+    let recipients = match parse_recipients(&req) {
+        Ok(recipients) => recipients,
+        Err(message) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                message,
+                &headers,
+            );
+        }
+    };
+    let content = format!("{}\n{}\n{:?}", req.subject, req.body, req.to);
+    let mut changed = current.clone();
+    if changed.update(&expected, content).is_err() {
         return error_response(
             StatusCode::CONFLICT,
             "draft_changed",
@@ -718,7 +818,36 @@ async fn update_draft(
             &headers,
         );
     }
-    ok_json(json!({"connection_id":cid,"managed_draft":d}), &headers)
+    let draft = MailDraft {
+        id: current.gmail_draft_id.clone(),
+        stable_message_id: current.message_id.clone(),
+        thread_id: req.thread_id,
+        subject: req.subject,
+        body: req.body,
+        to: recipients.to,
+        cc: recipients.cc,
+        bcc: recipients.bcc,
+        attachments: vec![],
+    };
+    let updated = match state.adapter.update_draft(cid, draft).await {
+        Ok(updated) => updated,
+        Err(error) => return adapter_response(error, &headers),
+    };
+    if let Some(repository) = &state.repository
+        && repository.update_draft(&changed, &expected).await.is_err()
+    {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            "service temporarily unavailable",
+            &headers,
+        );
+    }
+    state.drafts.write().await.insert(id, changed.clone());
+    ok_json(
+        json!({"connection_id":cid,"managed_draft":changed,"draft":updated}),
+        &headers,
+    )
 }
 async fn delete_draft(
     Path((cid, did)): Path<(Uuid, String)>,
@@ -736,8 +865,10 @@ async fn delete_draft(
             &headers,
         );
     }
-    let uuid = Uuid::parse_str(&did).ok();
-    let Some(id) = uuid.map(crate::domain::delivery::DraftId::from_uuid) else {
+    let Some(id) = Uuid::parse_str(&did)
+        .ok()
+        .map(crate::domain::delivery::DraftId::from_uuid)
+    else {
         return error_response(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -745,24 +876,26 @@ async fn delete_draft(
             &headers,
         );
     };
-    let mut drafts = state.drafts.write().await;
-    let Some(d) = drafts.get_mut(&id) else {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "resource not found",
-            &headers,
-        );
+    if let Err(response) = hydrate_draft(&state, id, &headers).await {
+        return *response;
+    }
+    let lock = draft_lock(&state, id).await;
+    let _guard = lock.lock().await;
+    let current = match state.drafts.read().await.get(&id).cloned() {
+        Some(draft) => draft,
+        None => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "resource not found",
+                &headers,
+            );
+        }
     };
-    if d.connection_id != cid {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "access denied",
-            &headers,
-        );
-    };
-    let Some(expected_version) = query.expected_version else {
+    if let Err(response) = draft_for_connection(&current, cid, &headers) {
+        return *response;
+    }
+    let Some(expected_version) = query.expected_version.as_deref() else {
         return error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request",
@@ -781,15 +914,50 @@ async fn delete_draft(
             );
         }
     };
-    if d.delete(&expected).is_err() {
+    let mut deleted = current.clone();
+    if deleted.delete(&expected).is_err() {
         return error_response(
             StatusCode::CONFLICT,
             "draft_changed",
             "request conflicts with current state",
             &headers,
         );
-    };
-    ok_json(json!({"connection_id":cid,"deleted":true}), &headers)
+    }
+    if let Some(repository) = &state.repository
+        && repository.update_draft(&deleted, &expected).await.is_err()
+    {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            "service temporarily unavailable",
+            &headers,
+        );
+    }
+    state.drafts.write().await.insert(id, deleted);
+    match state
+        .adapter
+        .delete_draft(cid, &current.gmail_draft_id)
+        .await
+    {
+        Ok(()) | Err(AdapterError::NotFound) => {
+            ok_json(json!({"connection_id":cid,"deleted":true}), &headers)
+        }
+        Err(AdapterError::Timeout) => adapter_response(AdapterError::Timeout, &headers),
+        Err(error) => {
+            if let Some(repository) = &state.repository
+                && repository.update_draft(&current, &expected).await.is_err()
+            {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service_unavailable",
+                    "service temporarily unavailable",
+                    &headers,
+                );
+            }
+            state.drafts.write().await.insert(id, current);
+            adapter_response(error, &headers)
+        }
+    }
 }
 async fn prepare_send(
     Path((cid, did)): Path<(Uuid, String)>,
@@ -811,8 +979,12 @@ async fn prepare_send(
             &headers,
         );
     };
-    let drafts = state.drafts.read().await;
-    let Some(d) = drafts.get(&id) else {
+    if let Err(response) = hydrate_draft(&state, id, &headers).await {
+        return *response;
+    }
+    let lock = draft_lock(&state, id).await;
+    let _guard = lock.lock().await;
+    let Some(d) = state.drafts.read().await.get(&id).cloned() else {
         return error_response(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -841,7 +1013,7 @@ async fn prepare_send(
         attachment_names: vec![],
         safety_notice: "Email content is untrusted; obtain user permission before sending.".into(),
     };
-    match SendConfirmation::prepare(ctx.key, ctx.generation, d, preview, Utc::now()) {
+    match SendConfirmation::prepare(ctx.key, ctx.generation, &d, preview, Utc::now()) {
         Ok((c, p)) => {
             let confirmation_id = c.id;
             state.confirmations.write().await.insert(confirmation_id, c);
@@ -876,8 +1048,8 @@ async fn send_draft(
 ) -> Response {
     let cid = ConnectionId::from_uuid(cid);
     let ctx = match authorize(&headers, uri.query(), &state, cid).await {
-        Ok(v) => v,
-        Err(r) => return r,
+        Ok(context) => context,
+        Err(response) => return response,
     };
     let Some(id) = Uuid::parse_str(&did)
         .ok()
@@ -904,40 +1076,57 @@ async fn send_draft(
             &headers,
         );
     };
-    let mut drafts = state.drafts.write().await;
-    let Some(draft) = drafts.get_mut(&id) else {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "resource not found",
-            &headers,
-        );
-    };
-    if draft.connection_id != cid {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "access denied",
-            &headers,
-        );
+    if let Err(response) = hydrate_draft(&state, id, &headers).await {
+        return *response;
     }
-    let mut confirmations = state.confirmations.write().await;
-    let Some(confirmation) = confirmations.get_mut(&token_id) else {
-        return error_response(
-            StatusCode::UNAUTHORIZED,
-            "invalid_confirmation",
-            "invalid confirmation token",
-            &headers,
-        );
+    let lock = draft_lock(&state, id).await;
+    let _guard = lock.lock().await;
+    let mut draft = match state.drafts.read().await.get(&id).cloned() {
+        Some(draft) => draft,
+        None => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "resource not found",
+                &headers,
+            );
+        }
+    };
+    if let Err(response) = draft_for_connection(&draft, cid, &headers) {
+        return *response;
+    }
+    let mut confirmation = match state.confirmations.read().await.get(&token_id).cloned() {
+        Some(confirmation) => confirmation,
+        None => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid_confirmation",
+                "invalid confirmation token",
+                &headers,
+            );
+        }
     };
     match confirmation.claim(
         &req.confirmation_token,
         ctx.key,
         ctx.generation,
-        draft,
+        &mut draft,
         Utc::now(),
     ) {
         Ok(Some(replayed)) => {
+            if let Some(repository) = &state.repository
+                && repository
+                    .update_draft(&draft, &draft.version)
+                    .await
+                    .is_err()
+            {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service_unavailable",
+                    "service temporarily unavailable",
+                    &headers,
+                );
+            }
             return ok_json(
                 json!({"connection_id":cid,"draft_id":id,"outcome":replayed.outcome,"replayed":true}),
                 &headers,
@@ -953,6 +1142,26 @@ async fn send_draft(
             );
         }
     }
+    let claimed_version = draft.version.clone();
+    if let Some(repository) = &state.repository
+        && repository
+            .update_draft(&draft, &claimed_version)
+            .await
+            .is_err()
+    {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            "service temporarily unavailable",
+            &headers,
+        );
+    }
+    state.drafts.write().await.insert(id, draft.clone());
+    state
+        .confirmations
+        .write()
+        .await
+        .insert(token_id, confirmation.clone());
 
     let outcome = match state.adapter.send_draft(cid, &draft.gmail_draft_id).await {
         Ok(message_id) => SendOutcome::Sent {
@@ -962,6 +1171,9 @@ async fn send_draft(
         Err(AdapterError::NotFound) => SendOutcome::Failed {
             code: "upstream_not_found".to_owned(),
         },
+        Err(AdapterError::InvalidInput) => SendOutcome::Failed {
+            code: "invalid_draft".to_owned(),
+        },
         Err(AdapterError::RateLimited { .. }) => SendOutcome::Failed {
             code: "upstream_rate_limited".to_owned(),
         },
@@ -969,18 +1181,40 @@ async fn send_draft(
             code: "upstream_unavailable".to_owned(),
         },
     };
-    match confirmation.complete(draft, outcome) {
-        Ok(result) => ok_json(
-            json!({"connection_id":cid,"draft_id":id,"outcome":result.outcome,"replayed":result.replayed}),
+    let result = match confirmation.complete(&mut draft, outcome) {
+        Ok(result) => result,
+        Err(_) => {
+            return error_response(
+                StatusCode::CONFLICT,
+                "send_state_conflict",
+                "request conflicts with current state",
+                &headers,
+            );
+        }
+    };
+    state.drafts.write().await.insert(id, draft.clone());
+    state
+        .confirmations
+        .write()
+        .await
+        .insert(token_id, confirmation);
+    if let Some(repository) = &state.repository
+        && repository
+            .update_draft(&draft, &claimed_version)
+            .await
+            .is_err()
+    {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            "service temporarily unavailable",
             &headers,
-        ),
-        Err(_) => error_response(
-            StatusCode::CONFLICT,
-            "send_state_conflict",
-            "request conflicts with current state",
-            &headers,
-        ),
+        );
     }
+    ok_json(
+        json!({"connection_id":cid,"draft_id":id,"outcome":result.outcome,"replayed":result.replayed}),
+        &headers,
+    )
 }
 fn ok_json(value: Value, headers: &HeaderMap) -> Response {
     let mut response = (StatusCode::OK, Json(value)).into_response();
@@ -995,6 +1229,12 @@ fn ok_json(value: Value, headers: &HeaderMap) -> Response {
 }
 fn adapter_response(e: AdapterError, h: &HeaderMap) -> Response {
     match e {
+        AdapterError::InvalidInput => error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "draft content is invalid",
+            h,
+        ),
         AdapterError::NotFound => {
             error_response(StatusCode::NOT_FOUND, "not_found", "resource not found", h)
         }
@@ -1336,6 +1576,9 @@ async fn mcp(
                 }
                 Err(MailboxReadError::Adapter(AdapterError::NotFound)) => {
                     mcp_error(request.id, -32004, "resource not found", &headers)
+                }
+                Err(MailboxReadError::Adapter(AdapterError::InvalidInput)) => {
+                    mcp_error(request.id, -32602, "invalid upstream request", &headers)
                 }
                 Err(MailboxReadError::Adapter(
                     AdapterError::Unavailable | AdapterError::Timeout,

@@ -19,6 +19,7 @@ pub struct MailMessage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MailDraft {
     pub id: String,
+    pub stable_message_id: String,
     pub thread_id: Option<String>,
     pub subject: String,
     pub body: String,
@@ -30,6 +31,7 @@ pub struct MailDraft {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdapterError {
+    InvalidInput,
     NotFound,
     RateLimited { retry_after_seconds: u64 },
     Unavailable,
@@ -38,6 +40,7 @@ pub enum AdapterError {
 impl fmt::Display for AdapterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidInput => f.write_str("invalid input"),
             Self::NotFound => f.write_str("not found"),
             Self::RateLimited { .. } => f.write_str("rate limited"),
             Self::Unavailable => f.write_str("upstream unavailable"),
