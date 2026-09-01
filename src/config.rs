@@ -7,6 +7,8 @@ use secrecy::{ExposeSecret, SecretString};
 use std::{collections::BTreeMap, env, fmt, fs, path::Path, str::FromStr};
 use url::Url;
 
+use crate::oauth::{GMAIL_CALLBACK_PATH, LOGIN_CALLBACK_PATH};
+
 use crate::crypto::Keyring;
 
 pub const DEFAULT_PERSONAL_USE_USER_LIMIT: u16 = 90;
@@ -240,11 +242,11 @@ impl AppConfig {
     }
 
     pub fn google_login_callback_url(&self) -> Url {
-        callback_url(&self.public_base_url, "/auth/google/callback")
+        callback_url(&self.public_base_url, LOGIN_CALLBACK_PATH)
     }
 
     pub fn google_gmail_callback_url(&self) -> Url {
-        callback_url(&self.public_base_url, "/connections/google/callback")
+        callback_url(&self.public_base_url, GMAIL_CALLBACK_PATH)
     }
 }
 

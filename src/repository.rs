@@ -14,7 +14,7 @@ use crate::{
         },
     },
     governance::AuditEvent,
-    oauth::{OAuthFlowKind, OAuthTransactionRecord},
+    oauth::{OAuthFlowKind, OAuthTransactionRecord, validate_granted_gmail_scopes},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -242,6 +242,28 @@ impl Repository {
         )
         .bind(encode_time(now))
         .bind(id.to_string())
+        .bind(encode_time(now))
+        .bind(state_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(oauth_claim_from_row).transpose()
+    }
+
+    /// Atomically claim a callback only when its persisted flow matches the route.
+    pub async fn claim_oauth_transaction_for_flow(
+        &self,
+        id: Uuid,
+        presented_state: &str,
+        flow: OAuthFlowKind,
+        now: DateTime<Utc>,
+    ) -> Result<Option<OAuthTransactionClaim>, RepositoryError> {
+        let state_hash = hash_token(presented_state);
+        let row = sqlx::query(
+            "UPDATE oauth_transactions SET consumed_at=? WHERE id=? AND flow_type=? AND consumed_at IS NULL AND expires_at > ? AND state_hash=? RETURNING id,flow_type,nonce_hash,pkce_verifier,initiated_by,target_connection_id,created_at,expires_at",
+        )
+        .bind(encode_time(now))
+        .bind(id.to_string())
+        .bind(oauth_flow(flow))
         .bind(encode_time(now))
         .bind(state_hash)
         .fetch_optional(&self.pool)
@@ -673,7 +695,25 @@ impl Repository {
         envelope: Option<&EncryptedRefreshToken>,
     ) -> Result<(), RepositoryError> {
         let now = encode_time(Utc::now());
-        sqlx::query("INSERT INTO gmail_connections (id,owner_id,google_sub,primary_email,status,granted_scopes,refresh_token_envelope,last_used_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").bind(c.id.to_string()).bind(c.owner_id.to_string()).bind(&c.google_sub).bind(&c.email).bind(connection_status(c.status)).bind(scopes_json(&c.granted_scopes)?).bind(envelope.map(EncryptedRefreshToken::as_str)).bind(c.last_used_at.map(encode_time)).bind(&now).bind(now.clone()).execute(&self.pool).await?;
+        let result = sqlx::query("INSERT INTO gmail_connections (id,owner_id,google_sub,primary_email,status,granted_scopes,refresh_token_envelope,last_used_at,created_at,updated_at) SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM users WHERE id=? AND status='active')")
+            .bind(c.id.to_string())
+            .bind(c.owner_id.to_string())
+            .bind(&c.google_sub)
+            .bind(&c.email)
+            .bind(connection_status(c.status))
+            .bind(scopes_json(&c.granted_scopes)?)
+            .bind(envelope.map(EncryptedRefreshToken::as_str))
+            .bind(c.last_used_at.map(encode_time))
+            .bind(&now)
+            .bind(now.clone())
+            .bind(c.owner_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(RepositoryError::InvalidValue(
+                "connection owner is not active".to_owned(),
+            ));
+        }
         Ok(())
     }
     pub async fn get_connection(
@@ -734,6 +774,44 @@ impl Repository {
         .bind(id.to_string())
         .execute(&self.pool)
         .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Replace a target connection only when owner and previous Google subject
+    /// still match. The conditional update prevents a concurrent reauth race.
+    pub async fn reauthorize_connection(
+        &self,
+        id: ConnectionId,
+        owner_id: UserId,
+        expected_google_sub: &str,
+        email: &str,
+        scopes: &[String],
+        envelope: &EncryptedRefreshToken,
+    ) -> Result<bool, RepositoryError> {
+        if expected_google_sub.trim().is_empty() {
+            return Err(RepositoryError::InvalidValue(
+                "google subject must not be empty".to_owned(),
+            ));
+        }
+        let email = normalize_email(email)
+            .map_err(|_| RepositoryError::InvalidValue("invalid email".to_owned()))?;
+        let scopes = validate_granted_gmail_scopes(scopes.iter()).map_err(|_| {
+            RepositoryError::InvalidValue("required Gmail scopes are missing".to_owned())
+        })?;
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            "UPDATE gmail_connections SET primary_email=?,status='active',granted_scopes=?,refresh_token_envelope=?,updated_at=? WHERE id=? AND owner_id=? AND google_sub=? AND status <> 'revoking' AND EXISTS (SELECT 1 FROM users WHERE users.id=gmail_connections.owner_id AND users.status='active')",
+        )
+        .bind(email)
+        .bind(scopes_json(&scopes)?)
+        .bind(envelope.as_str())
+        .bind(encode_time(Utc::now()))
+        .bind(id.to_string())
+        .bind(owner_id.to_string())
+        .bind(expected_google_sub)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1009,6 +1087,77 @@ pub struct FirstAuthorization {
     pub historical_authorizations: u32,
 }
 
+#[async_trait::async_trait]
+impl crate::gmail_credentials::GmailCredentialStore for Repository {
+    async fn load(
+        &self,
+        owner_id: UserId,
+        connection_id: ConnectionId,
+    ) -> Result<
+        Option<crate::gmail_credentials::StoredGmailCredential>,
+        crate::gmail_credentials::CredentialError,
+    > {
+        let row = sqlx::query("SELECT c.id,c.owner_id,c.google_sub,c.primary_email,c.status,c.granted_scopes,c.refresh_token_envelope,c.last_used_at FROM gmail_connections c JOIN users u ON u.id=c.owner_id WHERE c.id=? AND c.owner_id=? AND u.status='active'")
+            .bind(connection_id.to_string())
+            .bind(owner_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| crate::gmail_credentials::CredentialError::StoreUnavailable)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let envelope = row
+            .try_get::<Option<String>, _>("refresh_token_envelope")
+            .map_err(|_| crate::gmail_credentials::CredentialError::StoreUnavailable)?
+            .map(EncryptedRefreshToken::from_envelope)
+            .transpose()
+            .map_err(|_| crate::gmail_credentials::CredentialError::InvalidCredential)?
+            .map(|value| value.as_str().to_owned());
+        let connection = connection_from_row(row)
+            .map_err(|_| crate::gmail_credentials::CredentialError::InvalidCredential)?;
+        Ok(Some(crate::gmail_credentials::StoredGmailCredential::new(
+            connection, envelope,
+        )))
+    }
+
+    async fn mark_reauth_required(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<(), crate::gmail_credentials::CredentialError> {
+        let result = sqlx::query("UPDATE gmail_connections SET status='reauth_required',updated_at=? WHERE id=? AND status='active' AND EXISTS (SELECT 1 FROM users WHERE users.id=gmail_connections.owner_id AND users.status='active')")
+            .bind(encode_time(Utc::now()))
+            .bind(connection_id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|_| crate::gmail_credentials::CredentialError::StoreUnavailable)?;
+        if result.rows_affected() != 1 {
+            return Err(crate::gmail_credentials::CredentialError::AccessDenied);
+        }
+        Ok(())
+    }
+
+    async fn persist_refresh_token(
+        &self,
+        owner_id: UserId,
+        connection_id: ConnectionId,
+        envelope: String,
+    ) -> Result<(), crate::gmail_credentials::CredentialError> {
+        let envelope = EncryptedRefreshToken::from_envelope(envelope)
+            .map_err(|_| crate::gmail_credentials::CredentialError::InvalidCredential)?;
+        let result = sqlx::query("UPDATE gmail_connections SET refresh_token_envelope=?,updated_at=? WHERE id=? AND owner_id=? AND status='active' AND EXISTS (SELECT 1 FROM users WHERE users.id=gmail_connections.owner_id AND users.status='active')")
+            .bind(envelope.as_str())
+            .bind(encode_time(Utc::now()))
+            .bind(connection_id.to_string())
+            .bind(owner_id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|_| crate::gmail_credentials::CredentialError::StoreUnavailable)?;
+        if result.rows_affected() != 1 {
+            return Err(crate::gmail_credentials::CredentialError::AccessDenied);
+        }
+        Ok(())
+    }
+}
 fn oauth_flow(v: OAuthFlowKind) -> &'static str {
     match v {
         OAuthFlowKind::Login => "login",
@@ -1828,6 +1977,163 @@ mod tests {
         }
         assert_eq!(winners, 1);
     }
+
+    #[tokio::test]
+    async fn flow_scoped_claim_rejects_wrong_flow_without_consuming() {
+        let repository = repository().await;
+        let (id, flow, now) = insert_oauth(&repository, Duration::minutes(10)).await;
+
+        assert!(
+            repository
+                .claim_oauth_transaction_for_flow(id, flow.state(), OAuthFlowKind::Gmail, now)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let claim = repository
+            .claim_oauth_transaction_for_flow(id, flow.state(), OAuthFlowKind::Login, now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.flow, OAuthFlowKind::Login);
+    }
+
+    #[tokio::test]
+    async fn reauthorize_preserves_id_and_updates_identity_material() {
+        let repository = repository().await;
+        let user = owner();
+        repository.insert_user(&user).await.unwrap();
+        let connection = connection(&repository, &user).await;
+        let scopes = vec![
+            GMAIL_READONLY_SCOPE.to_owned(),
+            GMAIL_COMPOSE_SCOPE.to_owned(),
+        ];
+        let envelope = EncryptedRefreshToken::from_envelope("am1.1.rotated.ciphertext").unwrap();
+
+        assert!(
+            repository
+                .reauthorize_connection(
+                    connection.id,
+                    user.id,
+                    "gmail-sub",
+                    "Updated@Example.com",
+                    &scopes,
+                    &envelope,
+                )
+                .await
+                .unwrap()
+        );
+        let updated = repository
+            .get_connection(connection.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.id, connection.id);
+        assert_eq!(updated.owner_id, user.id);
+        assert_eq!(updated.google_sub, "gmail-sub");
+        assert_eq!(updated.email, "updated@example.com");
+        assert_eq!(
+            updated.granted_scopes,
+            vec![
+                crate::oauth::GMAIL_READONLY_SCOPE.to_owned(),
+                crate::oauth::GMAIL_COMPOSE_SCOPE.to_owned(),
+            ]
+        );
+        assert_eq!(updated.status, ConnectionStatus::Active);
+        let stored_envelope: String =
+            sqlx::query_scalar("SELECT refresh_token_envelope FROM gmail_connections WHERE id=?")
+                .bind(connection.id.to_string())
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        assert_eq!(stored_envelope, envelope.as_str());
+    }
+
+    #[tokio::test]
+    async fn reauthorize_rejects_wrong_owner_subject_revoking_and_inactive_owner() {
+        let repository = repository().await;
+        let now = Utc::now();
+        let user = owner();
+        let other = User::new("other-sub", "other@example.com", UserRole::Member, now).unwrap();
+        repository.insert_user(&user).await.unwrap();
+        repository.insert_user(&other).await.unwrap();
+        let connection = connection(&repository, &user).await;
+        let scopes = vec![
+            GMAIL_READONLY_SCOPE.to_owned(),
+            GMAIL_COMPOSE_SCOPE.to_owned(),
+        ];
+        let envelope = EncryptedRefreshToken::from_envelope("am1.1.nonce.cipher").unwrap();
+
+        assert!(
+            !repository
+                .reauthorize_connection(
+                    connection.id,
+                    other.id,
+                    "gmail-sub",
+                    "mail@example.com",
+                    &scopes,
+                    &envelope,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !repository
+                .reauthorize_connection(
+                    connection.id,
+                    user.id,
+                    "wrong-sub",
+                    "mail@example.com",
+                    &scopes,
+                    &envelope,
+                )
+                .await
+                .unwrap()
+        );
+
+        let mut revoking = connection.clone();
+        revoking.status = ConnectionStatus::Revoking;
+        assert!(repository.update_connection(&revoking).await.unwrap());
+        assert!(
+            !repository
+                .reauthorize_connection(
+                    connection.id,
+                    user.id,
+                    "gmail-sub",
+                    "mail@example.com",
+                    &scopes,
+                    &envelope,
+                )
+                .await
+                .unwrap()
+        );
+
+        let second = GmailConnection::new(
+            user.id,
+            "gmail-sub-2",
+            "second@example.com",
+            vec![GMAIL_READONLY_SCOPE.into(), GMAIL_COMPOSE_SCOPE.into()],
+        )
+        .unwrap();
+        repository.insert_connection(&second, None).await.unwrap();
+        let mut inactive = user.clone();
+        assert!(inactive.begin_revoke(now + Duration::seconds(1)));
+        repository.update_user(&inactive).await.unwrap();
+        assert!(
+            !repository
+                .reauthorize_connection(
+                    second.id,
+                    user.id,
+                    "gmail-sub-2",
+                    "second@example.com",
+                    &scopes,
+                    &envelope,
+                )
+                .await
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn audit_stores_metadata_only() {
         let repository = repository().await;

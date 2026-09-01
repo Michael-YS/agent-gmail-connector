@@ -19,8 +19,8 @@ use crate::crypto::{CryptoError, Keyring, decrypt_token, encrypt_token, hash_tok
 
 pub const GOOGLE_AUTHORIZE_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const GOOGLE_ISSUER: &str = "https://accounts.google.com";
-pub const LOGIN_CALLBACK_PATH: &str = "/auth/google/login/callback";
-pub const GMAIL_CALLBACK_PATH: &str = "/auth/google/gmail/callback";
+pub const LOGIN_CALLBACK_PATH: &str = "/auth/google/callback";
+pub const GMAIL_CALLBACK_PATH: &str = "/connections/google/callback";
 pub const GMAIL_READONLY_SCOPE: &str = "https://www.googleapis.com/auth/gmail.readonly";
 pub const GMAIL_COMPOSE_SCOPE: &str = "https://www.googleapis.com/auth/gmail.compose";
 pub const LOGIN_SCOPES: [&str; 3] = ["openid", "email", "profile"];
@@ -576,12 +576,17 @@ impl GmailFlow {
 }
 
 fn validate_base_url(url: &Url) -> Result<(), OAuthError> {
+    let local_http = matches!(
+        url.host_str(),
+        Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+    ) && url.scheme() == "http";
     if url.host_str().is_none()
-        || !matches!(url.scheme(), "http" | "https")
+        || (url.scheme() != "https" && !local_http)
         || url.username() != ""
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
     {
         return Err(OAuthError::InvalidBaseUrl);
     }
@@ -667,7 +672,7 @@ mod tests {
         DateTime::from_timestamp(1_700_000_000, 0).unwrap()
     }
     fn base() -> Url {
-        Url::parse("https://agentmail.example/root").unwrap()
+        Url::parse("https://agentmail.example").unwrap()
     }
 
     #[test]
@@ -682,6 +687,25 @@ mod tests {
         assert!(query["scope"].contains(GMAIL_READONLY_SCOPE));
         assert!(query["scope"].contains(GMAIL_COMPOSE_SCOPE));
         assert!(!login.authorize_url().query().unwrap().contains("gmail."));
+    }
+
+    #[test]
+    fn flows_reject_ambiguous_or_insecure_base_urls() {
+        for value in [
+            "http://agentmail.example",
+            "https://agentmail.example/base",
+            "https://agentmail.example/?next=evil",
+            "https://user:pass@agentmail.example",
+        ] {
+            let url = Url::parse(value).unwrap();
+            assert!(matches!(
+                LoginFlow::new(&url, "client", now()),
+                Err(OAuthError::InvalidBaseUrl)
+            ));
+        }
+
+        let localhost = Url::parse("http://localhost:3000").unwrap();
+        assert!(LoginFlow::new(&localhost, "client", now()).is_ok());
     }
 
     #[test]

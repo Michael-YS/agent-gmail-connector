@@ -2,7 +2,7 @@
 
 AgentMail 是一个面向 agent 的 Gmail 安全访问层。当前仓库已经实现 Rust/Axum 服务骨架、SQLite schema 与显式迁移、secret 文件加载、refresh token 信封加密、Access Key/grant 领域模型、OAuth/OIDC 的 state/nonce/PKCE 与 claims 语义核心、固定 callback 的 Google token exchange/refresh client、原子 Owner bootstrap、hash-only web session/control-plane 应用服务、一次性邀请制与 Google 双 client 安全配置、SQLite repository、限流/无内容审计数据模型、共享 mailbox 读取服务、带响应上限和 MIME 安全处理的 Gmail 只读 HTTP client、REST 消息搜索 OpenAPI、最小 MCP JSON-RPC 搜索工具、managed draft 与两阶段发送状态机、fake Gmail adapter、健康检查，以及容器/迁移工件。
 
-重要：当前版本仍不是可投入生产的完整 v1。Google JWKS 签名 adapter 与 HTTP callback、真实 Gmail credential/adapter 装配、control plane HTTP CRUD、完整 MCP Streamable HTTP/rmcp、MIME 附件和发布供应链尚未实现或尚未完成真实环境验证；详见 [TESTING_GAPS.md](TESTING_GAPS.md)。当前 `serve` 使用 SQLite repository 处理已持久化的机器凭据和授权，但仍使用 fake Gmail adapter，也没有可用的 control plane 管理入口，不能连接真实 Gmail。不要把本仓库当前提交部署为真实邮件服务。
+重要：当前版本仍不是可投入生产的完整 v1。真实 RS256/JWKS 验签、Login/Gmail callback、session/CSRF、加密 refresh token 与凭据刷新已经接入 `serve`；但 REST 邮件读取仍使用 fake Gmail adapter，control plane 页面与邀请/Access Key CRUD、完整 MCP Streamable HTTP/rmcp、MIME 附件和发布供应链尚未完成或尚未经过真实环境验证，详见 [TESTING_GAPS.md](TESTING_GAPS.md)。在真实 Gmail adapter 和剩余安全验收完成前，不要把本仓库部署为真实邮件服务。
 
 ## 本地验证
 
@@ -29,10 +29,10 @@ agentmail serve
 
 最终 v1 需要两个 Google Cloud Project（Dev Testing、Prod In Production），每个项目建立两个 Web OAuth Client：
 
-- Login Client：`openid email profile`，回调 `https://agentmail.michaelsun.top/auth/google/login/callback`。
-- Gmail Client：`openid email profile gmail.readonly gmail.compose`，回调 `https://agentmail.michaelsun.top/auth/google/gmail/callback`，offline access。
+- Login Client：`openid email profile`，回调 `https://agentmail.michaelsun.top/auth/google/callback`。
+- Gmail Client：`openid email profile gmail.readonly gmail.compose`，回调 `https://agentmail.michaelsun.top/connections/google/callback`，offline access。
 
-Dev 可另加 localhost 回调并把 junk-mail 账号加入 test users。Prod 只保留 HTTPS 生产回调，`PERSONAL_USE_USER_LIMIT` 不得超过 99。上述 callback 路由在当前代码中尚未实现，因此配置 Google Console 后也不能完成真实授权；其实现与测试方法列在 `TESTING_GAPS.md`。
+Dev 可另加 localhost 回调并把 junk-mail 账号加入 test users。Prod 只保留 HTTPS 生产回调，`PERSONAL_USE_USER_LIMIT` 不得超过 99。`serve` 只从 `PUBLIC_BASE_URL` 与上述固定路径构造 redirect URI，不读取请求的 `Host`/`Forwarded`；Gmail 授权启动是需要有效 session 与 `X-CSRF-Token` 的 POST。真实浏览器/Google Cloud 验收方法列在 `TESTING_GAPS.md`。
 
 ## VPS 目录与 secrets
 

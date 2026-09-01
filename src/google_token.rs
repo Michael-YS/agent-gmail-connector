@@ -108,6 +108,7 @@ impl GoogleTokenClient {
         let endpoint = Url::parse(GOOGLE_TOKEN_ENDPOINT).expect("constant Google token URL");
         let http = Client::builder()
             .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| GoogleTokenError::Upstream)?;
         Self::with_endpoint(http, endpoint, client_id, client_secret, redirect_uri)

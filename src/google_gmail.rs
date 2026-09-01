@@ -105,6 +105,7 @@ impl GoogleGmailClient {
         let base_url = Url::parse(GMAIL_API_BASE).expect("constant Gmail API URL");
         let http = Client::builder()
             .timeout(DEFAULT_REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("default reqwest client must build");
         Self::with_base(http, base_url)

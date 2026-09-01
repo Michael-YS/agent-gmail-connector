@@ -1,10 +1,14 @@
 pub mod adapter;
 pub mod config;
+pub mod control_http;
+pub mod control_plane;
 pub mod crypto;
 pub mod database;
 pub mod domain;
 pub mod error;
+pub mod gmail_credentials;
 pub mod google_gmail;
+pub mod google_oidc;
 pub mod google_token;
 pub mod governance;
 pub mod http;

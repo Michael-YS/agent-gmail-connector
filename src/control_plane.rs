@@ -195,7 +195,7 @@ fn random_secret() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{database::Database, domain::identity::UserStatus};
+    use crate::{database::Database, domain::identity::UserStatus, repository::NewWebSession};
     use tempfile::tempdir;
 
     async fn service() -> (ControlPlaneService, Repository) {

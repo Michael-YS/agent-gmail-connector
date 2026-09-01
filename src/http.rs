@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::{
     adapter::{AdapterError, FakeGmailAdapter, GmailAdapter, MailDraft},
     config::AppConfig,
+    control_http::ControlHttpState,
     database::{Database, DatabaseError},
     domain::{
         access::{AccessKey, KeyPublicId, parse_credential},
@@ -26,6 +27,8 @@ use crate::{
         identity::{ConnectionId, GmailConnection, User, UserId, UserRole},
         mailbox::{EmailAddress, Recipients, strip_html_active_content},
     },
+    google_oidc::GoogleJwksVerifier,
+    google_token::GoogleTokenClient,
     mailbox_service::{MailboxReadError, MailboxReadService, MessageSearchResult},
     repository::Repository,
 };
@@ -1449,7 +1452,27 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::Serve => {
             let db = Database::connect(config.database_url.clone()).await?;
             db.ensure_current().await?;
+            let repository = Repository::new(&db);
+            let oidc_verifier = GoogleJwksVerifier::new()?;
+            let login_token_client = GoogleTokenClient::new(
+                config.google_login_client_id.clone(),
+                config.google_login_client_secret.clone(),
+                config.google_login_callback_url(),
+            )?;
+            let gmail_token_client = GoogleTokenClient::new(
+                config.google_gmail_client_id.clone(),
+                config.google_gmail_client_secret.clone(),
+                config.google_gmail_callback_url(),
+            )?;
+            let control_state = ControlHttpState::new(
+                config.clone(),
+                repository,
+                oidc_verifier,
+                login_token_client,
+                gmail_token_client,
+            )?;
             let state = AppState::new(Some(db), Arc::new(FakeGmailAdapter::new()));
+            let app = router(state).merge(crate::control_http::router(control_state));
             let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".into());
             let port = std::env::var("PORT")
                 .ok()
@@ -1457,7 +1480,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 .unwrap_or(18080);
             let addr: SocketAddr = format!("{host}:{port}").parse()?;
             let listener = tokio::net::TcpListener::bind(addr).await?;
-            axum::serve(listener, router(state)).await?;
+            axum::serve(listener, app).await?;
             Ok(())
         }
     }
