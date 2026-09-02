@@ -19,6 +19,7 @@ AgentMail 是 Rust/Axum + SQLite 实现的 Gmail 安全访问层。当前权威�
 ## 安全边界
 
 - 不在源码、日志、文档或测试输出中保存 token、OAuth secret、邮件正文或附件内容。
+- Access Key mutation 只允许 Owner session+CSRF；create/rotate credential 仅返回一次，数据库只能保存 hash，grant 必须绑定 active same-owner Connection。
 - 只能修改、删除或发送 AgentMail 创建并登记的 managed draft。
 - 发送必须先持久化 confirmation，再原子 claim；任何可能已处理的写入错误只做稳定 Message-ID Sent 对账，绝不自动重发。
 - v1 不实现细粒度 Access Key permissions、Gmail watch、Pub/Sub 或后台同步。

@@ -23,18 +23,20 @@
 10. `59bfc44 feat(mime): build bounded managed messages`
 11. `06b77b6 feat(gmail): manage production drafts`
 12. `dd44402 feat(gmail): persist safe send outcomes`
+13. `e501f0d feat(control): manage Access Keys`
 
 `a277988` 已包含真实 Google OIDC/JWKS 校验、统一 OAuth 回调、控制面 HTTP 路由、owner session、原子 OAuth transaction claim、加密 refresh token provider、连接所有权/状态保护，以及真实 Google token/Gmail HTTP client。该提交完成时通过 111 项测试、严格 Clippy 和格式检查。
 
 ## 当前实现断点
 
-- Gmail read、MIME、managed draft 和安全发送四个后续代码里程碑均已提交；除本进度文档同步外没有未提交代码。
+- Gmail read、MIME、managed draft、安全发送和 Owner Access Key 管理里程碑均已提交；除本进度文档同步外没有未提交代码。
 - production Gmail adapter 已完成读取及无附件 managed draft create/update/delete/send，不再回退到 fake adapter。
 - 安全 MIME 构建层已使用 `mail-builder 0.5` 完成：稳定 Message-ID、reply References、reply-all 排除当前主地址、非 ASCII header、安全附件 filename/content-type、inline CID、原始附件与最终编码消息的 25 MiB 双重限制，以及有界 writer。
 - 无附件 managed draft 已接入真实 Gmail create/update/delete：使用稳定 Message-ID 和安全 MIME，按草稿独立串行化，从 SQLite 恢复重启后的 managed record，保持 expected-version 乐观锁，并对 create 持久化失败做补偿删除、对 delete 404 做幂等成功。
 - confirmation token 只以 SHA-256 hash 入库；prepare 先持久化再返回明文一次；claim/outcome 与 managed draft 状态分别在 SQLite 事务中原子更新。相同 token 重放首次结果，不再次发送。
 - production send 已启用单次 Gmail `drafts.send`。Timeout、5xx/Unavailable、429 和 claim 后进程重启均只按系统生成的 `@agentmail.invalid` Message-ID 查询 Sent；要求精确 Message-ID header 与 `SENT` 标签，无法确认则持久化 `send_state_unknown`，绝不盲目重发。
-- 最新完整验证：119 个 library tests、4 个 HTTP tests、5 个 REST/MCP tests，共 128 项；`git diff --check`、`cargo fmt --check` 和严格 Clippy 均通过。Terra 复审指出缺少可计数的超时/重启证据，已补测试证明 timeout 仅 send 一次且重放不 send、claim 后重启 send 次数为零。
+- Owner Access Key 管理 API 已接入 `serve`：list/create/rotate/revoke 和 Connection grant add/remove。所有 mutation 要求 Owner session+CSRF；Member 与跨 owner IDOR 被拒绝；初始 grants 也在 repository 事务内验证 active same-owner Connection；create/rotate credential 只显示一次并 `Cache-Control: no-store`，SQLite 只存 Argon2 hash。rotate 在同一事务内返回 metadata/credential snapshot，旧 credential 立即失效并递增 generation。
+- 最新完整验证：123 个 library tests、4 个 HTTP tests、5 个 REST/MCP tests，共 132 项；`git diff --check`、`cargo fmt --check` 和严格 Clippy 均通过。Terra 复审发现并已修正 rotate 后二次查询造成的一次性 credential 交付窗口。
 
 ## 剩余实现里程碑
 
@@ -53,13 +55,18 @@
 - 保持 access-key scope、owner、connection status 和 CSRF/幂等性约束。
 - 不记录 token、邮件正文或附件内容。
 
-### 3. 连接生命周期
+### 3. Control plane 剩余入口
+
+- Owner Access Key JSON 管理 API 已完成；剩余 control plane HTML 页面。
+- 剩余：邀请接受、Member 登录、邀请/成员管理和账号删除编排。
+
+### 4. 连接生命周期
 
 - OAuth/连接撤销与本地凭证清除。
 - 凭证失效后的重新授权恢复流程。
 - reconciliation、连接状态刷新和异常恢复。
 
-### 4. 文档与发布验证
+### 5. 文档与发布验证
 
 - 保持 `README.md` 与真实代码一致，并包含完整部署步骤。
 - `TESTING_GAPS.md` 专门记录尚未完成的测试、前置条件和执行方法。
