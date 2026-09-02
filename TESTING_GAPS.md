@@ -1,12 +1,12 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果见提交记录：Rust 严格 Clippy、123 项领域/配置/数据库/OAuth/JWKS/control-plane/Access-Key/repository/治理/MIME/Gmail/发送恢复测试、4 项 HTTP 安全与 managed-draft 契约测试、5 项 REST/MCP 契约测试，以及隔离 SQLite 的 migrate/status/backup CLI smoke。
+本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：132 项 library（含邀请接受、Member 重登、Owner 邀请 list/create/revoke/regenerate、OAuth hash 绑定、重放/错误 email/atomic session）、4 项 HTTP 安全与 managed-draft 契约测试、5 项 REST/MCP 契约测试，共 141 项；并已运行 `cargo fmt --check`、`cargo check --all-targets --all-features --locked`。未执行部署、真实 Google 或浏览器 smoke。
 
 ## A. 尚未实现，因此目前无法执行的测试
 
 ### A1. Google OIDC 登录与邀请制 control plane
 
-- 已实现：真实 RS256/JWKS verifier（固定 discovery、no-redirect、响应上限、缓存与 unknown-kid 冷却）、flow-scoped 单次 callback、固定双 client token exchange、Owner+session、session cookie/CSRF、Login/Gmail HTTP 路由，以及 Owner 专用 Access Key 创建/列表/轮换/撤销/grant API 均已接入 `serve`。剩余缺口：邀请接受、Member 登录、邀请/成员管理、control plane HTML 页面和真实 Google 浏览器登录尚未完成。
+- 已实现：真实 RS256/JWKS verifier（固定 discovery、no-redirect、响应上限、缓存与 unknown-kid 冷却）、flow-scoped 单次 callback、固定双 client token exchange、Owner/Member session、session cookie/CSRF、Login/Gmail HTTP 路由，以及 Owner Access Key 和邀请创建/list/revoke/regenerate API。邀请 token 只从 POST body 接收，以 hash 绑定 Login OAuth transaction；callback 以 verified email+精确 Google sub 原子接受邀请并创建 Member/session。剩余缺口：Member 管理、账号删除、control plane HTML 页面和真实 Google 浏览器登录。
 - 实现后测试：用 fake OIDC server 覆盖成功、错误 state/nonce、错误 issuer/audience、过期 token、未验证 email、邀请 email 不一致、邀请重放、session idle/absolute expiry 和 CSRF；再用 Dev Project 浏览器登录。
 - 命令目标：`cargo test --test oidc_contract --all-features`。
 - 通过标准：所有失败在创建用户/session 前被拒绝；数据库和日志不出现 authorization code、state、nonce、access token 或 ID token。
@@ -20,7 +20,7 @@
 
 ### A3. 数据库 repository 与 control plane CRUD
 
-- 已实现：SQLite repository 已覆盖 users/invitations/sessions/connections/access keys/grants/managed drafts/audit/首次授权 ledger；Owner Access Key list/create/rotate/revoke/grant API 使用 session+CSRF，初始和后续 grants 都验证 active same-owner Connection，create/rotate credential 仅返回一次且只以 hash 入库。剩余缺口：邀请/Member/账号删除 control-plane API 与 HTML 页面尚未完成。
+- 已实现：SQLite repository 已覆盖 users/invitations/sessions/connections/access keys/grants/managed drafts/audit/首次授权 ledger；Owner Access Key 与邀请 list/create/revoke/regenerate API 使用 session+CSRF，邀请 token 与 session 只存 hash；邀请接受和既有 active Member/Owner 的精确 identity 登录会原子创建 session。剩余缺口：Member 管理、账号删除与 control-plane HTML 页面。
 - 实现后测试：临时 SQLite 覆盖 Owner/Member、邀请、Connection、key create/rotate/revoke、grant 变更、账号删除与跨重启恢复。
 - 命令目标：`cargo test --test repository_roundtrip --all-features`。
 - 通过标准：重启后状态不丢失；key/confirmation/session 只存 hash；唯一 Owner、唯一 Gmail sub 与 first-authorization ledger 约束生效。
