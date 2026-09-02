@@ -7,7 +7,10 @@ use crate::{
             AccessError, AccessKey, AccessKeyId, AccessKeyStatus, GrantSet, NewAccessKey,
             hash_secret, parse_credential, verify_secret,
         },
-        delivery::{DraftId, DraftVersion, ManagedDraft, ManagedDraftState},
+        delivery::{
+            ConfirmationId, DraftId, DraftVersion, ManagedDraft, ManagedDraftState,
+            SendConfirmation, SendOutcome,
+        },
         identity::{
             ConnectionId, ConnectionStatus, GmailConnection, SessionId, User, UserId, UserRole,
             UserStatus, normalize_email,
@@ -161,6 +164,26 @@ pub struct NewInvitation {
     pub invited_by: UserId,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredSendConfirmation {
+    pub confirmation: SendConfirmation,
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableSendClaim {
+    Claimed {
+        confirmation: SendConfirmation,
+        draft: ManagedDraft,
+    },
+    Replayed {
+        confirmation: SendConfirmation,
+        outcome: SendOutcome,
+    },
+    InProgress {
+        confirmation: SendConfirmation,
+    },
 }
 pub struct EncryptedRefreshToken(String);
 
@@ -982,6 +1005,166 @@ impl Repository {
         }
     }
 
+    pub async fn insert_send_confirmation(
+        &self,
+        confirmation: &SendConfirmation,
+        now: DateTime<Utc>,
+    ) -> Result<(), RepositoryError> {
+        if confirmation.invalidated || confirmation.outcome.is_some() {
+            return Err(RepositoryError::InvalidValue(
+                "new send confirmation state".to_owned(),
+            ));
+        }
+        let token_hash = confirmation.token_hash_hex();
+        validate_token_hash(&token_hash, "send confirmation token hash")?;
+        sqlx::query("INSERT INTO send_confirmations (id,token_hash,access_key_id,key_generation,connection_id,draft_id,draft_version,expires_at,consumed_at,result_json,created_at) VALUES (?,?,?,?,?,?,?,?,NULL,NULL,?)")
+            .bind(confirmation.id.to_string())
+            .bind(token_hash)
+            .bind(confirmation.key_id.to_string())
+            .bind(i64::try_from(confirmation.key_generation)?)
+            .bind(confirmation.connection_id.to_string())
+            .bind(confirmation.draft_id.to_string())
+            .bind(confirmation.draft_version.as_str())
+            .bind(encode_time(confirmation.expires_at))
+            .bind(encode_time(now))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn lookup_send_confirmation(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<StoredSendConfirmation>, RepositoryError> {
+        validate_token_hash(token_hash, "send confirmation token hash")?;
+        let row = sqlx::query("SELECT id,token_hash,access_key_id,key_generation,connection_id,draft_id,draft_version,expires_at,consumed_at,result_json FROM send_confirmations WHERE token_hash=?")
+            .bind(token_hash)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(send_confirmation_from_row).transpose()
+    }
+
+    pub async fn claim_send_confirmation(
+        &self,
+        token_hash: &str,
+        key_id: AccessKeyId,
+        generation: u64,
+        draft: &ManagedDraft,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DurableSendClaim>, RepositoryError> {
+        validate_token_hash(token_hash, "send confirmation token hash")?;
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query("SELECT id,token_hash,access_key_id,key_generation,connection_id,draft_id,draft_version,expires_at,consumed_at,result_json FROM send_confirmations WHERE token_hash=?")
+            .bind(token_hash)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        let Some(stored) = row.map(send_confirmation_from_row).transpose()? else {
+            return Ok(None);
+        };
+        let confirmation = stored.confirmation;
+        if confirmation.key_id != key_id
+            || confirmation.key_generation != generation
+            || confirmation.connection_id != draft.connection_id
+            || confirmation.draft_id != draft.id
+            || confirmation.draft_version != draft.version
+        {
+            return Ok(None);
+        }
+        if let Some(outcome) = confirmation.outcome.clone() {
+            transaction.commit().await?;
+            return Ok(Some(DurableSendClaim::Replayed {
+                confirmation,
+                outcome,
+            }));
+        }
+        if stored.consumed_at.is_some() {
+            transaction.commit().await?;
+            return Ok(Some(DurableSendClaim::InProgress { confirmation }));
+        }
+        if confirmation.expires_at <= now || draft.state != ManagedDraftState::Active {
+            return Ok(None);
+        }
+        let mut sending = draft.clone();
+        sending
+            .mark_sending(&confirmation.draft_version)
+            .map_err(|_| RepositoryError::Conflict)?;
+        let claimed = sqlx::query("UPDATE send_confirmations SET consumed_at=? WHERE id=? AND token_hash=? AND consumed_at IS NULL AND result_json IS NULL AND expires_at > ?")
+            .bind(encode_time(now))
+            .bind(confirmation.id.to_string())
+            .bind(token_hash)
+            .bind(encode_time(now))
+            .execute(&mut *transaction)
+            .await?;
+        if claimed.rows_affected() != 1 {
+            return Err(RepositoryError::Conflict);
+        }
+        let updated = sqlx::query("UPDATE managed_drafts SET status='sending',updated_at=? WHERE id=? AND connection_id=? AND current_version=? AND status='active'")
+            .bind(encode_time(now))
+            .bind(sending.id.to_string())
+            .bind(sending.connection_id.to_string())
+            .bind(sending.version.as_str())
+            .execute(&mut *transaction)
+            .await?;
+        if updated.rows_affected() != 1 {
+            return Err(RepositoryError::Conflict);
+        }
+        transaction.commit().await?;
+        Ok(Some(DurableSendClaim::Claimed {
+            confirmation,
+            draft: sending,
+        }))
+    }
+
+    pub async fn complete_send_confirmation(
+        &self,
+        confirmation: &SendConfirmation,
+        draft: &ManagedDraft,
+        now: DateTime<Utc>,
+    ) -> Result<(), RepositoryError> {
+        let Some(outcome) = confirmation.outcome.as_ref() else {
+            return Err(RepositoryError::InvalidValue(
+                "send confirmation outcome".to_owned(),
+            ));
+        };
+        if draft.id != confirmation.draft_id
+            || draft.connection_id != confirmation.connection_id
+            || draft.version != confirmation.draft_version
+            || !matches!(
+                draft.state,
+                ManagedDraftState::Active
+                    | ManagedDraftState::Sent
+                    | ManagedDraftState::SendStateUnknown
+            )
+        {
+            return Err(RepositoryError::InvalidValue(
+                "send confirmation completion state".to_owned(),
+            ));
+        }
+        let result_json =
+            serde_json::to_string(outcome).map_err(|_| RepositoryError::Corrupt("send outcome"))?;
+        let mut transaction = self.pool.begin().await?;
+        let completed = sqlx::query("UPDATE send_confirmations SET result_json=? WHERE id=? AND consumed_at IS NOT NULL AND result_json IS NULL")
+            .bind(result_json)
+            .bind(confirmation.id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        if completed.rows_affected() != 1 {
+            return Err(RepositoryError::Conflict);
+        }
+        let updated = sqlx::query("UPDATE managed_drafts SET status=?,updated_at=? WHERE id=? AND connection_id=? AND current_version=? AND status='sending'")
+            .bind(draft_status(draft.state))
+            .bind(encode_time(now))
+            .bind(draft.id.to_string())
+            .bind(draft.connection_id.to_string())
+            .bind(draft.version.as_str())
+            .execute(&mut *transaction)
+            .await?;
+        if updated.rows_affected() != 1 {
+            return Err(RepositoryError::Conflict);
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
     pub async fn record_audit_event(&self, e: &AuditEvent) -> Result<(), RepositoryError> {
         sqlx::query("INSERT INTO audit_events (id,user_id,access_key_id,connection_id,operation,result_category,latency_ms,request_id,created_at) VALUES (?,?,?,?,?,?,?,?,?)").bind(e.id.to_string()).bind(e.user_id.map(|v|v.to_string())).bind(e.access_key_id.map(|v|v.to_string())).bind(e.connection_id.map(|v|v.to_string())).bind(e.operation.as_str()).bind(e.result_category.as_str()).bind(i64::try_from(e.latency_ms)?).bind(e.request_id.as_str()).bind(encode_time(e.created_at)).execute(&self.pool).await?;
         Ok(())
@@ -1361,6 +1544,45 @@ fn draft_from_row(r: sqlx::sqlite::SqliteRow) -> Result<ManagedDraft, Repository
     })
 }
 
+fn decode_token_hash(value: String) -> Result<[u8; 32], RepositoryError> {
+    validate_token_hash(&value, "send confirmation token hash")?;
+    let mut hash = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        hash[index] = std::str::from_utf8(pair)
+            .ok()
+            .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+            .ok_or(RepositoryError::Corrupt("send confirmation token hash"))?;
+    }
+    Ok(hash)
+}
+fn send_confirmation_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<StoredSendConfirmation, RepositoryError> {
+    let result_json: Option<String> = row.try_get("result_json")?;
+    let outcome = result_json
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|_| RepositoryError::Corrupt("send outcome"))
+        })
+        .transpose()?;
+    let key_generation: i64 = row.try_get("key_generation")?;
+    Ok(StoredSendConfirmation {
+        confirmation: SendConfirmation {
+            id: ConfirmationId::from_uuid(parse_uuid(row.try_get("id")?)?),
+            token_hash: decode_token_hash(row.try_get("token_hash")?)?,
+            key_id: AccessKeyId::from_uuid(parse_uuid(row.try_get("access_key_id")?)?),
+            key_generation: u64::try_from(key_generation)
+                .map_err(|_| RepositoryError::Corrupt("send confirmation generation"))?,
+            connection_id: ConnectionId::from_uuid(parse_uuid(row.try_get("connection_id")?)?),
+            draft_id: DraftId::from_uuid(parse_uuid(row.try_get("draft_id")?)?),
+            draft_version: DraftVersion::new(row.try_get::<String, _>("draft_version")?)
+                .map_err(|_| RepositoryError::Corrupt("send confirmation version"))?,
+            expires_at: parse_time(row.try_get("expires_at")?)?,
+            invalidated: false,
+            outcome,
+        },
+        consumed_at: parse_opt_time(row.try_get("consumed_at")?)?,
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2134,6 +2356,90 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn durable_send_confirmation_claims_completes_and_replays_without_plaintext() {
+        let repository = repository().await;
+        let user = owner();
+        repository.insert_user(&user).await.unwrap();
+        let connection = connection(&repository, &user).await;
+        let created = AccessKey::generate(user.id, "send-key", [connection.id]).unwrap();
+        let stored_key = repository.insert_access_key(&created).await.unwrap();
+        let draft =
+            ManagedDraft::new(connection.id, "gmail-draft", "<stable@agentmail>", "body").unwrap();
+        repository.insert_draft(&draft).await.unwrap();
+        let preview = crate::domain::delivery::SendPreview {
+            connection_id: connection.id,
+            draft_id: draft.id,
+            version: draft.version.clone(),
+            from: None,
+            to: vec![],
+            cc: vec![],
+            bcc: vec![],
+            subject: String::new(),
+            body_summary: String::new(),
+            attachment_names: vec![],
+            safety_notice: String::new(),
+        };
+        let now = Utc::now();
+        let (confirmation, prepared) =
+            SendConfirmation::prepare(stored_key.id, stored_key.generation, &draft, preview, now)
+                .unwrap();
+        let digest = SendConfirmation::token_digest_hex(&prepared.token);
+        repository
+            .insert_send_confirmation(&confirmation, now)
+            .await
+            .unwrap();
+        let stored_hash: String = sqlx::query_scalar("SELECT token_hash FROM send_confirmations")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(stored_hash, digest);
+        assert!(!stored_hash.contains(&prepared.token));
+
+        let (mut claimed_confirmation, mut sending) = match repository
+            .claim_send_confirmation(&digest, stored_key.id, stored_key.generation, &draft, now)
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            DurableSendClaim::Claimed {
+                confirmation,
+                draft,
+            } => (confirmation, draft),
+            other => panic!("unexpected claim: {other:?}"),
+        };
+        assert_eq!(sending.state, ManagedDraftState::Sending);
+        assert!(matches!(
+            repository
+                .claim_send_confirmation(
+                    &digest,
+                    stored_key.id,
+                    stored_key.generation,
+                    &sending,
+                    now
+                )
+                .await
+                .unwrap(),
+            Some(DurableSendClaim::InProgress { .. })
+        ));
+        let outcome = SendOutcome::Sent {
+            gmail_message_id: "sent-message".into(),
+        };
+        claimed_confirmation
+            .complete(&mut sending, outcome.clone())
+            .unwrap();
+        repository
+            .complete_send_confirmation(&claimed_confirmation, &sending, now)
+            .await
+            .unwrap();
+        assert!(matches!(
+            repository
+                .claim_send_confirmation(&digest, stored_key.id, stored_key.generation, &sending, now)
+                .await
+                .unwrap(),
+            Some(DurableSendClaim::Replayed { outcome: replayed, .. }) if replayed == outcome
+        ));
+    }
     #[tokio::test]
     async fn audit_stores_metadata_only() {
         let repository = repository().await;

@@ -19,6 +19,7 @@ use crate::{
 use async_trait::async_trait;
 use secrecy::SecretString;
 use std::{fmt, sync::Arc, time::Duration};
+use uuid::Uuid;
 
 const LIST_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 const LIST_FETCH_CONCURRENCY: usize = 4;
@@ -235,13 +236,65 @@ impl GmailAdapter for LiveGmailAdapter {
 
     async fn send_draft(
         &self,
-        _connection: ConnectionId,
-        _draft_id: &str,
+        connection: ConnectionId,
+        draft_id: &str,
     ) -> Result<String, AdapterError> {
-        // Fail closed until confirmations/outcomes are durable and a lost send
-        // response can be reconciled by stable RFC Message-ID.
-        Err(AdapterError::Unavailable)
+        let token = self.access_token(connection).await?;
+        let result = self.gmail.send_draft(&token, draft_id).await;
+        self.map_gmail_result(connection, result)
+            .await
+            .map(|sent| sent.message_id)
     }
+
+    async fn find_sent_message(
+        &self,
+        connection: ConnectionId,
+        stable_message_id: &str,
+    ) -> Result<Option<String>, AdapterError> {
+        let inner = agentmail_message_id_inner(stable_message_id)?;
+        let token = self.access_token(connection).await?;
+        let query = format!("in:sent rfc822msgid:{inner}");
+        let list_result = self
+            .gmail
+            .list_messages(&token, Some(&query), Some(2), None)
+            .await;
+        let list = self.map_gmail_result(connection, list_result).await?;
+        let mut exact = Vec::new();
+        for item in list.messages.into_iter().take(2) {
+            let message_result = self
+                .gmail
+                .get_message(&token, &item.id, MessageFormat::Metadata)
+                .await;
+            let message = self.map_gmail_result(connection, message_result).await?;
+            if is_exact_sent_match(&message, stable_message_id) {
+                exact.push(message.id);
+            }
+        }
+        Ok((exact.len() == 1).then(|| exact.remove(0)))
+    }
+}
+
+fn is_exact_sent_match(message: &GmailMessage, stable_message_id: &str) -> bool {
+    message
+        .label_ids
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case("SENT"))
+        && header_value(message, "message-id")
+            .is_some_and(|value| value.trim() == stable_message_id)
+}
+
+fn agentmail_message_id_inner(value: &str) -> Result<&str, AdapterError> {
+    let inner = value
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+        .ok_or(AdapterError::InvalidInput)?;
+    let Some(local) = inner.strip_suffix("@agentmail.invalid") else {
+        return Err(AdapterError::InvalidInput);
+    };
+    if Uuid::parse_str(local).is_err() {
+        return Err(AdapterError::InvalidInput);
+    }
+    Ok(inner)
 }
 
 fn build_draft_mime(
@@ -400,6 +453,51 @@ fn map_gmail_error(error: GoogleGmailError) -> AdapterError {
 mod tests {
     use super::*;
     use crate::google_gmail::MessageHeader;
+
+    #[test]
+    fn sent_reconciliation_accepts_only_system_message_ids() {
+        let valid = "<018f0d58-8e52-7b7e-a5f2-7d82a5f5f1e1@agentmail.invalid>";
+        assert_eq!(
+            agentmail_message_id_inner(valid).unwrap(),
+            "018f0d58-8e52-7b7e-a5f2-7d82a5f5f1e1@agentmail.invalid"
+        );
+        for invalid in [
+            "018f0d58-8e52-7b7e-a5f2-7d82a5f5f1e1@agentmail.invalid",
+            "<not-a-uuid@agentmail.invalid>",
+            "<018f0d58-8e52-7b7e-a5f2-7d82a5f5f1e1@example.com>",
+            "<018f0d58-8e52-7b7e-a5f2-7d82a5f5f1e1@agentmail.invalid> extra",
+        ] {
+            assert_eq!(
+                agentmail_message_id_inner(invalid),
+                Err(AdapterError::InvalidInput)
+            );
+        }
+    }
+
+    #[test]
+    fn sent_reconciliation_requires_exact_header_and_sent_label() {
+        let stable = "<018f0d58-8e52-7b7e-a5f2-7d82a5f5f1e1@agentmail.invalid>";
+        let mut message = GmailMessage {
+            id: "m1".into(),
+            thread_id: None,
+            label_ids: vec!["SENT".into()],
+            snippet: None,
+            internal_date: None,
+            headers: vec![MessageHeader {
+                name: "Message-ID".into(),
+                value: stable.into(),
+            }],
+            body: None,
+            body_is_html: false,
+            untrusted_email_content: true,
+        };
+        assert!(is_exact_sent_match(&message, stable));
+        message.label_ids = vec!["INBOX".into()];
+        assert!(!is_exact_sent_match(&message, stable));
+        message.label_ids = vec!["SENT".into()];
+        message.headers[0].value = "<different@agentmail.invalid>".into();
+        assert!(!is_exact_sent_match(&message, stable));
+    }
 
     #[test]
     fn maps_safe_metadata_and_sanitizes_control_characters() {

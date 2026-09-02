@@ -89,6 +89,15 @@ pub trait GmailAdapter: Send + Sync {
         connection: ConnectionId,
         draft_id: &str,
     ) -> Result<String, AdapterError>;
+    /// Reconcile an already-attempted send by its system-generated RFC Message-ID.
+    /// Implementations must not send or retry the draft from this method.
+    async fn find_sent_message(
+        &self,
+        _connection: ConnectionId,
+        _stable_message_id: &str,
+    ) -> Result<Option<String>, AdapterError> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Default)]

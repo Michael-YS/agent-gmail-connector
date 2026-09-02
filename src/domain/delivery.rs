@@ -220,6 +220,19 @@ pub struct SendConfirmation {
 }
 
 impl SendConfirmation {
+    /// SHA-256 digest for durable lookup; plaintext confirmation tokens are never persisted.
+    pub fn token_digest_hex(token: &str) -> String {
+        token_hash_hex(hash_token(token))
+    }
+
+    pub fn token_hash_hex(&self) -> String {
+        token_hash_hex(self.token_hash)
+    }
+
+    pub fn matches_token_digest_hex(&self, digest: &str) -> bool {
+        decode_token_hash_hex(digest)
+            .is_ok_and(|candidate| bool::from(self.token_hash.ct_eq(&candidate)))
+    }
     pub fn prepare(
         key_id: AccessKeyId,
         key_generation: u64,
@@ -434,6 +447,22 @@ fn hash_token_bytes(value: &[u8]) -> [u8; 32] {
     out
 }
 
+fn token_hash_hex(hash: [u8; 32]) -> String {
+    hash.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+fn decode_token_hash_hex(value: &str) -> Result<[u8; 32], ()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(());
+    }
+    let mut hash = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        hash[index] = std::str::from_utf8(pair)
+            .ok()
+            .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+            .ok_or(())?;
+    }
+    Ok(hash)
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeliveryError {
     MissingDraftIdentity,
@@ -550,6 +579,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn confirmation_token_digest_is_hex_and_constant_time_verifiable() {
+        let draft = ManagedDraft::new(ConnectionId::new(), "gd", "<a@agentmail>", "hello").unwrap();
+        let (confirmation, prepared) =
+            SendConfirmation::prepare(AccessKeyId::new(), 1, &draft, preview(&draft), Utc::now())
+                .unwrap();
+        let digest = SendConfirmation::token_digest_hex(&prepared.token);
+        assert_eq!(digest.len(), 64);
+        assert!(confirmation.matches_token_digest_hex(&digest));
+        assert!(!confirmation.matches_token_digest_hex(&"0".repeat(64)));
+        assert!(!confirmation.matches_token_digest_hex("not-a-digest"));
+    }
     #[test]
     fn idempotency_key_reuse_with_different_payload_is_conflict() {
         let record = IdempotencyRecord::new("caller", "create", "key", "body");
