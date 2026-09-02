@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Redirect, Response},
@@ -25,7 +25,10 @@ use crate::{
     config::AppConfig,
     control_plane::{ControlPlaneError, ControlPlaneService, SessionCookiePolicy},
     crypto::{CryptoError, encrypt_refresh_token, hash_token, verify_token},
-    domain::identity::{ConnectionId, ConnectionStatus, GmailConnection, UserId},
+    domain::{
+        access::{AccessKey, AccessKeyId},
+        identity::{ConnectionId, ConnectionStatus, GmailConnection, UserId, UserRole},
+    },
     google_oidc::{GoogleJwksVerifier, GoogleOidcError},
     google_token::{GoogleTokenClient, GoogleTokenError, TokenSet},
     oauth::{
@@ -33,7 +36,7 @@ use crate::{
         OAuthFlowKind, OidcClaims, ValidatedOidcIdentity, validate_granted_gmail_scopes,
         validate_oidc_claims,
     },
-    repository::{EncryptedRefreshToken, Repository, RepositoryError},
+    repository::{EncryptedRefreshToken, Repository, RepositoryError, StoredAccessKey},
 };
 
 const LOGIN_TRANSACTION_COOKIE: &str = "__Host-agentmail_login_tx";
@@ -202,7 +205,284 @@ where
         .route(GMAIL_CALLBACK_PATH, get(gmail_callback::<V, E>))
         .route("/auth/google/gmail", post(gmail_start::<V, E>))
         .route("/auth/logout", post(logout::<V, E>))
+        .route(
+            "/control/access-keys",
+            get(list_access_keys::<V, E>).post(create_access_key::<V, E>),
+        )
+        .route(
+            "/control/access-keys/{key_id}/rotate",
+            post(rotate_access_key::<V, E>),
+        )
+        .route(
+            "/control/access-keys/{key_id}/revoke",
+            post(revoke_access_key::<V, E>),
+        )
+        .route(
+            "/control/access-keys/{key_id}/connections/{connection_id}",
+            axum::routing::put(grant_access_key::<V, E>).delete(remove_access_key_grant::<V, E>),
+        )
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateAccessKeyRequest {
+    name: String,
+    #[serde(default)]
+    connection_ids: Vec<Uuid>,
+}
+
+async fn list_access_keys<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    headers: HeaderMap,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let owner = match require_owner_session(&state, &headers, false).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    match state.repository.list_access_keys(owner.user_id).await {
+        Ok(keys) => (
+            StatusCode::OK,
+            Json(json!({
+                "access_keys": keys.iter().map(access_key_view).collect::<Vec<_>>()
+            })),
+        )
+            .into_response(),
+        Err(error) => error_response(error.into()),
+    }
+}
+
+async fn create_access_key<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateAccessKeyRequest>,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let owner = match require_owner_session(&state, &headers, true).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let connections = request
+        .connection_ids
+        .into_iter()
+        .map(ConnectionId::from_uuid)
+        .collect::<Vec<_>>();
+    let created = match AccessKey::generate(owner.user_id, request.name, connections) {
+        Ok(created) => created,
+        Err(_) => return control_api_error(StatusCode::BAD_REQUEST, "invalid_request"),
+    };
+    let stored = match state.repository.insert_access_key(&created).await {
+        Ok(stored) => stored,
+        Err(RepositoryError::InvalidValue(_)) => {
+            return control_api_error(StatusCode::BAD_REQUEST, "invalid_request");
+        }
+        Err(error) => return error_response(error.into()),
+    };
+    credential_response(&stored, created.credential)
+}
+
+async fn rotate_access_key<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    Path(key_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let owner = match require_owner_session(&state, &headers, true).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let key_id = AccessKeyId::from_uuid(key_id);
+    match state
+        .repository
+        .rotate_access_key(owner.user_id, key_id)
+        .await
+    {
+        Ok(Some(rotated)) => credential_response(&rotated.key, rotated.credential),
+        Ok(None) => control_api_error(StatusCode::NOT_FOUND, "not_found"),
+        Err(RepositoryError::Conflict) => control_api_error(StatusCode::CONFLICT, "invalid_state"),
+        Err(error) => error_response(error.into()),
+    }
+}
+
+async fn revoke_access_key<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    Path(key_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let owner = match require_owner_session(&state, &headers, true).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let key_id = AccessKeyId::from_uuid(key_id);
+    let existing = match state.repository.get_access_key(owner.user_id, key_id).await {
+        Ok(Some(key)) => key,
+        Ok(None) => return control_api_error(StatusCode::NOT_FOUND, "not_found"),
+        Err(error) => return error_response(error.into()),
+    };
+    if existing.status.accepts_requests()
+        && let Err(error) = state
+            .repository
+            .revoke_access_key(owner.user_id, key_id)
+            .await
+    {
+        return error_response(error.into());
+    }
+    match state.repository.get_access_key(owner.user_id, key_id).await {
+        Ok(Some(stored)) => (
+            StatusCode::OK,
+            Json(json!({"access_key": access_key_view(&stored)})),
+        )
+            .into_response(),
+        Ok(None) => control_api_error(StatusCode::NOT_FOUND, "not_found"),
+        Err(error) => error_response(error.into()),
+    }
+}
+
+async fn grant_access_key<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    Path((key_id, connection_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    mutate_access_key_grant(&state, &headers, key_id, connection_id, true).await
+}
+
+async fn remove_access_key_grant<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    Path((key_id, connection_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    mutate_access_key_grant(&state, &headers, key_id, connection_id, false).await
+}
+
+async fn mutate_access_key_grant<V, E>(
+    state: &ControlHttpState<V, E>,
+    headers: &HeaderMap,
+    key_id: Uuid,
+    connection_id: Uuid,
+    granted: bool,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let owner = match require_owner_session(state, headers, true).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let key_id = AccessKeyId::from_uuid(key_id);
+    match state.repository.get_access_key(owner.user_id, key_id).await {
+        Ok(Some(key)) if key.status.accepts_requests() => {}
+        Ok(Some(_)) => return control_api_error(StatusCode::CONFLICT, "invalid_state"),
+        Ok(None) => return control_api_error(StatusCode::NOT_FOUND, "not_found"),
+        Err(error) => return error_response(error.into()),
+    }
+    match state
+        .repository
+        .set_access_key_grant(key_id, ConnectionId::from_uuid(connection_id), granted)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(RepositoryError::InvalidValue(_)) => {
+            control_api_error(StatusCode::BAD_REQUEST, "invalid_connection")
+        }
+        Err(error) => error_response(error.into()),
+    }
+}
+
+async fn require_owner_session<V, E>(
+    state: &ControlHttpState<V, E>,
+    headers: &HeaderMap,
+    require_csrf: bool,
+) -> Result<SessionContext, Response>
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let token_hash = session_token_hash(headers).map_err(error_response)?;
+    let session = state
+        .control_plane
+        .authenticate_session(&token_hash, Utc::now())
+        .await
+        .map_err(|error| error_response(error.into()))?;
+    let user = state
+        .repository
+        .get_user(session.user_id)
+        .await
+        .map_err(|error| error_response(error.into()))?
+        .ok_or_else(|| control_api_error(StatusCode::FORBIDDEN, "forbidden"))?;
+    if user.role != UserRole::Owner {
+        return Err(control_api_error(StatusCode::FORBIDDEN, "forbidden"));
+    }
+    if require_csrf {
+        let presented = headers
+            .get("x-csrf-token")
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| control_api_error(StatusCode::BAD_REQUEST, "invalid_csrf"))?;
+        if !state
+            .control_plane
+            .verify_csrf(&session.csrf_token_hash, presented)
+        {
+            return Err(control_api_error(StatusCode::BAD_REQUEST, "invalid_csrf"));
+        }
+    }
+    Ok(SessionContext {
+        user_id: session.user_id,
+        token_hash,
+        csrf_token_hash: session.csrf_token_hash,
+    })
+}
+
+fn access_key_view(key: &StoredAccessKey) -> serde_json::Value {
+    json!({
+        "id": key.id,
+        "name": key.name,
+        "public_prefix": key.public_prefix,
+        "generation": key.generation,
+        "status": key.status,
+        "connection_ids": key.grants.iter().copied().collect::<Vec<_>>(),
+        "last_used_at": key.last_used_at,
+    })
+}
+
+fn credential_response(key: &StoredAccessKey, credential: String) -> Response {
+    let mut response = (
+        StatusCode::OK,
+        Json(json!({
+            "access_key": access_key_view(key),
+            "credential": credential,
+            "credential_visible_once": true,
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn control_api_error(status: StatusCode, code: &'static str) -> Response {
+    (status, Json(json!({"error": code}))).into_response()
 }
 
 pub async fn login_start<V, E>(State(state): State<ControlHttpState<V, E>>) -> Response
@@ -804,27 +1084,192 @@ fn redirect_with_cookie(location: &str, cookie: String) -> Response {
 }
 
 fn error_response(error: ControlHttpError) -> Response {
-    let status = match error {
+    let (status, code) = match error {
         ControlHttpError::ControlPlane(ControlPlaneError::Unauthenticated)
-        | ControlHttpError::InvalidTransactionCookie => StatusCode::UNAUTHORIZED,
+        | ControlHttpError::InvalidTransactionCookie => {
+            (StatusCode::UNAUTHORIZED, "authentication_failed")
+        }
+        ControlHttpError::Repository(_)
+        | ControlHttpError::ControlPlane(ControlPlaneError::Repository(_)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
+        }
         ControlHttpError::OAuth(_)
         | ControlHttpError::GoogleToken(_)
         | ControlHttpError::Crypto(_)
-        | ControlHttpError::Repository(_)
         | ControlHttpError::ControlPlane(_)
         | ControlHttpError::InvalidRequest
         | ControlHttpError::OidcVerification
         | ControlHttpError::MissingIdToken
-        | ControlHttpError::NonceMismatch => StatusCode::BAD_REQUEST,
+        | ControlHttpError::NonceMismatch => (StatusCode::BAD_REQUEST, "authentication_failed"),
     };
-    (status, Json(json!({"error":"authentication failed"}))).into_response()
+    (status, Json(json!({"error":code}))).into_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::Database;
+    use crate::{
+        database::Database,
+        domain::{
+            access::AccessKey,
+            identity::{GMAIL_COMPOSE_SCOPE, GMAIL_READONLY_SCOPE, SessionId, User, UserRole},
+        },
+        repository::NewWebSession,
+    };
+    use axum::{body::Body, http::Method};
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+    use tower::ServiceExt;
+
+    #[derive(Clone)]
+    struct UnusedVerifier;
+
+    #[async_trait::async_trait]
+    impl OidcTokenVerifier for UnusedVerifier {
+        async fn verify_with_refresh(
+            &self,
+            _id_token: &str,
+        ) -> Result<OidcClaims, GoogleOidcError> {
+            panic!("OIDC verification is not used by access-key route tests")
+        }
+    }
+
+    #[derive(Clone)]
+    struct UnusedExchanger;
+
+    #[async_trait::async_trait]
+    impl OAuthCodeExchanger for UnusedExchanger {
+        async fn exchange_code(
+            &self,
+            _code: &str,
+            _code_verifier: &SecretString,
+        ) -> Result<TokenSet, GoogleTokenError> {
+            panic!("OAuth exchange is not used by access-key route tests")
+        }
+    }
+
+    fn test_config() -> AppConfig {
+        let key = URL_SAFE_NO_PAD.encode([11_u8; 32]);
+        AppConfig::from_map(BTreeMap::from([
+            ("APP_ENV".to_owned(), "production".to_owned()),
+            (
+                "PUBLIC_BASE_URL".to_owned(),
+                "https://agentmail.example".to_owned(),
+            ),
+            ("OWNER_EMAIL".to_owned(), "owner@example.com".to_owned()),
+            (
+                "GOOGLE_LOGIN_CLIENT_ID".to_owned(),
+                "login-client-id".to_owned(),
+            ),
+            (
+                "GOOGLE_GMAIL_CLIENT_ID".to_owned(),
+                "gmail-client-id".to_owned(),
+            ),
+            ("LOGIN_CLIENT_SECRET".to_owned(), "l".repeat(32)),
+            ("GMAIL_CLIENT_SECRET".to_owned(), "g".repeat(32)),
+            ("SESSION_SECRET".to_owned(), "s".repeat(32)),
+            ("CSRF_SECRET".to_owned(), "c".repeat(32)),
+            (
+                "CREDENTIAL_ENCRYPTION_KEYRING".to_owned(),
+                format!("v1={key}"),
+            ),
+        ]))
+        .unwrap()
+    }
+
+    async fn key_fixture(
+        role: UserRole,
+    ) -> (Router, Repository, User, GmailConnection, String, String) {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        database.migrate().await.unwrap();
+        let repository = Repository::new(&database);
+        let user = User::new("test-sub", "owner@example.com", role, Utc::now()).unwrap();
+        repository.insert_user(&user).await.unwrap();
+        let connection = GmailConnection::new(
+            user.id,
+            "gmail-sub",
+            "owner@example.com",
+            vec![GMAIL_READONLY_SCOPE.into(), GMAIL_COMPOSE_SCOPE.into()],
+        )
+        .unwrap();
+        repository
+            .insert_connection(&connection, None)
+            .await
+            .unwrap();
+        let session_token = "control-test-session".to_owned();
+        let csrf_token = "control-test-csrf".to_owned();
+        let now = Utc::now();
+        repository
+            .insert_web_session(&NewWebSession {
+                id: SessionId::new(),
+                user_id: user.id,
+                token_hash: hash_token(&session_token),
+                csrf_token_hash: hash_token(&csrf_token),
+                idle_expires_at: now + Duration::hours(1),
+                absolute_expires_at: now + Duration::hours(1),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        let state = ControlHttpState::new(
+            test_config(),
+            repository.clone(),
+            UnusedVerifier,
+            UnusedExchanger,
+            UnusedExchanger,
+        )
+        .unwrap();
+        (
+            router(state),
+            repository,
+            user,
+            connection,
+            session_token,
+            csrf_token,
+        )
+    }
+
+    async fn control_json(
+        app: &Router,
+        method: Method,
+        uri: String,
+        session_token: Option<&str>,
+        csrf_token: Option<&str>,
+        body: Value,
+    ) -> (StatusCode, HeaderMap, Value) {
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(session_token) = session_token {
+            request = request.header(
+                header::COOKIE,
+                format!("__Host-agentmail_session={session_token}"),
+            );
+        }
+        if let Some(csrf_token) = csrf_token {
+            request = request.header("x-csrf-token", csrf_token);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                request
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, headers, body)
+    }
 
     #[test]
     fn host_headers_cannot_change_fixed_callback_url() {
@@ -860,6 +1305,271 @@ mod tests {
             HeaderValue::from_static("agentmail_login_tx=nope"),
         );
         assert!(transaction_cookie_value(&headers, LOGIN_TRANSACTION_COOKIE).is_err());
+    }
+
+    #[tokio::test]
+    async fn access_key_list_requires_owner_session_and_redacts_credentials() {
+        let (app, repository, user, connection, session, _csrf) =
+            key_fixture(UserRole::Owner).await;
+        let created = AccessKey::generate(user.id, "listed", [connection.id]).unwrap();
+        let credential = created.credential.clone();
+        repository.insert_access_key(&created).await.unwrap();
+
+        let (status, _, _) = control_json(
+            &app,
+            Method::GET,
+            "/control/access-keys".to_owned(),
+            None,
+            None,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, _, listed) = control_json(
+            &app,
+            Method::GET,
+            "/control/access-keys".to_owned(),
+            Some(&session),
+            None,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["access_keys"].as_array().unwrap().len(), 1);
+        let rendered = listed.to_string();
+        assert!(!rendered.contains(&credential));
+        assert!(!rendered.contains("secret_hash"));
+        assert!(
+            repository
+                .authenticate_access_key(&credential)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn access_key_routes_enforce_csrf_rotation_revocation_and_grants() {
+        let (app, repository, _user, connection, session, csrf) =
+            key_fixture(UserRole::Owner).await;
+        let create_body = json!({"name":"managed","connection_ids":[]});
+        let (status, _, _) = control_json(
+            &app,
+            Method::POST,
+            "/control/access-keys".to_owned(),
+            Some(&session),
+            None,
+            create_body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _, _) = control_json(
+            &app,
+            Method::POST,
+            "/control/access-keys".to_owned(),
+            Some(&session),
+            Some("wrong-csrf"),
+            create_body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, headers, created) = control_json(
+            &app,
+            Method::POST,
+            "/control/access-keys".to_owned(),
+            Some(&session),
+            Some(&csrf),
+            create_body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(created["credential_visible_once"], true);
+        let key_id = created["access_key"]["id"].as_str().unwrap().to_owned();
+        let credential = created["credential"].as_str().unwrap().to_owned();
+        let stored_hash: String =
+            sqlx::query_scalar("SELECT secret_hash FROM access_keys WHERE id=?")
+                .bind(&key_id)
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        assert!(!stored_hash.contains(&credential));
+        assert!(
+            repository
+                .authenticate_access_key(&credential)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let grant_path = format!(
+            "/control/access-keys/{key_id}/connections/{}",
+            connection.id
+        );
+        let (status, _, _) = control_json(
+            &app,
+            Method::PUT,
+            grant_path.clone(),
+            Some(&session),
+            Some(&csrf),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let parsed_key = AccessKeyId::from_uuid(Uuid::parse_str(&key_id).unwrap());
+        assert!(
+            repository
+                .access_key_allows(parsed_key, connection.id)
+                .await
+                .unwrap()
+        );
+        let (status, _, _) = control_json(
+            &app,
+            Method::DELETE,
+            grant_path,
+            Some(&session),
+            Some(&csrf),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(
+            !repository
+                .access_key_allows(parsed_key, connection.id)
+                .await
+                .unwrap()
+        );
+
+        let foreign = User::new(
+            "member-sub",
+            "member@example.com",
+            UserRole::Member,
+            Utc::now(),
+        )
+        .unwrap();
+        repository.insert_user(&foreign).await.unwrap();
+        let foreign_connection = GmailConnection::new(
+            foreign.id,
+            "foreign-gmail-sub",
+            "member@example.com",
+            vec![GMAIL_READONLY_SCOPE.into(), GMAIL_COMPOSE_SCOPE.into()],
+        )
+        .unwrap();
+        repository
+            .insert_connection(&foreign_connection, None)
+            .await
+            .unwrap();
+        let foreign_key =
+            AccessKey::generate(foreign.id, "foreign", [foreign_connection.id]).unwrap();
+        let foreign_key = repository.insert_access_key(&foreign_key).await.unwrap();
+        let foreign_grant_path = format!(
+            "/control/access-keys/{key_id}/connections/{}",
+            foreign_connection.id
+        );
+        let (status, _, _) = control_json(
+            &app,
+            Method::PUT,
+            foreign_grant_path,
+            Some(&session),
+            Some(&csrf),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _, _) = control_json(
+            &app,
+            Method::POST,
+            format!("/control/access-keys/{}/rotate", foreign_key.id),
+            Some(&session),
+            Some(&csrf),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, headers, rotated) = control_json(
+            &app,
+            Method::POST,
+            format!("/control/access-keys/{key_id}/rotate"),
+            Some(&session),
+            Some(&csrf),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        let rotated_credential = rotated["credential"].as_str().unwrap();
+        assert_ne!(rotated_credential, credential);
+        assert!(
+            repository
+                .authenticate_access_key(&credential)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository
+                .authenticate_access_key(rotated_credential)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let (status, _, _) = control_json(
+            &app,
+            Method::POST,
+            format!("/control/access-keys/{key_id}/revoke"),
+            Some(&session),
+            Some(&csrf),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            repository
+                .authenticate_access_key(rotated_credential)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (status, _, listed) = control_json(
+            &app,
+            Method::GET,
+            "/control/access-keys".to_owned(),
+            Some(&session),
+            None,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!listed.to_string().contains(rotated_credential));
+    }
+
+    #[tokio::test]
+    async fn access_key_routes_reject_member_session() {
+        let (app, _, _, _, session, csrf) = key_fixture(UserRole::Member).await;
+        let (status, _, _) = control_json(
+            &app,
+            Method::GET,
+            "/control/access-keys".to_owned(),
+            Some(&session),
+            None,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _, _) = control_json(
+            &app,
+            Method::POST,
+            "/control/access-keys".to_owned(),
+            Some(&session),
+            Some(&csrf),
+            json!({"name":"member-key"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

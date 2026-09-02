@@ -44,6 +44,9 @@ impl KeyPublicId {
     pub fn new() -> Self {
         Self(Uuid::now_v7())
     }
+    pub(crate) const fn from_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
 }
 impl Default for KeyPublicId {
     fn default() -> Self {
@@ -134,7 +137,36 @@ pub struct NewAccessKey {
     pub credential: String,
 }
 
+pub(crate) struct PersistedAccessKey {
+    pub id: AccessKeyId,
+    pub owner_id: UserId,
+    pub name: String,
+    pub public_id: KeyPublicId,
+    pub secret_hash: String,
+    pub generation: u64,
+    pub status: AccessKeyStatus,
+    pub grants: GrantSet,
+}
+
 impl AccessKey {
+    /// Rebuild a key loaded from durable storage for domain transitions.
+    pub(crate) fn from_persisted(value: PersistedAccessKey) -> Self {
+        Self {
+            id: value.id,
+            owner_id: value.owner_id,
+            name: value.name,
+            public_id: value.public_id,
+            secret_hash: value.secret_hash,
+            generation: value.generation,
+            status: value.status,
+            grants: value.grants,
+        }
+    }
+
+    pub(crate) fn secret_hash(&self) -> &str {
+        &self.secret_hash
+    }
+
     pub fn generate(
         owner_id: UserId,
         name: impl Into<String>,

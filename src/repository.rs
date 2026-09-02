@@ -4,8 +4,8 @@ use crate::{
     database::Database,
     domain::{
         access::{
-            AccessError, AccessKey, AccessKeyId, AccessKeyStatus, GrantSet, NewAccessKey,
-            hash_secret, parse_credential, verify_secret,
+            AccessError, AccessKey, AccessKeyId, AccessKeyStatus, GrantSet, KeyPublicId,
+            NewAccessKey, hash_secret, parse_credential, verify_secret,
         },
         delivery::{
             ConfirmationId, DraftId, DraftVersion, ManagedDraft, ManagedDraftState,
@@ -891,6 +891,30 @@ impl Repository {
     }
     async fn insert_access_key_record(&self, k: &StoredAccessKey) -> Result<(), RepositoryError> {
         let mut tx = self.pool.begin().await?;
+        let active_owner: i64 =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id=? AND status='active')")
+                .bind(k.owner_id.to_string())
+                .fetch_one(&mut *tx)
+                .await?;
+        if active_owner == 0 {
+            return Err(RepositoryError::InvalidValue(
+                "access key owner must be active".to_owned(),
+            ));
+        }
+        for connection in k.grants.iter() {
+            let valid: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM gmail_connections c JOIN users u ON u.id=c.owner_id WHERE c.id=? AND c.owner_id=? AND c.status='active' AND u.status='active')",
+            )
+            .bind(connection.to_string())
+            .bind(k.owner_id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+            if valid == 0 {
+                return Err(RepositoryError::InvalidValue(
+                    "initial grant requires an active same-owner connection".to_owned(),
+                ));
+            }
+        }
         sqlx::query("INSERT INTO access_keys (id,owner_id,name,public_prefix,secret_hash,generation,status,last_used_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").bind(k.id.to_string()).bind(k.owner_id.to_string()).bind(&k.name).bind(&k.public_prefix).bind(&k.secret_hash).bind(i64::try_from(k.generation)?).bind(key_status(k.status)).bind(k.last_used_at.map(encode_time)).bind(encode_time(Utc::now())).bind(encode_time(Utc::now())).execute(&mut *tx).await?;
         for c in k.grants.iter() {
             sqlx::query("INSERT INTO access_key_grants (access_key_id,connection_id,created_at) VALUES (?,?,?)").bind(k.id.to_string()).bind(c.to_string()).bind(encode_time(Utc::now())).execute(&mut *tx).await?;
@@ -905,6 +929,126 @@ impl Repository {
         let row=sqlx::query("SELECT id,owner_id,name,public_prefix,secret_hash,generation,status,last_used_at FROM access_keys WHERE public_prefix=?").bind(prefix).fetch_optional(&self.pool).await?;
         let Some(row) = row else { return Ok(None) };
         self.access_key_from_row(row).await.map(Some)
+    }
+    pub async fn list_access_keys(
+        &self,
+        owner_id: UserId,
+    ) -> Result<Vec<StoredAccessKey>, RepositoryError> {
+        let rows = sqlx::query("SELECT k.id,k.owner_id,k.name,k.public_prefix,k.secret_hash,k.generation,k.status,k.last_used_at FROM access_keys k JOIN users u ON u.id=k.owner_id WHERE k.owner_id=? AND u.status='active' ORDER BY k.name,k.id")
+            .bind(owner_id.to_string())
+            .fetch_all(&self.pool)
+            .await?;
+        let mut keys = Vec::with_capacity(rows.len());
+        for row in rows {
+            keys.push(self.access_key_from_row(row).await?);
+        }
+        Ok(keys)
+    }
+    pub async fn get_access_key(
+        &self,
+        owner_id: UserId,
+        key_id: AccessKeyId,
+    ) -> Result<Option<StoredAccessKey>, RepositoryError> {
+        let row = sqlx::query("SELECT k.id,k.owner_id,k.name,k.public_prefix,k.secret_hash,k.generation,k.status,k.last_used_at FROM access_keys k JOIN users u ON u.id=k.owner_id WHERE k.id=? AND k.owner_id=? AND u.status='active'")
+            .bind(key_id.to_string())
+            .bind(owner_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => self.access_key_from_row(row).await.map(Some),
+            None => Ok(None),
+        }
+    }
+    pub async fn rotate_access_key(
+        &self,
+        owner_id: UserId,
+        key_id: AccessKeyId,
+    ) -> Result<Option<RotatedAccessKey>, RepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query("SELECT k.id,k.owner_id,k.name,k.public_prefix,k.secret_hash,k.generation,k.status,k.last_used_at FROM access_keys k JOIN users u ON u.id=k.owner_id WHERE k.id=? AND k.owner_id=? AND u.status='active'")
+            .bind(key_id.to_string())
+            .bind(owner_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let id = AccessKeyId::from_uuid(parse_uuid(row.try_get("id")?)?);
+        let key_owner = UserId::from_uuid(parse_uuid(row.try_get("owner_id")?)?);
+        let public_id = KeyPublicId::from_uuid(parse_uuid(row.try_get("public_prefix")?)?);
+        let name: String = row.try_get("name")?;
+        let secret_hash: String = row.try_get("secret_hash")?;
+        let generation = u64::try_from(row.try_get::<i64, _>("generation")?)?;
+        let status = parse_key_status(row.try_get("status")?)?;
+        let last_used_at = parse_opt_time(row.try_get("last_used_at")?)?;
+        let grant_rows = sqlx::query("SELECT connection_id FROM access_key_grants WHERE access_key_id=? ORDER BY connection_id")
+            .bind(id.to_string())
+            .fetch_all(&mut *transaction)
+            .await?;
+        let grants = GrantSet::new(
+            grant_rows
+                .into_iter()
+                .map(|row| {
+                    parse_uuid(row.try_get::<String, _>("connection_id")?)
+                        .map(ConnectionId::from_uuid)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let mut key = AccessKey::from_persisted(crate::domain::access::PersistedAccessKey {
+            id,
+            owner_id: key_owner,
+            name: name.clone(),
+            public_id,
+            secret_hash,
+            generation,
+            status,
+            grants: grants.clone(),
+        });
+        let credential = key.rotate().map_err(|error| match error {
+            AccessError::Revoked => RepositoryError::Conflict,
+            error => RepositoryError::Access(error),
+        })?;
+        let snapshot = StoredAccessKey {
+            id,
+            owner_id: key_owner,
+            name,
+            public_prefix: public_id.to_string(),
+            secret_hash: key.secret_hash().to_owned(),
+            generation: key.generation,
+            status: key.status,
+            grants,
+            last_used_at,
+        };
+        let updated = sqlx::query("UPDATE access_keys SET secret_hash=?,generation=?,updated_at=? WHERE id=? AND owner_id=? AND status='active' AND generation=?")
+            .bind(key.secret_hash())
+            .bind(i64::try_from(key.generation)?)
+            .bind(encode_time(Utc::now()))
+            .bind(key_id.to_string())
+            .bind(owner_id.to_string())
+            .bind(i64::try_from(generation)?)
+            .execute(&mut *transaction)
+            .await?;
+        if updated.rows_affected() != 1 {
+            return Err(RepositoryError::Conflict);
+        }
+        transaction.commit().await?;
+        Ok(Some(RotatedAccessKey {
+            key: snapshot,
+            credential,
+        }))
+    }
+    pub async fn revoke_access_key(
+        &self,
+        owner_id: UserId,
+        key_id: AccessKeyId,
+    ) -> Result<bool, RepositoryError> {
+        let updated = sqlx::query("UPDATE access_keys SET status='revoked',generation=generation+1,updated_at=? WHERE id=? AND owner_id=? AND status='active' AND EXISTS (SELECT 1 FROM users WHERE users.id=access_keys.owner_id AND users.status='active')")
+            .bind(encode_time(Utc::now()))
+            .bind(key_id.to_string())
+            .bind(owner_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(updated.rows_affected() == 1)
     }
     pub async fn authenticate_access_key(
         &self,
@@ -1262,6 +1406,20 @@ impl StoredAccessKey {
     }
     pub fn allows(&self, c: ConnectionId) -> bool {
         self.status.accepts_requests() && self.grants.contains(c)
+    }
+}
+
+pub struct RotatedAccessKey {
+    pub key: StoredAccessKey,
+    pub credential: String,
+}
+
+impl fmt::Debug for RotatedAccessKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RotatedAccessKey")
+            .field("key", &self.key)
+            .field("credential", &"[REDACTED]")
+            .finish()
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2059,6 +2217,143 @@ mod tests {
                 .access_key_allows(stored.id, foreign_connection.id)
                 .await
                 .unwrap()
+        );
+        let invalid_initial_grant =
+            AccessKey::generate(first.id, "foreign-initial", [foreign_connection.id]).unwrap();
+        assert!(matches!(
+            repository.insert_access_key(&invalid_initial_grant).await,
+            Err(RepositoryError::InvalidValue(_))
+        ));
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM access_keys WHERE name='foreign-initial'")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn owner_scoped_access_keys_rotate_revoke_and_preserve_grants() {
+        let repository = repository().await;
+        let first = owner();
+        let second = User::new(
+            "member-sub",
+            "member@example.com",
+            UserRole::Member,
+            Utc::now(),
+        )
+        .unwrap();
+        repository.insert_user(&first).await.unwrap();
+        repository.insert_user(&second).await.unwrap();
+        let connection = connection(&repository, &first).await;
+        let created = AccessKey::generate(first.id, "managed-key", [connection.id]).unwrap();
+        let old_credential = created.credential.clone();
+        let stored = repository.insert_access_key(&created).await.unwrap();
+        assert!(
+            repository
+                .authenticate_access_key(&old_credential)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        assert_eq!(
+            repository.list_access_keys(first.id).await.unwrap().len(),
+            1
+        );
+        assert!(
+            repository
+                .get_access_key(first.id, stored.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            repository
+                .get_access_key(second.id, stored.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository
+                .rotate_access_key(second.id, stored.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let rotated = repository
+            .rotate_access_key(first.id, stored.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let credential = rotated.credential.clone();
+        assert_ne!(credential, old_credential);
+        assert_eq!(rotated.key.generation, stored.generation + 1);
+        assert!(rotated.key.allows(connection.id));
+        assert!(rotated.key.last_used_at.is_some());
+        assert!(!format!("{rotated:?}").contains(&credential));
+        assert!(
+            repository
+                .authenticate_access_key(&old_credential)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository
+                .authenticate_access_key(&credential)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        assert!(
+            !repository
+                .revoke_access_key(second.id, stored.id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            repository
+                .revoke_access_key(first.id, stored.id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !repository
+                .revoke_access_key(first.id, stored.id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            repository
+                .authenticate_access_key(&credential)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            repository.rotate_access_key(first.id, stored.id).await,
+            Err(RepositoryError::Conflict)
+        ));
+        let mut inactive = first.clone();
+        assert!(inactive.begin_revoke(Utc::now()));
+        repository.update_user(&inactive).await.unwrap();
+        assert!(
+            repository
+                .list_access_keys(first.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repository
+                .get_access_key(first.id, stored.id)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
