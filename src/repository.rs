@@ -89,7 +89,7 @@ impl fmt::Debug for EncryptedPkceVerifier {
 /// One-time material returned by a successful durable OAuth callback claim.
 /// State is intentionally absent: callers receive only the nonce hash and
 /// encrypted verifier needed to complete the exchange.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct OAuthTransactionClaim {
     pub id: Uuid,
     pub flow: OAuthFlowKind,
@@ -97,8 +97,25 @@ pub struct OAuthTransactionClaim {
     pub pkce_verifier: EncryptedPkceVerifier,
     pub initiated_by: Option<UserId>,
     pub target_connection: Option<ConnectionId>,
+    pub invitation_token_hash: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for OAuthTransactionClaim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthTransactionClaim")
+            .field("id", &self.id)
+            .field("flow", &self.flow)
+            .field("nonce_hash", &self.nonce_hash)
+            .field("pkce_verifier", &self.pkce_verifier)
+            .field("initiated_by", &self.initiated_by)
+            .field("target_connection", &self.target_connection)
+            .field("invitation_token_hash", &"[REDACTED]")
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// Durable browser session metadata. Both bearer values are already one-way
@@ -126,6 +143,36 @@ pub struct NewWebSession {
     pub idle_expires_at: DateTime<Utc>,
     pub absolute_expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+}
+
+/// Hash-only browser-session credentials without a user binding. Atomic login
+/// methods select the user inside their transaction and never trust a caller
+/// supplied user ID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewSessionCredentials {
+    pub id: SessionId,
+    pub token_hash: String,
+    pub csrf_token_hash: String,
+    pub idle_expires_at: DateTime<Utc>,
+    pub absolute_expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Atomic invitation claim plus Member-session creation input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewInvitationMemberSession {
+    pub invitation_token_hash: String,
+    pub verified_email: String,
+    pub google_sub: String,
+    pub session: NewSessionCredentials,
+}
+
+/// Atomic re-login input for an already active, exactly matched user.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewExistingUserSession {
+    pub verified_email: String,
+    pub google_sub: String,
+    pub session: NewSessionCredentials,
 }
 
 /// Atomic Owner bootstrap/login input. Session credentials are already
@@ -233,8 +280,16 @@ impl Repository {
         record: &OAuthTransactionRecord,
         pkce_verifier: &EncryptedPkceVerifier,
     ) -> Result<(), RepositoryError> {
+        if let Some(invitation_token_hash) = &record.invitation_token_hash {
+            validate_token_hash(invitation_token_hash, "invitation token hash")?;
+            if record.flow != OAuthFlowKind::Login {
+                return Err(RepositoryError::InvalidValue(
+                    "only login OAuth transactions may bind invitations".to_owned(),
+                ));
+            }
+        }
         sqlx::query(
-            "INSERT INTO oauth_transactions (id,flow_type,state_hash,pkce_verifier,nonce_hash,initiated_by,target_connection_id,expires_at,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO oauth_transactions (id,flow_type,state_hash,pkce_verifier,nonce_hash,initiated_by,target_connection_id,invitation_token_hash,expires_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(id.to_string())
         .bind(oauth_flow(record.flow))
@@ -243,6 +298,7 @@ impl Repository {
         .bind(&record.nonce_hash)
         .bind(record.initiated_by.as_deref())
         .bind(record.target_connection.as_deref())
+        .bind(record.invitation_token_hash.as_deref())
         .bind(encode_time(record.expires_at))
         .bind(encode_time(record.created_at))
         .execute(&self.pool)
@@ -261,7 +317,7 @@ impl Repository {
     ) -> Result<Option<OAuthTransactionClaim>, RepositoryError> {
         let state_hash = hash_token(presented_state);
         let row = sqlx::query(
-            "UPDATE oauth_transactions SET consumed_at=? WHERE id=? AND consumed_at IS NULL AND expires_at > ? AND state_hash=? RETURNING id,flow_type,nonce_hash,pkce_verifier,initiated_by,target_connection_id,created_at,expires_at",
+            "UPDATE oauth_transactions SET consumed_at=? WHERE id=? AND consumed_at IS NULL AND expires_at > ? AND state_hash=? RETURNING id,flow_type,nonce_hash,pkce_verifier,initiated_by,target_connection_id,invitation_token_hash,created_at,expires_at",
         )
         .bind(encode_time(now))
         .bind(id.to_string())
@@ -282,7 +338,7 @@ impl Repository {
     ) -> Result<Option<OAuthTransactionClaim>, RepositoryError> {
         let state_hash = hash_token(presented_state);
         let row = sqlx::query(
-            "UPDATE oauth_transactions SET consumed_at=? WHERE id=? AND flow_type=? AND consumed_at IS NULL AND expires_at > ? AND state_hash=? RETURNING id,flow_type,nonce_hash,pkce_verifier,initiated_by,target_connection_id,created_at,expires_at",
+            "UPDATE oauth_transactions SET consumed_at=? WHERE id=? AND flow_type=? AND consumed_at IS NULL AND expires_at > ? AND state_hash=? RETURNING id,flow_type,nonce_hash,pkce_verifier,initiated_by,target_connection_id,invitation_token_hash,created_at,expires_at",
         )
         .bind(encode_time(now))
         .bind(id.to_string())
@@ -437,6 +493,63 @@ impl Repository {
             .await?;
         tx.commit().await?;
         Ok(Some((invitation, user)))
+    }
+
+    /// Atomically consume a matching invitation, create its Member, and
+    /// create that Member's browser session. A session failure rolls back
+    /// both the user creation and invitation consumption.
+    pub async fn claim_invitation_with_session(
+        &self,
+        request: &NewInvitationMemberSession,
+        now: DateTime<Utc>,
+    ) -> Result<Option<(Invitation, User, WebSession)>, RepositoryError> {
+        validate_token_hash(&request.invitation_token_hash, "invitation token hash")?;
+        let verified_email = normalized_verified_email(&request.verified_email)?;
+        validate_google_sub(&request.google_sub)?;
+        validate_session_credentials(&request.session)?;
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query("UPDATE invitations SET accepted_at=? WHERE token_hash=? AND target_email=? AND accepted_at IS NULL AND expires_at > ? AND EXISTS (SELECT 1 FROM users WHERE users.id=invitations.invited_by AND users.role='owner' AND users.status='active') RETURNING id,target_email,token_hash,invited_by,expires_at,accepted_at,created_at")
+            .bind(encode_time(now))
+            .bind(&request.invitation_token_hash)
+            .bind(&verified_email)
+            .bind(encode_time(now))
+            .fetch_optional(&mut *transaction)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let invitation = invitation_from_row(row)?;
+        let user = User::new(&request.google_sub, &verified_email, UserRole::Member, now)
+            .map_err(|_| RepositoryError::InvalidValue("invalid member identity".to_owned()))?;
+        insert_user_in_transaction(&mut transaction, &user).await?;
+        let session =
+            insert_session_in_transaction(&mut transaction, user.id, &request.session).await?;
+        transaction.commit().await?;
+        Ok(Some((invitation, user, session)))
+    }
+
+    /// Create a session only for an existing active user whose Google subject
+    /// and normalized login email both exactly match the verified OIDC result.
+    pub async fn login_existing_user_with_session(
+        &self,
+        request: &NewExistingUserSession,
+    ) -> Result<Option<(User, WebSession)>, RepositoryError> {
+        let verified_email = normalized_verified_email(&request.verified_email)?;
+        validate_google_sub(&request.google_sub)?;
+        validate_session_credentials(&request.session)?;
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query("SELECT id,google_sub,login_email,role,status,last_activity_at,created_at,updated_at FROM users WHERE google_sub=? AND login_email=? AND status='active'")
+            .bind(&request.google_sub)
+            .bind(&verified_email)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        let Some(user) = row.map(user_from_row).transpose()? else {
+            return Ok(None);
+        };
+        let session =
+            insert_session_in_transaction(&mut transaction, user.id, &request.session).await?;
+        transaction.commit().await?;
+        Ok(Some((user, session)))
     }
 
     /// Revoke an unaccepted invitation. Deletion is the schema's revocation
@@ -1499,6 +1612,79 @@ impl crate::gmail_credentials::GmailCredentialStore for Repository {
         Ok(())
     }
 }
+fn normalized_verified_email(value: &str) -> Result<String, RepositoryError> {
+    normalize_email(value)
+        .map_err(|_| RepositoryError::InvalidValue("invalid verified email".to_owned()))
+}
+
+fn validate_google_sub(value: &str) -> Result<(), RepositoryError> {
+    if value.trim().is_empty() {
+        return Err(RepositoryError::InvalidValue(
+            "google subject is empty".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_session_credentials(session: &NewSessionCredentials) -> Result<(), RepositoryError> {
+    validate_token_hash(&session.token_hash, "session token hash")?;
+    validate_token_hash(&session.csrf_token_hash, "CSRF token hash")?;
+    if session.idle_expires_at <= session.created_at
+        || session.absolute_expires_at <= session.created_at
+    {
+        return Err(RepositoryError::InvalidValue(
+            "session expiry must be in the future".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn insert_user_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    user: &User,
+) -> Result<(), RepositoryError> {
+    sqlx::query("INSERT INTO users (id,google_sub,login_email,role,status,last_activity_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)")
+        .bind(user.id.to_string())
+        .bind(&user.google_sub)
+        .bind(&user.email)
+        .bind(user_role(user.role))
+        .bind(user_status(user.status))
+        .bind(user.last_activity_at.map(encode_time))
+        .bind(encode_time(user.created_at))
+        .bind(encode_time(user.updated_at))
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
+async fn insert_session_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    user_id: UserId,
+    session: &NewSessionCredentials,
+) -> Result<WebSession, RepositoryError> {
+    sqlx::query("INSERT INTO web_sessions (id,token_hash,user_id,csrf_token_hash,idle_expires_at,absolute_expires_at,created_at,last_seen_at) VALUES (?,?,?,?,?,?,?,?)")
+        .bind(session.id.to_string())
+        .bind(&session.token_hash)
+        .bind(user_id.to_string())
+        .bind(&session.csrf_token_hash)
+        .bind(encode_time(session.idle_expires_at))
+        .bind(encode_time(session.absolute_expires_at))
+        .bind(encode_time(session.created_at))
+        .bind(encode_time(session.created_at))
+        .execute(&mut **transaction)
+        .await?;
+    Ok(WebSession {
+        id: session.id,
+        user_id,
+        token_hash: session.token_hash.clone(),
+        csrf_token_hash: session.csrf_token_hash.clone(),
+        idle_expires_at: session.idle_expires_at,
+        absolute_expires_at: session.absolute_expires_at,
+        created_at: session.created_at,
+        last_seen_at: session.created_at,
+    })
+}
+
 fn oauth_flow(v: OAuthFlowKind) -> &'static str {
     match v {
         OAuthFlowKind::Login => "login",
@@ -1535,6 +1721,7 @@ fn oauth_claim_from_row(
             r.try_get("target_connection_id")?,
             ConnectionId::from_uuid,
         )?,
+        invitation_token_hash: r.try_get("invitation_token_hash")?,
         created_at: parse_time(r.try_get("created_at")?)?,
         expires_at: parse_time(r.try_get("expires_at")?)?,
     })
@@ -2735,6 +2922,250 @@ mod tests {
             Some(DurableSendClaim::Replayed { outcome: replayed, .. }) if replayed == outcome
         ));
     }
+    fn session_credentials(seed: &str, now: DateTime<Utc>) -> NewSessionCredentials {
+        NewSessionCredentials {
+            id: SessionId::new(),
+            token_hash: hash_token(format!("{seed}-session")),
+            csrf_token_hash: hash_token(format!("{seed}-csrf")),
+            idle_expires_at: now + Duration::minutes(10),
+            absolute_expires_at: now + Duration::hours(1),
+            created_at: now,
+        }
+    }
+
+    async fn invitation_for(
+        repository: &Repository,
+        owner: &User,
+        target_email: &str,
+        token_hash: String,
+        now: DateTime<Utc>,
+    ) -> Invitation {
+        repository
+            .create_invitation(&NewInvitation {
+                id: crate::domain::identity::InvitationId::new(),
+                target_email: target_email.to_owned(),
+                token_hash,
+                invited_by: owner.id,
+                expires_at: now + Duration::hours(1),
+                created_at: now,
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn invitation_claim_with_session_has_one_winner_and_no_replay_session() {
+        let repository = repository().await;
+        let now = Utc::now();
+        let owner = owner();
+        repository.insert_user(&owner).await.unwrap();
+        let invitation_hash = hash_token("invite-once");
+        invitation_for(
+            &repository,
+            &owner,
+            "member@example.com",
+            invitation_hash.clone(),
+            now,
+        )
+        .await;
+        let request = NewInvitationMemberSession {
+            invitation_token_hash: invitation_hash,
+            verified_email: "MEMBER@example.com".to_owned(),
+            google_sub: "member-sub".to_owned(),
+            session: session_credentials("member-once", now),
+        };
+        let claimed = repository
+            .claim_invitation_with_session(&request, now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.1.email, "member@example.com");
+        assert_eq!(claimed.2.user_id, claimed.1.id);
+        assert!(
+            repository
+                .claim_invitation_with_session(&request, now)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(sessions, 1);
+    }
+
+    #[tokio::test]
+    async fn invitation_claim_wrong_email_leaves_invitation_and_session_absent() {
+        let repository = repository().await;
+        let now = Utc::now();
+        let owner = owner();
+        repository.insert_user(&owner).await.unwrap();
+        let invitation_hash = hash_token("invite-email");
+        let invitation = invitation_for(
+            &repository,
+            &owner,
+            "member@example.com",
+            invitation_hash.clone(),
+            now,
+        )
+        .await;
+        let claimed = repository
+            .claim_invitation_with_session(
+                &NewInvitationMemberSession {
+                    invitation_token_hash: invitation_hash,
+                    verified_email: "other@example.com".to_owned(),
+                    google_sub: "other-sub".to_owned(),
+                    session: session_credentials("wrong-email", now),
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(claimed.is_none());
+        let accepted_at: Option<String> =
+            sqlx::query_scalar("SELECT accepted_at FROM invitations WHERE id=?")
+                .bind(invitation.id.to_string())
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        assert!(accepted_at.is_none());
+        let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role='member'")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!((members, sessions), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn invitation_claim_session_failure_rolls_back_acceptance_and_member() {
+        let repository = repository().await;
+        let now = Utc::now();
+        let owner = owner();
+        repository.insert_user(&owner).await.unwrap();
+        let duplicate_id = SessionId::new();
+        repository
+            .insert_web_session(&NewWebSession {
+                id: duplicate_id,
+                user_id: owner.id,
+                token_hash: hash_token("existing-invitation-session"),
+                csrf_token_hash: hash_token("existing-invitation-csrf"),
+                idle_expires_at: now + Duration::minutes(10),
+                absolute_expires_at: now + Duration::hours(1),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        let invitation_hash = hash_token("invite-rollback");
+        let invitation = invitation_for(
+            &repository,
+            &owner,
+            "member@example.com",
+            invitation_hash.clone(),
+            now,
+        )
+        .await;
+        let result = repository
+            .claim_invitation_with_session(
+                &NewInvitationMemberSession {
+                    invitation_token_hash: invitation_hash,
+                    verified_email: "member@example.com".to_owned(),
+                    google_sub: "member-sub".to_owned(),
+                    session: NewSessionCredentials {
+                        id: duplicate_id,
+                        ..session_credentials("failed-member", now)
+                    },
+                },
+                now,
+            )
+            .await;
+        assert!(result.is_err());
+        let accepted_at: Option<String> =
+            sqlx::query_scalar("SELECT accepted_at FROM invitations WHERE id=?")
+                .bind(invitation.id.to_string())
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        assert!(accepted_at.is_none());
+        let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role='member'")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(members, 0);
+    }
+
+    #[tokio::test]
+    async fn existing_active_member_relogin_requires_exact_subject_and_email() {
+        let repository = repository().await;
+        let now = Utc::now();
+        let member = User::new("member-sub", "member@example.com", UserRole::Member, now).unwrap();
+        repository.insert_user(&member).await.unwrap();
+        let logged_in = repository
+            .login_existing_user_with_session(&NewExistingUserSession {
+                verified_email: " MEMBER@EXAMPLE.COM ".to_owned(),
+                google_sub: "member-sub".to_owned(),
+                session: session_credentials("member-relogin", now),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(logged_in.0.id, member.id);
+        assert_eq!(logged_in.1.user_id, member.id);
+        assert!(
+            repository
+                .login_existing_user_with_session(&NewExistingUserSession {
+                    verified_email: "other@example.com".to_owned(),
+                    google_sub: "member-sub".to_owned(),
+                    session: session_credentials("member-wrong-email", now),
+                })
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_login_claim_round_trips_only_invitation_digest() {
+        let repository = repository().await;
+        let now = Utc::now();
+        let invitation_hash = hash_token("invitation-plaintext");
+        let flow = LoginFlow::with_invitation_token_hash(
+            &url::Url::parse("https://agentmail.example").unwrap(),
+            "client",
+            invitation_hash.clone(),
+            now,
+            Duration::minutes(10),
+        )
+        .unwrap();
+        let id = Uuid::now_v7();
+        let envelope = EncryptedPkceVerifier::from_envelope(
+            flow.transaction()
+                .encrypted_pkce_verifier(&id.to_string(), &test_keyring())
+                .unwrap(),
+        )
+        .unwrap();
+        repository
+            .insert_oauth_transaction(id, &flow.transaction().persistence(), &envelope)
+            .await
+            .unwrap();
+        let claim = repository
+            .claim_oauth_transaction(id, flow.state(), now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.invitation_token_hash, Some(invitation_hash.clone()));
+        assert!(!format!("{claim:?}").contains(&invitation_hash));
+        assert!(
+            !serde_json::to_string(&flow.transaction().persistence())
+                .unwrap()
+                .contains(&invitation_hash)
+        );
+    }
+
     #[tokio::test]
     async fn audit_stores_metadata_only() {
         let repository = repository().await;

@@ -14,6 +14,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
@@ -27,10 +28,13 @@ use crate::{
     crypto::{CryptoError, encrypt_refresh_token, hash_token, verify_token},
     domain::{
         access::{AccessKey, AccessKeyId},
-        identity::{ConnectionId, ConnectionStatus, GmailConnection, UserId, UserRole},
+        identity::{
+            ConnectionId, ConnectionStatus, GmailConnection, InvitationId, User, UserId, UserRole,
+        },
     },
     google_oidc::{GoogleJwksVerifier, GoogleOidcError},
     google_token::{GoogleTokenClient, GoogleTokenError, TokenSet},
+    invitations::InviteService,
     oauth::{
         GMAIL_CALLBACK_PATH, GOOGLE_ISSUER, GmailFlow, LOGIN_CALLBACK_PATH, LoginFlow, OAuthError,
         OAuthFlowKind, OidcClaims, ValidatedOidcIdentity, validate_granted_gmail_scopes,
@@ -201,10 +205,26 @@ where
 {
     Router::new()
         .route("/auth/google/login", get(login_start::<V, E>))
+        .route(
+            "/auth/invitations/accept",
+            post(invitation_accept_start::<V, E>),
+        )
         .route(LOGIN_CALLBACK_PATH, get(login_callback::<V, E>))
         .route(GMAIL_CALLBACK_PATH, get(gmail_callback::<V, E>))
         .route("/auth/google/gmail", post(gmail_start::<V, E>))
         .route("/auth/logout", post(logout::<V, E>))
+        .route(
+            "/control/invitations",
+            get(list_invitations::<V, E>).post(create_invitation::<V, E>),
+        )
+        .route(
+            "/control/invitations/{invitation_id}/revoke",
+            post(revoke_invitation::<V, E>),
+        )
+        .route(
+            "/control/invitations/{invitation_id}/regenerate",
+            post(regenerate_invitation::<V, E>),
+        )
         .route(
             "/control/access-keys",
             get(list_access_keys::<V, E>).post(create_access_key::<V, E>),
@@ -225,10 +245,181 @@ where
 }
 
 #[derive(Debug, Deserialize)]
+struct InvitationAcceptRequest {
+    token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateInvitationRequest {
+    target_email: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateAccessKeyRequest {
     name: String,
     #[serde(default)]
     connection_ids: Vec<Uuid>,
+}
+
+async fn list_invitations<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    headers: HeaderMap,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let owner = match require_owner_session(&state, &headers, false).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    match state.repository.list_invitations(owner.user_id).await {
+        Ok(invitations) => (
+            StatusCode::OK,
+            Json(json!({
+                "invitations": invitations.iter().map(invitation_view).collect::<Vec<_>>()
+            })),
+        )
+            .into_response(),
+        Err(error) => error_response(error.into()),
+    }
+}
+
+async fn create_invitation<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateInvitationRequest>,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let owner = match require_owner_session(&state, &headers, true).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let owner = match active_owner(&state, owner.user_id).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let issued = match InviteService::new(state.repository.clone())
+        .issue(&owner, &request.target_email, Utc::now())
+        .await
+    {
+        Ok(issued) => issued,
+        Err(crate::invitations::InviteError::InvalidLifetime)
+        | Err(crate::invitations::InviteError::Repository(RepositoryError::InvalidValue(_))) => {
+            return control_api_error(StatusCode::BAD_REQUEST, "invalid_request");
+        }
+        Err(crate::invitations::InviteError::Repository(error)) => {
+            return error_response(error.into());
+        }
+        Err(crate::invitations::InviteError::NotClaimable) => {
+            return control_api_error(StatusCode::CONFLICT, "invalid_state");
+        }
+    };
+    invitation_issued_response(&issued)
+}
+
+async fn revoke_invitation<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    Path(invitation_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let owner = match require_owner_session(&state, &headers, true).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    match state
+        .repository
+        .revoke_invitation(owner.user_id, InvitationId::from_uuid(invitation_id))
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => control_api_error(StatusCode::NOT_FOUND, "not_found"),
+        Err(error) => error_response(error.into()),
+    }
+}
+
+async fn regenerate_invitation<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    Path(invitation_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let owner = match require_owner_session(&state, &headers, true).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let owner_user = match active_owner(&state, owner.user_id).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let invitation_id = InvitationId::from_uuid(invitation_id);
+    let existing = match state.repository.list_invitations(owner.user_id).await {
+        Ok(invitations) => invitations
+            .into_iter()
+            .find(|invitation| invitation.id == invitation_id && invitation.accepted_at.is_none()),
+        Err(error) => return error_response(error.into()),
+    };
+    let Some(existing) = existing else {
+        return control_api_error(StatusCode::NOT_FOUND, "not_found");
+    };
+    // Revocation precedes issuance: an issuance failure can leave no usable
+    // invitation, but never leaves both the old and replacement tokens valid.
+    match state
+        .repository
+        .revoke_invitation(owner.user_id, invitation_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return control_api_error(StatusCode::NOT_FOUND, "not_found"),
+        Err(error) => return error_response(error.into()),
+    }
+    let issued = match InviteService::new(state.repository.clone())
+        .issue(&owner_user, &existing.target_email, Utc::now())
+        .await
+    {
+        Ok(issued) => issued,
+        Err(crate::invitations::InviteError::InvalidLifetime)
+        | Err(crate::invitations::InviteError::Repository(RepositoryError::InvalidValue(_))) => {
+            return control_api_error(StatusCode::BAD_REQUEST, "invalid_request");
+        }
+        Err(crate::invitations::InviteError::Repository(error)) => {
+            return error_response(error.into());
+        }
+        Err(crate::invitations::InviteError::NotClaimable) => {
+            return control_api_error(StatusCode::CONFLICT, "invalid_state");
+        }
+    };
+    invitation_issued_response(&issued)
+}
+
+async fn active_owner<V, E>(
+    state: &ControlHttpState<V, E>,
+    user_id: UserId,
+) -> Result<User, Response>
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let user = state
+        .repository
+        .get_user(user_id)
+        .await
+        .map_err(|error| error_response(error.into()))?
+        .ok_or_else(|| control_api_error(StatusCode::FORBIDDEN, "forbidden"))?;
+    if !user.can_manage_owner_ui() {
+        return Err(control_api_error(StatusCode::FORBIDDEN, "forbidden"));
+    }
+    Ok(user)
 }
 
 async fn list_access_keys<V, E>(
@@ -453,6 +644,33 @@ where
     })
 }
 
+fn invitation_view(invitation: &crate::repository::Invitation) -> serde_json::Value {
+    json!({
+        "id": invitation.id,
+        "target_email": invitation.target_email,
+        "expires_at": invitation.expires_at,
+        "accepted_at": invitation.accepted_at,
+        "created_at": invitation.created_at,
+    })
+}
+
+fn invitation_issued_response(issued: &crate::invitations::IssuedInvitation) -> Response {
+    let mut response = (
+        StatusCode::OK,
+        Json(json!({
+            "invitation": invitation_view(&issued.invitation),
+            "token": issued.token.as_str(),
+            "accept_path": "/auth/invitations/accept",
+            "credential_visible_once": true,
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 fn access_key_view(key: &StoredAccessKey) -> serde_json::Value {
     json!({
         "id": key.id,
@@ -483,6 +701,40 @@ fn credential_response(key: &StoredAccessKey, credential: String) -> Response {
 
 fn control_api_error(status: StatusCode, code: &'static str) -> Response {
     (status, Json(json!({"error": code}))).into_response()
+}
+
+async fn invitation_accept_start<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    Json(request): Json<InvitationAcceptRequest>,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let valid_token = URL_SAFE_NO_PAD
+        .decode(request.token.as_bytes())
+        .is_ok_and(|token| token.len() == 32);
+    if !valid_token {
+        return control_api_error(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let now = Utc::now();
+    let flow = match LoginFlow::with_invitation_token_hash(
+        &state.config.public_base_url,
+        state.config.google_login_client_id.clone(),
+        hash_token(&request.token),
+        now,
+        Duration::minutes(10),
+    ) {
+        Ok(flow) => flow,
+        Err(error) => return error_response(error.into()),
+    };
+    let mut response = begin_login_response(&state, flow, Uuid::now_v7())
+        .await
+        .unwrap_or_else(error_response);
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 pub async fn login_start<V, E>(State(state): State<ControlHttpState<V, E>>) -> Response
@@ -778,7 +1030,7 @@ where
         Err(error) => return error_response(error),
     };
     let response = match expected_flow {
-        OAuthFlowKind::Login => finish_login(&state, identity, Utc::now()).await,
+        OAuthFlowKind::Login => finish_login(&state, identity, claim, Utc::now()).await,
         OAuthFlowKind::Gmail => finish_gmail(&state, identity, token_set, claim).await,
     };
     match response {
@@ -826,22 +1078,27 @@ fn validate_verified_claims(
 async fn finish_login<V, E>(
     state: &ControlHttpState<V, E>,
     identity: ValidatedOidcIdentity,
+    claim: crate::repository::OAuthTransactionClaim,
     now: DateTime<Utc>,
 ) -> Result<(Response, Option<String>), ControlHttpError>
 where
     V: OidcTokenVerifier,
     E: OAuthCodeExchanger,
 {
-    let credentials = state
-        .control_plane
-        .bootstrap_owner_session(&identity, now)
-        .await?;
+    let credentials = if let Some(invitation_token_hash) = claim.invitation_token_hash {
+        state
+            .control_plane
+            .accept_invitation_session(&invitation_token_hash, &identity, now)
+            .await?
+    } else {
+        state.control_plane.login_session(&identity, now).await?
+    };
     let mut response = (
         StatusCode::OK,
         Json(json!({
             "user_id": credentials.user.id,
             "email": credentials.user.email,
-            "role": "owner",
+            "role": credentials.user.role,
             "csrf_token": credentials.csrf_token,
         })),
     )
@@ -1117,7 +1374,7 @@ mod tests {
         repository::NewWebSession,
     };
     use axum::{body::Body, http::Method};
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
     use serde_json::Value;
     use std::collections::BTreeMap;
     use tower::ServiceExt;
@@ -1570,6 +1827,256 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn invitation_routes_enforce_owner_csrf_redaction_and_regeneration() {
+        let (app, repository, _owner, _connection, session, csrf) =
+            key_fixture(UserRole::Owner).await;
+        let create = json!({"target_email":"member@example.com"});
+        let (status, _, _) = control_json(
+            &app,
+            Method::POST,
+            "/control/invitations".to_owned(),
+            Some(&session),
+            None,
+            create.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, headers, created) = control_json(
+            &app,
+            Method::POST,
+            "/control/invitations".to_owned(),
+            Some(&session),
+            Some(&csrf),
+            create,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        let token = created["token"].as_str().unwrap().to_owned();
+        let invitation_id = created["invitation"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(created["credential_visible_once"], true);
+        let token_hash: String = sqlx::query_scalar("SELECT token_hash FROM invitations")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(token_hash, hash_token(&token));
+        assert!(!created.to_string().contains(&token_hash));
+
+        let (status, _, listed) = control_json(
+            &app,
+            Method::GET,
+            "/control/invitations".to_owned(),
+            Some(&session),
+            None,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!listed.to_string().contains(&token));
+        assert!(!listed.to_string().contains(&token_hash));
+
+        let (status, _, _) = control_json(
+            &app,
+            Method::POST,
+            format!("/control/invitations/{invitation_id}/regenerate"),
+            Some(&session),
+            None,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, headers, regenerated) = control_json(
+            &app,
+            Method::POST,
+            format!("/control/invitations/{invitation_id}/regenerate"),
+            Some(&session),
+            Some(&csrf),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_ne!(regenerated["token"].as_str().unwrap(), token);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invitations")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let (member_app, _, _, _, member_session, member_csrf) =
+            key_fixture(UserRole::Member).await;
+        let (status, _, _) = control_json(
+            &member_app,
+            Method::GET,
+            "/control/invitations".to_owned(),
+            Some(&member_session),
+            None,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _, _) = control_json(
+            &member_app,
+            Method::POST,
+            "/control/invitations".to_owned(),
+            Some(&member_session),
+            Some(&member_csrf),
+            json!({"target_email":"x@example.com"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn invitation_accept_start_binds_hash_and_never_leaks_token() {
+        let (app, repository, _owner, _connection, _session, _csrf) =
+            key_fixture(UserRole::Owner).await;
+        let token = URL_SAFE_NO_PAD.encode([9_u8; 32]);
+        let (status, headers, body) = control_json(
+            &app,
+            Method::POST,
+            "/auth/invitations/accept".to_owned(),
+            None,
+            None,
+            json!({"token": token}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert!(!headers[header::LOCATION].to_str().unwrap().contains(&token));
+        assert!(
+            !headers[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .contains(&token)
+        );
+        assert!(body.is_null());
+        let stored_hash: String =
+            sqlx::query_scalar("SELECT invitation_token_hash FROM oauth_transactions")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        assert_eq!(stored_hash, hash_token(&token));
+        let (status, _, _) = control_json(
+            &app,
+            Method::POST,
+            "/auth/invitations/accept".to_owned(),
+            None,
+            None,
+            json!({"token":"not-a-token"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    fn login_claim(
+        invitation_token_hash: Option<String>,
+    ) -> crate::repository::OAuthTransactionClaim {
+        crate::repository::OAuthTransactionClaim {
+            id: Uuid::now_v7(),
+            flow: OAuthFlowKind::Login,
+            nonce_hash: hash_token("nonce"),
+            pkce_verifier: crate::repository::EncryptedPkceVerifier::from_envelope(format!(
+                "am1.1.{}.{}",
+                URL_SAFE_NO_PAD.encode([0_u8; 24]),
+                URL_SAFE_NO_PAD.encode([1_u8; 1]),
+            ))
+            .unwrap(),
+            initiated_by: None,
+            target_connection: None,
+            invitation_token_hash,
+            created_at: Utc::now(),
+            expires_at: Utc::now() + Duration::minutes(10),
+        }
+    }
+
+    #[tokio::test]
+    async fn login_finish_sets_member_cookie_and_invitation_replay_cannot_create_session() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        database.migrate().await.unwrap();
+        let repository = Repository::new(&database);
+        let now = Utc::now();
+        let owner = User::new("owner-sub", "owner@example.com", UserRole::Owner, now).unwrap();
+        let member = User::new("member-sub", "member@example.com", UserRole::Member, now).unwrap();
+        repository.insert_user(&owner).await.unwrap();
+        repository.insert_user(&member).await.unwrap();
+        let state = ControlHttpState::new(
+            test_config(),
+            repository.clone(),
+            UnusedVerifier,
+            UnusedExchanger,
+            UnusedExchanger,
+        )
+        .unwrap();
+        let (response, cookie) = finish_login(
+            &state,
+            ValidatedOidcIdentity {
+                subject: member.google_sub.clone(),
+                email: "MEMBER@example.com".to_owned(),
+            },
+            login_claim(None),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(cookie.unwrap().contains("__Host-agentmail_session="));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["role"],
+            "member"
+        );
+
+        let invitation_token = "callback-invitation-token";
+        repository
+            .create_invitation(&crate::repository::NewInvitation {
+                id: crate::domain::identity::InvitationId::new(),
+                target_email: "invitee@example.com".to_owned(),
+                token_hash: hash_token(invitation_token),
+                invited_by: owner.id,
+                expires_at: now + Duration::hours(1),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        let invite_identity = ValidatedOidcIdentity {
+            subject: "invitee-sub".to_owned(),
+            email: "invitee@example.com".to_owned(),
+        };
+        finish_login(
+            &state,
+            invite_identity.clone(),
+            login_claim(Some(hash_token(invitation_token))),
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            finish_login(
+                &state,
+                invite_identity,
+                login_claim(Some(hash_token(invitation_token))),
+                now,
+            )
+            .await,
+            Err(ControlHttpError::ControlPlane(
+                ControlPlaneError::InvitationNotClaimable
+            ))
+        ));
+        let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role='member'")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!((members, sessions), (2, 2));
     }
 
     #[tokio::test]

@@ -8,7 +8,10 @@ use crate::{
     crypto::{hash_token, verify_token},
     domain::identity::{User, normalize_email},
     oauth::ValidatedOidcIdentity,
-    repository::{NewOwnerSession, Repository, RepositoryError, WebSession},
+    repository::{
+        NewExistingUserSession, NewInvitationMemberSession, NewOwnerSession, NewSessionCredentials,
+        Repository, RepositoryError, WebSession,
+    },
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, Utc};
@@ -25,6 +28,8 @@ pub enum ControlPlaneError {
     InvalidSessionLifetime,
     #[error("session is not authenticated")]
     Unauthenticated,
+    #[error("invitation is invalid, expired, already accepted, or email does not match")]
+    InvitationNotClaimable,
     #[error(transparent)]
     Repository(#[from] RepositoryError),
 }
@@ -147,6 +152,89 @@ impl ControlPlaneService {
         })
     }
 
+    /// Log in an existing active Owner or Member when both OIDC identity
+    /// values match. Only when no such user exists may the first Owner be
+    /// bootstrapped by the established owner-email rule.
+    pub async fn login_session(
+        &self,
+        identity: &ValidatedOidcIdentity,
+        now: DateTime<Utc>,
+    ) -> Result<SessionCredentials, ControlPlaneError> {
+        let (session_token, csrf_token, session) = self.new_session_credentials(now);
+        if let Some((user, stored_session)) = self
+            .repository
+            .login_existing_user_with_session(&NewExistingUserSession {
+                verified_email: identity.email.clone(),
+                google_sub: identity.subject.clone(),
+                session,
+            })
+            .await?
+        {
+            return Ok(self.session_credentials(user, stored_session, session_token, csrf_token));
+        }
+        self.bootstrap_owner_session(identity, now).await
+    }
+
+    /// Atomically consume a hash-bound invitation, create its Member, and
+    /// create the browser session after the OIDC identity has been verified.
+    pub async fn accept_invitation_session(
+        &self,
+        invitation_token_hash: &str,
+        identity: &ValidatedOidcIdentity,
+        now: DateTime<Utc>,
+    ) -> Result<SessionCredentials, ControlPlaneError> {
+        let (session_token, csrf_token, session) = self.new_session_credentials(now);
+        let Some((_invitation, user, stored_session)) = self
+            .repository
+            .claim_invitation_with_session(
+                &NewInvitationMemberSession {
+                    invitation_token_hash: invitation_token_hash.to_owned(),
+                    verified_email: identity.email.clone(),
+                    google_sub: identity.subject.clone(),
+                    session,
+                },
+                now,
+            )
+            .await?
+        else {
+            return Err(ControlPlaneError::InvitationNotClaimable);
+        };
+        Ok(self.session_credentials(user, stored_session, session_token, csrf_token))
+    }
+
+    fn new_session_credentials(
+        &self,
+        now: DateTime<Utc>,
+    ) -> (String, String, NewSessionCredentials) {
+        let session_token = random_secret();
+        let csrf_token = random_secret();
+        let session = NewSessionCredentials {
+            id: crate::domain::identity::SessionId::new(),
+            token_hash: hash_token(&session_token),
+            csrf_token_hash: hash_token(&csrf_token),
+            idle_expires_at: now + self.session_idle_ttl,
+            absolute_expires_at: now + self.session_absolute_ttl,
+            created_at: now,
+        };
+        (session_token, csrf_token, session)
+    }
+
+    fn session_credentials(
+        &self,
+        user: User,
+        session: WebSession,
+        session_token: String,
+        csrf_token: String,
+    ) -> SessionCredentials {
+        SessionCredentials {
+            user,
+            session,
+            session_token,
+            csrf_token,
+            cookie: SessionCookiePolicy::default(),
+        }
+    }
+
     /// Authenticate using the presented session token's hash, then refresh
     /// only idle expiry. The caller must hash the cookie value first.
     pub async fn authenticate_session(
@@ -195,7 +283,11 @@ fn random_secret() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{database::Database, domain::identity::UserStatus, repository::NewWebSession};
+    use crate::{
+        database::Database,
+        domain::identity::{InvitationId, User, UserRole, UserStatus},
+        repository::{NewInvitation, NewWebSession},
+    };
     use tempfile::tempdir;
 
     async fn service() -> (ControlPlaneService, Repository) {
@@ -274,6 +366,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn existing_member_login_and_invitation_accept_create_secure_sessions() {
+        let (service, repository) = service().await;
+        let now = Utc::now();
+        let member = User::new("member-sub", "member@example.com", UserRole::Member, now).unwrap();
+        repository.insert_user(&member).await.unwrap();
+        let member_identity = ValidatedOidcIdentity {
+            subject: "member-sub".to_owned(),
+            email: " MEMBER@EXAMPLE.COM ".to_owned(),
+        };
+        let logged_in = service.login_session(&member_identity, now).await.unwrap();
+        assert_eq!(logged_in.user.id, member.id);
+        assert_eq!(logged_in.user.role, UserRole::Member);
+        assert!(
+            service
+                .authenticate_session(&hash_token(&logged_in.session_token), now)
+                .await
+                .is_ok()
+        );
+        let wrong_email = ValidatedOidcIdentity {
+            email: "other@example.com".to_owned(),
+            ..member_identity.clone()
+        };
+        assert!(service.login_session(&wrong_email, now).await.is_err());
+
+        let owner = User::new("owner-sub", "owner@example.com", UserRole::Owner, now).unwrap();
+        repository.insert_user(&owner).await.unwrap();
+        let invitation_token = "test-invitation-token";
+        repository
+            .create_invitation(&NewInvitation {
+                id: InvitationId::new(),
+                target_email: "invitee@example.com".to_owned(),
+                token_hash: hash_token(invitation_token),
+                invited_by: owner.id,
+                expires_at: now + Duration::hours(1),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        let invitee = ValidatedOidcIdentity {
+            subject: "invitee-sub".to_owned(),
+            email: "INVITEE@example.com".to_owned(),
+        };
+        let accepted = service
+            .accept_invitation_session(&hash_token(invitation_token), &invitee, now)
+            .await
+            .unwrap();
+        assert_eq!(accepted.user.role, UserRole::Member);
+        assert!(
+            service
+                .authenticate_session(&hash_token(&accepted.session_token), now)
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            service
+                .accept_invitation_session(&hash_token(invitation_token), &invitee, now)
+                .await,
+            Err(ControlPlaneError::InvitationNotClaimable)
+        ));
     }
 
     #[tokio::test]

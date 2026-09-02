@@ -183,6 +183,9 @@ pub struct OAuthTransactionRecord {
     pkce_verifier: SecretString,
     pub initiated_by: Option<String>,
     pub target_connection: Option<String>,
+    /// Optional SHA-256 invitation-token digest bound to a login callback.
+    #[serde(serialize_with = "serialize_optional_redacted_token_hash")]
+    pub invitation_token_hash: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub consumed_at: Option<DateTime<Utc>>,
@@ -197,6 +200,7 @@ impl fmt::Debug for OAuthTransactionRecord {
             .field("pkce_verifier", &"[REDACTED]")
             .field("initiated_by", &self.initiated_by)
             .field("target_connection", &self.target_connection)
+            .field("invitation_token_hash", &"[REDACTED]")
             .field("created_at", &self.created_at)
             .field("expires_at", &self.expires_at)
             .field("consumed_at", &self.consumed_at)
@@ -209,6 +213,20 @@ where
     S: Serializer,
 {
     serializer.serialize_str("[REDACTED]")
+}
+
+fn serialize_optional_redacted_token_hash<S>(
+    value: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if value.is_some() {
+        serializer.serialize_str("[REDACTED]")
+    } else {
+        serializer.serialize_none()
+    }
 }
 
 #[derive(Clone)]
@@ -233,6 +251,7 @@ impl OAuthTransaction {
         flow: OAuthFlowKind,
         initiated_by: Option<String>,
         target_connection: Option<String>,
+        invitation_token_hash: Option<String>,
         now: DateTime<Utc>,
         ttl: Duration,
     ) -> Self {
@@ -247,6 +266,7 @@ impl OAuthTransaction {
                 pkce_verifier,
                 initiated_by,
                 target_connection,
+                invitation_token_hash,
                 created_at: now,
                 expires_at: now + ttl,
                 consumed_at: None,
@@ -389,13 +409,19 @@ struct FlowCore {
     _kind: PhantomData<OAuthFlowKind>,
 }
 
+#[derive(Default)]
+struct FlowContext {
+    initiated_by: Option<String>,
+    target_connection: Option<String>,
+    invitation_token_hash: Option<String>,
+}
+
 impl FlowCore {
     fn new(
         kind: OAuthFlowKind,
         public_base_url: &Url,
         client_id: impl Into<String>,
-        initiated_by: Option<String>,
-        target_connection: Option<String>,
+        context: FlowContext,
         now: DateTime<Utc>,
         ttl: Duration,
     ) -> Result<Self, OAuthError> {
@@ -407,7 +433,14 @@ impl FlowCore {
         Ok(Self {
             client_id,
             public_base_url: public_base_url.clone(),
-            transaction: OAuthTransaction::new(kind, initiated_by, target_connection, now, ttl),
+            transaction: OAuthTransaction::new(
+                kind,
+                context.initiated_by,
+                context.target_connection,
+                context.invitation_token_hash,
+                now,
+                ttl,
+            ),
             _kind: PhantomData,
         })
     }
@@ -486,8 +519,29 @@ impl LoginFlow {
                 OAuthFlowKind::Login,
                 public_base_url,
                 client_id,
-                None,
-                None,
+                FlowContext::default(),
+                now,
+                ttl,
+            )?,
+        })
+    }
+    /// Bind a hash-only invitation token to this login transaction.
+    pub fn with_invitation_token_hash(
+        public_base_url: &Url,
+        client_id: impl Into<String>,
+        invitation_token_hash: String,
+        now: DateTime<Utc>,
+        ttl: Duration,
+    ) -> Result<Self, OAuthError> {
+        Ok(Self {
+            core: FlowCore::new(
+                OAuthFlowKind::Login,
+                public_base_url,
+                client_id,
+                FlowContext {
+                    invitation_token_hash: Some(invitation_token_hash),
+                    ..FlowContext::default()
+                },
                 now,
                 ttl,
             )?,
@@ -548,8 +602,11 @@ impl GmailFlow {
                 OAuthFlowKind::Gmail,
                 public_base_url,
                 client_id,
-                initiated_by,
-                target_connection,
+                FlowContext {
+                    initiated_by,
+                    target_connection,
+                    invitation_token_hash: None,
+                },
                 now,
                 ttl,
             )?,
