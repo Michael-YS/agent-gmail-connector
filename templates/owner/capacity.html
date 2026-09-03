@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Personal Use capacity · AgentMail{% endblock %}
+{% block content %}
+<h1>Personal Use capacity</h1>
+{% if flash_is_some %}
+{% if flash_token_is_some %}
+<div class="flash {{ flash_css_class }}"><p>{{ flash_label }} new invitation token: <code>{{ flash_token }}</code></p>
+<p class="muted">This token is shown only once. Closing or refreshing this page removes it.</p>
+</div>
+{% else %}
+<div class="flash {{ flash_css_class }}"><p>{{ flash_message }}</p></div>
+{% endif %}
+{% endif %}
+<section class="card">
+<h2>Configured quota</h2>
+<dl class="kvlist">
+<dt>Configured limit</dt><dd>{{ configured_limit }}</dd>
+<dt>Active member count</dt><dd>{{ current_member_count }}</dd>
+<dt>Historical Gmail authorizations</dt><dd>{{ historical_authorization_count }}</dd>
+<dt>Remaining capacity</dt><dd>{{ remaining_capacity }}</dd>
+</dl>
+<p class="muted">Historical Gmail authorizations only increase when a Google account authorizes Gmail access for the first time on this instance. Account deletion, connection revocation, and upstream reauthorization do not decrease the count.</p>
+<p class="muted">Google Cloud Console remains the source of truth for Personal Use quota. If the console disagrees with this page, follow the manual reauthorization flow described in the deployment runbook.</p>
+</section>
+{% endblock %}

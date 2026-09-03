@@ -12,7 +12,7 @@
 ## 已提交里程碑
 
 1. `b0b67d2 docs: define AgentMail v1 plan`
-2. `080d519 feat: build AgentMail secure core and API`
+2. `080d519 fund AgentMail secure core and API`
 3. `527f501 ops: add hardened deployment and test guide`
 4. `c2d2356 feat: persist auth and governance state`
 5. `a841153 feat: add identity sessions and Google token client`
@@ -24,12 +24,14 @@
 11. `06b77b6 feat(gmail): manage production drafts`
 12. `dd44402 feat(gmail): persist safe send outcomes`
 13. `e501f0d feat(control): manage Access Keys`
-
-`a277988` 已包含真实 Google OIDC/JWKS 校验、统一 OAuth 回调、控制面 HTTP 路由、owner session、原子 OAuth transaction claim、加密 refresh token provider、连接所有权/状态保护，以及真实 Google token/Gmail HTTP client。该提交完成时通过 111 项测试、严格 Clippy 和格式检查。
+14. (pending) `feat(control-ui): owner HTML dashboard, invitations, members, capacity`
 
 ## 当前实现断点
 
-- Gmail read、MIME、managed draft、安全发送、Access Key 与邀请/Member control-plane 管理已实现；当前工作树含待提交的邀请登录与文档同步改动。
+- Gmail read、MIME、managed draft、安全发送、Access Key 与邀请/Member control-plane 管理已实现。
+- Owner control plane HTML 已接入 `serve`：Askama 模板（base + owner/{dashboard,invitations,members,capacity}.html），严格 CSP、`HttpOnly; Secure; SameSite=Lax` session + csrf cookie、双重 cookie session/csrf 绑定、PRG + flash 一次性 cookie 携带邀请 token；路由 `/control`、`/control/invitations` (GET list + POST create)、`/control/invitations/{id}/revoke`、`/control/invitations/{id}/regenerate`、`/control/members`、`/control/capacity`；所有 GET/POST 强制 Owner role，未登录 302 `/auth/google/login`，CSRF 错 flash=invalid_csrf；create/revoke/regenerate 复用 InviteService，regenerate 先 revoke 再 issue，旧 token 立即失效。Member session 角色被拒、Owner 账号 revoke 按钮暂未接 action（governance 里程碑）。
+- 登录 OAuth callback 现在除 session cookie 外另发 `__Host-agentmail_csrf` cookie，作为 HTML 表单 CSRF 明文载体，HttpOnly 仍由服务端读取；JSON 客户端不受影响（依旧从 response body 取 csrf 并以 `x-csrf-token` 头提交）。
+- 新增仓库函数 `list_member_summaries` 与 `personal_use_summary`，仅返回 active Member 聚合元数据与单调历史计数，供 `/control/members` 和 `/control/capacity` 渲染；`list_member_summaries` 查询已修正为 SQLite 兼容的 `MAX(u.last_activity_at, subqueries...)` 形式。
 - production Gmail adapter 已完成读取及无附件 managed draft create/update/delete/send，不再回退到 fake adapter。
 - 安全 MIME 构建层已使用 `mail-builder 0.5` 完成：稳定 Message-ID、reply References、reply-all 排除当前主地址、非 ASCII header、安全附件 filename/content-type、inline CID、原始附件与最终编码消息的 25 MiB 双重限制，以及有界 writer。
 - 无附件 managed draft 已接入真实 Gmail create/update/delete：使用稳定 Message-ID 和安全 MIME，按草稿独立串行化，从 SQLite 恢复重启后的 managed record，保持 expected-version 乐观锁，并对 create 持久化失败做补偿删除、对 delete 404 做幂等成功。
@@ -39,7 +41,7 @@
 - 邀请接受以 POST body 中的一次性 token 启动 Login OAuth；token 仅以 SHA-256 hash 绑定到 OAuth transaction，callback 仅以已验证、规范化 email 和精确 Google `sub` 原子接受邀请、创建 Member 与 session。重放、错误 email、过期或撤销邀请均不创建 session。
 - 常规 Google Login 会以精确 Google `sub` 与规范化 verified email 登录既有 active Owner 或 Member；没有既有用户时才保留首次 Owner bootstrap 规则。
 - Owner JSON API 已接入：`GET/POST /control/invitations`、`POST /control/invitations/{id}/revoke`、`POST /control/invitations/{id}/regenerate`；mutation 要求 Owner session+CSRF，列表不返回 hash，create/regenerate 的 token 只返回一次并 `Cache-Control: no-store`。regenerate 先 revoke 再 issue，因而 issuance 失败可留下无可用邀请，但绝不同时保留两个有效 token。
-- 最新本地完整验证：132 个 library tests、4 个 HTTP tests、5 个 REST/MCP tests，共 141 项；`git diff --check`、`cargo fmt --check` 与 `cargo check --all-targets --all-features --locked` 已通过。未执行部署、真实 Google 或浏览器 smoke。Terra 复审发现并已修正 rotate 后二次查询造成的一次性 credential 交付窗口。
+- 最新本地完整验证：141 个 library tests、4 个 HTTP tests、5 个 REST/MCP tests，共 150 项；`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo check --all-targets --all-features --locked` 已通过。未执行部署、真实 Google 或浏览器 smoke。Terra 复审发现并已修正 rotate 后二次查询造成的一次性 credential 交付窗口。
 
 ## 剩余实现里程碑
 
@@ -60,8 +62,8 @@
 
 ### 3. Control plane 剩余入口
 
-- Owner Access Key 与邀请 JSON 管理 API 已完成；剩余 control plane HTML 页面。
-- 剩余：Member 管理与账号删除编排。
+- Owner Access Key 与邀请 JSON 管理 API 已完成；Owner 控制面 HTML 已完成（dashboard / invitations / members / capacity）。
+- 剩余：Member 管理与账号删除编排（account revoke / delete-own-account 页面与编排）。
 
 ### 4. 连接生命周期
 
@@ -80,7 +82,7 @@
 ## 既定产品边界
 
 - v1 不实现细粒度 Access Key permissions，留给 v2。
-- 不实现 Gmail watch、Pub/Sub 或后台同步。
+- 不实现 Gmail watch、Pub/O 或后台同步。
 - Gmail 用户身份以 Google `sub` 为准。
 - 真实测试使用垃圾邮箱账户，不做批量发送。
 - 敏感凭证不得写入仓库、日志或本文档。

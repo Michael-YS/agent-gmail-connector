@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Owner dashboard · AgentMail{% endblock %}
+{% block content %}
+<h1>Owner dashboard</h1>
+{% if flash_is_some %}
+{% if flash_token_is_some %}
+<div class="flash {{ flash_css_class }}"><p>{{ flash_label }} new invitation token: <code>{{ flash_token }}</code></p>
+<p class="muted">This token is shown only once. Closing or refreshing this page removes it.</p>
+</div>
+{% else %}
+<div class="flash {{ flash_css_class }}"><p>{{ flash_message }}</p></div>
+{% endif %}
+{% endif %}
+<section class="card">
+<h2>Personal Use capacity</h2>
+<dl class="kvlist">
+<dt>Active members</dt><dd>{{ current_member_count }}</dd>
+<dt>Historical Gmail authorizations</dt><dd>{{ historical_authorization_count }}</dd>
+<dt>Remaining capacity</dt><dd>{{ remaining_capacity }} of {{ configured_limit }}</dd>
+</dl>
+<p class="muted">Google Cloud Console remains the source of truth for Personal Use limits.</p>
+</section>
+<section class="card">
+<h2>Owner shortcuts</h2>
+<ul>
+<li><a href="/control/invitations">Manage invitations</a> — issue, revoke, or regenerate one-time links.</li>
+<li><a href="/control/members">View members</a> — read-only directory of active and revoked accounts.</li>
+<li><a href="/control/capacity">Personal Use capacity</a> — current usage and remaining quota.</li>
+</ul>
+</section>
+{% endblock %}

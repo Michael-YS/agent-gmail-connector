@@ -1106,6 +1106,13 @@ where
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&crate::control_ui::csrf_cookie_value(
+            &credentials.csrf_token,
+        ))
+        .expect("csrf cookie header"),
+    );
     Ok((
         response,
         Some(session_cookie(
@@ -1295,7 +1302,7 @@ fn transaction_cookie_value(headers: &HeaderMap, name: &str) -> Result<Uuid, Con
     Uuid::parse_str(value).map_err(|_| ControlHttpError::InvalidTransactionCookie)
 }
 
-fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+pub(crate) fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
         .get(header::COOKIE)?
         .to_str()

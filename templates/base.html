@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'">
+<meta name="referrer" content="no-referrer">
+<title>{% block title %}AgentMail{% endblock %}</title>
+<style>
+:root { color-scheme: light dark; --fg:#111; --bg:#fff; --muted:#555; --accent:#0a4; --warn:#a40; --border:#ccc; }
+@media (prefers-color-scheme: dark) { :root { --fg:#eee; --bg:#121212; --muted:#aaa; --border:#333; } }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; color: var(--fg); background: var(--bg); line-height: 1.4; }
+header { border-bottom: 1px solid var(--border); padding-bottom: 0.75rem; margin-bottom: 1.5rem; display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; }
+header nav a { margin-right: 0.75rem; color: var(--accent); text-decoration: none; }
+header nav a:hover { text-decoration: underline; }
+header .session { color: var(--muted); font-size: 0.9em; }
+h1 { font-size: 1.4rem; margin: 0 0 1rem; }
+h2 { font-size: 1.1rem; margin: 1.5rem 0 0.5rem; }
+table { border-collapse: collapse; width: 100%; margin: 0.5rem 0 1.5rem; }
+th, td { border: 1px solid var(--border); padding: 0.5rem 0.65rem; text-align: left; vertical-align: top; }
+th { background: rgba(127,127,127,0.08); }
+.muted { color: var(--muted); font-size: 0.9em; }
+.flash { padding: 0.6rem 0.8rem; border: 1px solid var(--accent); border-radius: 4px; margin: 0 0 1rem; }
+.flash.warn { border-color: var(--warn); }
+.flash code { background: rgba(127,127,127,0.15); padding: 0.05rem 0.3rem; border-radius: 3px; word-break: break-all; }
+form.inline { display: inline; }
+button, .button { background: var(--accent); color: white; border: 0; padding: 0.4rem 0.85rem; border-radius: 4px; cursor: pointer; font-size: 0.95em; text-decoration: none; display: inline-block; }
+button.warn, .button.warn { background: var(--warn); }
+button[disabled], .button[disabled] { background: var(--muted); cursor: not-allowed; }
+section.card { border: 1px solid var(--border); border-radius: 6px; padding: 1rem 1.25rem; margin: 1rem 0; }
+section.card h2 { margin-top: 0; }
+.kvlist { display: grid; grid-template-columns: max-content 1fr; gap: 0.3rem 1rem; margin: 0.5rem 0; }
+.kvlist dt { color: var(--muted); }
+input[type=text], input[type=email] { padding: 0.4rem 0.55rem; border: 1px solid var(--border); border-radius: 4px; font-size: 0.95em; }
+label.field { display: block; margin: 0.5rem 0; }
+</style>
+</head>
+<body>
+<header>
+<nav>
+<a href="/">AgentMail</a>
+{% if show_dashboard %}<a href="/control">Dashboard</a>{% endif %}
+{% if show_invitations %}<a href="/control/invitations">Invitations</a>{% endif %}
+{% if show_members %}<a href="/control/members">Members</a>{% endif %}
+{% if show_capacity %}<a href="/control/capacity">Capacity</a>{% endif %}
+</nav>
+{% if session_email_is_some %}<span class="session">Signed in as <strong>{{ session_email }}</strong></span>{% endif %}
+</header>
+{% block content %}{% endblock %}
+<footer>
+<p class="muted">AgentMail routes Gmail through a hardened control plane. Tokens, addresses, subjects, and message bodies are never displayed, logged, or audited by this UI.</p>
+</footer>
+</body>
+</html>

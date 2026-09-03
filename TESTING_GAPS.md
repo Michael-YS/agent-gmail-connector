@@ -1,6 +1,6 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：132 项 library（含邀请接受、Member 重登、Owner 邀请 list/create/revoke/regenerate、OAuth hash 绑定、重放/错误 email/atomic session）、4 项 HTTP 安全与 managed-draft 契约测试、5 项 REST/MCP 契约测试，共 141 项；并已运行 `cargo fmt --check`、`cargo check --all-targets --all-features --locked`。未执行部署、真实 Google 或浏览器 smoke。
+本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：141 项 library（含邀请接受、Member 重登、Owner 邀请 list/create/revoke/regenerate、OAuth hash 绑定、重放/错误 email/atomic session、Owner HTML 控制面：dashboard / invitations list+create+revoke+regenerate / members / capacity，CSRF cookie、flash 一次性 token、Member 角色拒绝、未登录 302）、4 项 HTTP 安全与 managed-draft 契约测试、5 项 REST/MCP 契约测试，共 150 项；并已运行 `cargo fmt --check`、`cargo check --all-targets --all-features --locked`、`cargo clippy --all-targets --all-features -- -D warnings`。未执行部署、真实 Google 或浏览器 smoke。
 
 ## A. 尚未实现，因此目前无法执行的测试
 
@@ -20,7 +20,7 @@
 
 ### A3. 数据库 repository 与 control plane CRUD
 
-- 已实现：SQLite repository 已覆盖 users/invitations/sessions/connections/access keys/grants/managed drafts/audit/首次授权 ledger；Owner Access Key 与邀请 list/create/revoke/regenerate API 使用 session+CSRF，邀请 token 与 session 只存 hash；邀请接受和既有 active Member/Owner 的精确 identity 登录会原子创建 session。剩余缺口：Member 管理、账号删除与 control-plane HTML 页面。
+- 已实现：SQLite repository 已覆盖 users/invitations/sessions/connections/access keys/grants/managed drafts/audit/首次授权 ledger；Owner Access Key 与邀请 list/create/revoke/regenerate API 使用 session+CSRF，邀请 token 与 session 只存 hash；邀请接受和既有 active Member/Owner 的精确 identity 登录会原子创建 session。Owner HTML 控制面（dashboard / invitations / members / capacity）已接入并通过 9 项 UI 单元测试（认证/CSRF/角色/一次性 token）。剩余缺口：Member 管理与账号删除。
 - 实现后测试：临时 SQLite 覆盖 Owner/Member、邀请、Connection、key create/rotate/revoke、grant 变更、账号删除与跨重启恢复。
 - 命令目标：`cargo test --test repository_roundtrip --all-features`。
 - 通过标准：重启后状态不丢失；key/confirmation/session 只存 hash；唯一 Owner、唯一 Gmail sub 与 first-authorization ledger 约束生效。

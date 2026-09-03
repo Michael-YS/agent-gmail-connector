@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Invitations · AgentMail{% endblock %}
+{% block content %}
+<h1>Invitations</h1>
+{% if flash_is_some %}
+{% if flash_token_is_some %}
+<div class="flash {{ flash_css_class }}"><p>{{ flash_label }} new invitation token: <code>{{ flash_token }}</code></p>
+<p class="muted">This token is shown only once. Closing or refreshing this page removes it.</p>
+</div>
+{% else %}
+<div class="flash {{ flash_css_class }}"><p>{{ flash_message }}</p></div>
+{% endif %}
+{% endif %}
+<section class="card">
+<h2>Issue a new invitation</h2>
+<form method="post" action="/control/invitations" autocomplete="off">
+<input type="hidden" name="_csrf" value="{{ csrf }}">
+<label class="field">Target email (Gmail account the invitee will use):
+<input type="email" name="target_email" required maxlength="254" value="{{ preset_email }}">
+</label>
+<button type="submit">Issue invitation</button>
+</form>
+</section>
+<section class="card">
+<h2>Existing invitations</h2>
+{% if invitations_empty %}
+<p class="muted">No invitations have been issued yet.</p>
+{% else %}
+<table>
+<thead>
+<tr><th>Target email</th><th>Status</th><th>Expires</th><th>Actions</th></tr>
+</thead>
+<tbody>
+{% for inv in invitations %}
+<tr>
+<td>{{ inv.target_email }}</td>
+<td>{{ inv.status_label }}</td>
+<td>{{ inv.expires_at }}{% if inv.has_accepted_at %} <span class="muted">(accepted {{ inv.accepted_at_display }})</span>{% endif %}</td>
+<td>
+{% if inv.is_pending %}
+<form class="inline" method="post" action="/control/invitations/{{ inv.id }}/regenerate"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit" class="warn">Regenerate</button></form>
+<form class="inline" method="post" action="/control/invitations/{{ inv.id }}/revoke"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Revoke</button></form>
+{% else %}<span class="muted">No actions available.</span>{% endif %}
+</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+</section>
+{% endblock %}

@@ -1888,9 +1888,11 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 gmail_token_client,
             )?;
             let state = AppState::new(Some(db), live_adapter);
-            let control_router = crate::control_http::router(control_state)
+            let control_router = crate::control_http::router(control_state.clone())
                 .layer(middleware::from_fn(request_context));
-            let app = router(state).merge(control_router);
+            let control_ui_router = crate::control_ui::router(control_state)
+                .layer(middleware::from_fn(request_context));
+            let app = router(state).merge(control_router).merge(control_ui_router);
             let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".into());
             let port = std::env::var("PORT")
                 .ok()

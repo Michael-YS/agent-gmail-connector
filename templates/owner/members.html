@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Members · AgentMail{% endblock %}
+{% block content %}
+<h1>Members</h1>
+{% if flash_is_some %}
+{% if flash_token_is_some %}
+<div class="flash {{ flash_css_class }}"><p>{{ flash_label }} new invitation token: <code>{{ flash_token }}</code></p>
+<p class="muted">This token is shown only once. Closing or refreshing this page removes it.</p>
+</div>
+{% else %}
+<div class="flash {{ flash_css_class }}"><p>{{ flash_message }}</p></div>
+{% endif %}
+{% endif %}
+<section class="card">
+<h2>Active and revoked member accounts</h2>
+<p class="muted">Owner sees non-content metadata only. Gmail messages, drafts, queries, and tokens are never exposed here.</p>
+{% if members_empty %}
+<p class="muted">No member accounts exist yet.</p>
+{% else %}
+<table>
+<thead>
+<tr><th>Email</th><th>Status</th><th>Connections</th><th>Access keys</th><th>Last activity</th></tr>
+</thead>
+<tbody>
+{% for m in members %}
+<tr>
+<td>{{ m.email }}</td>
+<td>{{ m.status }}</td>
+<td>{{ m.connection_count }}</td>
+<td>{{ m.access_key_count }}</td>
+<td>{{ m.last_activity }}{% if m.is_revoking %} <span class="muted">(revoke pending)</span>{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+</section>
+{% endblock %}

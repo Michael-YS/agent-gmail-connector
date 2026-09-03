@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod config;
 pub mod control_http;
 pub mod control_plane;
+pub mod control_ui;
 pub mod crypto;
 pub mod database;
 pub mod domain;

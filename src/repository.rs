@@ -825,6 +825,51 @@ impl Repository {
         Ok(result.rows_affected() == 1)
     }
 
+    /// List only Member accounts with owner-safe, non-content aggregate metadata.
+    pub async fn list_member_summaries(&self) -> Result<Vec<MemberSummary>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT u.id,u.login_email,u.status,\
+             (SELECT COUNT(*) FROM gmail_connections c WHERE c.owner_id=u.id) AS connection_count,\
+             (SELECT COUNT(*) FROM access_keys k WHERE k.owner_id=u.id) AS access_key_count,\
+             MAX(\
+                 u.last_activity_at,\
+                 (SELECT MAX(last_seen_at) FROM web_sessions WHERE user_id=u.id),\
+                 (SELECT MAX(last_used_at) FROM gmail_connections WHERE owner_id=u.id),\
+                 (SELECT MAX(last_used_at) FROM access_keys WHERE owner_id=u.id)\
+             ) AS last_activity_at \
+             FROM users u WHERE u.role='member' ORDER BY u.login_email,u.id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(member_summary_from_row).collect()
+    }
+
+    /// Return current active-Member and monotonic authorization capacity counts.
+    pub async fn personal_use_summary(
+        &self,
+        personal_use_user_limit: u16,
+    ) -> Result<PersonalUseSummary, RepositoryError> {
+        let current: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users WHERE role='member' AND status='active'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let historical: i64 = sqlx::query_scalar(
+            "SELECT counter_value FROM instance_counters WHERE counter_name='historical_gmail_authorizations'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let current_member_count = u32::try_from(current)?;
+        let historical_authorization_count = u32::try_from(historical)?;
+        let remaining_capacity =
+            u32::from(personal_use_user_limit).saturating_sub(historical_authorization_count);
+        Ok(PersonalUseSummary {
+            current_member_count,
+            historical_authorization_count,
+            remaining_capacity,
+        })
+    }
+
     pub async fn insert_connection(
         &self,
         c: &GmailConnection,
@@ -1541,6 +1586,25 @@ pub struct FirstAuthorization {
     pub historical_authorizations: u32,
 }
 
+/// Owner-safe, non-content metadata for one Member account.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemberSummary {
+    pub id: UserId,
+    pub email: String,
+    pub status: UserStatus,
+    pub connection_count: u32,
+    pub access_key_count: u32,
+    pub last_activity_at: Option<DateTime<Utc>>,
+}
+
+/// Instance-level Personal Use capacity derived from durable metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PersonalUseSummary {
+    pub current_member_count: u32,
+    pub historical_authorization_count: u32,
+    pub remaining_capacity: u32,
+}
+
 #[async_trait::async_trait]
 impl crate::gmail_credentials::GmailCredentialStore for Repository {
     async fn load(
@@ -1847,6 +1911,17 @@ fn web_session_from_row(r: sqlx::sqlite::SqliteRow) -> Result<WebSession, Reposi
         absolute_expires_at: parse_time(r.try_get("absolute_expires_at")?)?,
         created_at: parse_time(r.try_get("created_at")?)?,
         last_seen_at: parse_time(r.try_get("last_seen_at")?)?,
+    })
+}
+
+fn member_summary_from_row(r: sqlx::sqlite::SqliteRow) -> Result<MemberSummary, RepositoryError> {
+    Ok(MemberSummary {
+        id: UserId::from_uuid(parse_uuid(r.try_get("id")?)?),
+        email: r.try_get("login_email")?,
+        status: parse_user_status(r.try_get("status")?)?,
+        connection_count: u32::try_from(r.try_get::<i64, _>("connection_count")?)?,
+        access_key_count: u32::try_from(r.try_get::<i64, _>("access_key_count")?)?,
+        last_activity_at: parse_opt_time(r.try_get("last_activity_at")?)?,
     })
 }
 
