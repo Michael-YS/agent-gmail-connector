@@ -473,6 +473,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revocation_during_refresh_does_not_return_or_cache_access_token() {
+        let (provider, owner, connection, store, refresher) = setup(Ok(token_set()));
+        let pending = provider.access_token(owner, connection);
+        let revoke = async {
+            while refresher.calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            store
+                .record
+                .lock()
+                .await
+                .as_mut()
+                .unwrap()
+                .connection
+                .status = ConnectionStatus::Revoking;
+        };
+        let (result, ()) = tokio::join!(pending, revoke);
+        assert!(matches!(result, Err(CredentialError::AccessDenied)));
+        assert!(
+            provider
+                .entry(connection)
+                .await
+                .cached
+                .lock()
+                .await
+                .is_none()
+        );
+        assert_eq!(refresher.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn wrong_owner_and_inactive_connection_are_rejected() {
         let (provider, owner, connection, store, _refresher) = setup(Ok(token_set()));
         assert!(matches!(

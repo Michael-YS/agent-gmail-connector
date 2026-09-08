@@ -1,6 +1,6 @@
 //! Minimal Google OAuth token-endpoint client.
 //!
-//! This module deliberately stops at token exchange and refresh.  It does not
+//! This module handles token exchange, refresh, and revocation. It does not
 //! persist tokens, fetch JWKS keys, or make Gmail API calls; those boundaries
 //! need the repository and adapter wiring that is not part of this slice.
 
@@ -10,6 +10,8 @@ use serde::Deserialize;
 use std::{fmt, time::Duration};
 
 pub const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
+pub const GOOGLE_REVOKE_ENDPOINT: &str = "https://oauth2.googleapis.com/revoke";
+const MAX_REVOKE_ERROR_BYTES: usize = 8192;
 
 #[derive(Debug, thiserror::Error, Clone, Eq, PartialEq)]
 pub enum GoogleTokenError {
@@ -21,6 +23,8 @@ pub enum GoogleTokenError {
     EmptyAuthorizationCode,
     #[error("refresh token is empty")]
     EmptyRefreshToken,
+    #[error("revocation token is empty")]
+    EmptyRevocationToken,
     #[error("redirect URI is invalid")]
     InvalidRedirectUri,
     #[error("token endpoint returned invalid_grant")]
@@ -66,6 +70,7 @@ impl fmt::Debug for TokenSet {
 pub struct GoogleTokenClient {
     http: Client,
     token_endpoint: Url,
+    revoke_endpoint: Url,
     redirect_uri: Url,
     client_id: String,
     client_secret: SecretString,
@@ -142,6 +147,8 @@ impl GoogleTokenClient {
         Ok(Self {
             http,
             token_endpoint,
+            revoke_endpoint: Url::parse(GOOGLE_REVOKE_ENDPOINT)
+                .expect("constant Google revoke URL"),
             redirect_uri,
             client_id,
             client_secret,
@@ -186,6 +193,49 @@ impl GoogleTokenClient {
             ("grant_type", "refresh_token"),
         ])
         .await
+    }
+
+    /// Revoke an access or refresh token. Credentials are sent only in the form
+    /// body. Only Google's documented HTTP 200 response confirms revocation;
+    /// invalid_token remains an error. Local credential deletion is independent
+    /// of whether remote revocation succeeds.
+    pub async fn revoke(&self, token: &SecretString) -> Result<(), GoogleTokenError> {
+        if token.expose_secret().is_empty() {
+            return Err(GoogleTokenError::EmptyRevocationToken);
+        }
+        let mut response = self
+            .http
+            .post(self.revoke_endpoint.clone())
+            .form(&[("token", token.expose_secret())])
+            .send()
+            .await
+            .map_err(classify_transport_error)?;
+        let status = response.status();
+        if status == StatusCode::OK {
+            return Ok(());
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(GoogleTokenError::RateLimited {
+                retry_after_seconds: response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.trim().parse().ok()),
+            });
+        }
+        // Bound any error-body drain and never retain or expose provider text.
+        let mut bytes_read = 0usize;
+        while let Some(chunk) = response.chunk().await.map_err(classify_transport_error)? {
+            bytes_read = bytes_read.saturating_add(chunk.len());
+            if bytes_read > MAX_REVOKE_ERROR_BYTES {
+                break;
+            }
+        }
+        if status.is_server_error() {
+            Err(GoogleTokenError::Upstream)
+        } else {
+            Err(GoogleTokenError::InvalidResponse)
+        }
     }
 
     async fn post_form(&self, form: &[(&str, &str)]) -> Result<TokenSet, GoogleTokenError> {
@@ -342,6 +392,13 @@ mod tests {
                 }
             }
             if let Some(separator) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..separator]);
+                assert!(headers.starts_with("POST /token HTTP/1.1\r\n"));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("content-type: application/x-www-form-urlencoded")
+                );
                 let request_body = String::from_utf8_lossy(&request[separator + 4..]);
                 for field in expected_fields {
                     assert!(request_body.contains(&field), "missing form field {field}");
@@ -368,6 +425,7 @@ mod tests {
         GoogleTokenClient::with_endpoint(
             Client::builder()
                 .timeout(Duration::from_millis(250))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap(),
             endpoint,
@@ -393,6 +451,88 @@ mod tests {
             .unwrap_err();
             assert_eq!(error, GoogleTokenError::InvalidRedirectUri);
         }
+    }
+    #[tokio::test]
+    async fn revoke_sends_token_in_form_and_keeps_errors_redacted() {
+        let cases = [
+            (200, None, "", Ok(())),
+            (
+                400,
+                None,
+                r#"{"error":"invalid_token","detail":"secret-body"}"#,
+                Err(GoogleTokenError::InvalidResponse),
+            ),
+            (500, None, "secret-body", Err(GoogleTokenError::Upstream)),
+            (302, None, "", Err(GoogleTokenError::InvalidResponse)),
+            (
+                429,
+                Some("12"),
+                "secret-body",
+                Err(GoogleTokenError::RateLimited {
+                    retry_after_seconds: Some(12),
+                }),
+            ),
+        ];
+        for (status, retry_after, body, expected) in cases {
+            let (endpoint, server) = fake_server(
+                status,
+                retry_after,
+                body,
+                &["token=revocation%2Bsecret"],
+                None,
+            )
+            .await;
+            let mut client = client(endpoint.clone());
+            client.revoke_endpoint = endpoint;
+            let result = client
+                .revoke(&SecretString::from("revocation+secret"))
+                .await;
+            assert_eq!(result, expected);
+            assert!(!format!("{result:?}").contains("secret-body"));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_rejects_empty_token_and_reports_timeout() {
+        let (endpoint, server) = fake_server(
+            200,
+            None,
+            "",
+            &["token=refresh"],
+            Some(Duration::from_millis(500)),
+        )
+        .await;
+        let mut client = client(endpoint.clone());
+        client.revoke_endpoint = endpoint;
+        assert_eq!(
+            client.revoke(&SecretString::from("")).await,
+            Err(GoogleTokenError::EmptyRevocationToken)
+        );
+        assert_eq!(
+            client.revoke(&SecretString::from("refresh")).await,
+            Err(GoogleTokenError::Timeout)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn revoke_bounds_error_body() {
+        let (endpoint, server) = fake_server(
+            400,
+            None,
+            &"x".repeat(MAX_REVOKE_ERROR_BYTES * 2),
+            &["token=refresh"],
+            None,
+        )
+        .await;
+        let mut client = client(endpoint.clone());
+        client.revoke_endpoint = endpoint;
+        assert_eq!(
+            client.revoke(&SecretString::from("refresh")).await,
+            Err(GoogleTokenError::InvalidResponse)
+        );
+        server.await.unwrap();
     }
     #[tokio::test]
     async fn exchange_and_refresh_send_expected_forms() {

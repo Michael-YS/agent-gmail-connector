@@ -43,6 +43,12 @@ pub enum RepositoryError {
     IntegerRange(#[from] TryFromIntError),
 }
 
+/// Credential retained until Google revocation succeeds. Debug redacts the envelope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectionRevocation {
+    pub refresh_token_envelope: Option<EncryptedRefreshToken>,
+}
+
 /// An encrypted PKCE verifier envelope. The plaintext verifier is never
 /// accepted by the repository and is never exposed by this type's Debug
 /// implementation.
@@ -232,6 +238,7 @@ pub enum DurableSendClaim {
         confirmation: SendConfirmation,
     },
 }
+#[derive(Clone, Eq, PartialEq)]
 pub struct EncryptedRefreshToken(String);
 
 impl EncryptedRefreshToken {
@@ -245,7 +252,7 @@ impl EncryptedRefreshToken {
         Ok(Self(envelope))
     }
 
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -941,6 +948,75 @@ impl Repository {
     pub async fn update_connection(&self, c: &GmailConnection) -> Result<bool, RepositoryError> {
         let result=sqlx::query("UPDATE gmail_connections SET primary_email=?,status=?,granted_scopes=?,last_used_at=?,updated_at=? WHERE id=?").bind(&c.email).bind(connection_status(c.status)).bind(scopes_json(&c.granted_scopes)?).bind(c.last_used_at.map(encode_time)).bind(encode_time(Utc::now())).bind(c.id.to_string()).execute(&self.pool).await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    /// Disable local authorization before attempting remote credential revocation.
+    /// Retrying a revoking connection returns the retained encrypted credential.
+    pub async fn begin_connection_revoke(
+        &self,
+        owner_id: UserId,
+        id: ConnectionId,
+    ) -> Result<Option<ConnectionRevocation>, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query("UPDATE gmail_connections SET status='revoking',updated_at=? WHERE id=? AND owner_id=? AND EXISTS (SELECT 1 FROM users WHERE users.id=gmail_connections.owner_id AND users.status='active')")
+            .bind(encode_time(Utc::now()))
+            .bind(id.to_string())
+            .bind(owner_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        if changed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        sqlx::query("DELETE FROM access_key_grants WHERE connection_id=?")
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM send_confirmations WHERE connection_id=?")
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        // A pending reauthorization must never become a new connection after
+        // ON DELETE SET NULL removes its target.
+        sqlx::query("DELETE FROM oauth_transactions WHERE target_connection_id=?")
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        let envelope: Option<String> =
+            sqlx::query_scalar("SELECT refresh_token_envelope FROM gmail_connections WHERE id=?")
+                .bind(id.to_string())
+                .fetch_one(&mut *tx)
+                .await?;
+        // Corrupt legacy ciphertext must not undo the local authorization
+        // barrier. It cannot be used for remote revocation, so omit it.
+        let refresh_token_envelope =
+            envelope.and_then(|value| EncryptedRefreshToken::from_envelope(value).ok());
+        tx.commit().await?;
+        Ok(Some(ConnectionRevocation {
+            refresh_token_envelope,
+        }))
+    }
+
+    /// Finish after attempting remote revocation. Foreign keys remove managed drafts,
+    /// confirmations and grants; the historical authorization ledger is retained.
+    pub async fn finish_connection_revoke(
+        &self,
+        owner_id: UserId,
+        id: ConnectionId,
+    ) -> Result<bool, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM oauth_transactions WHERE target_connection_id=? AND EXISTS (SELECT 1 FROM gmail_connections WHERE id=? AND owner_id=? AND status='revoking')")
+            .bind(id.to_string()).bind(id.to_string()).bind(owner_id.to_string())
+            .execute(&mut *tx).await?;
+        let deleted = sqlx::query(
+            "DELETE FROM gmail_connections WHERE id=? AND owner_id=? AND status='revoking'",
+        )
+        .bind(id.to_string())
+        .bind(owner_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(deleted.rows_affected() == 1)
     }
     pub async fn update_refresh_token_envelope(
         &self,
@@ -2077,6 +2153,179 @@ mod tests {
         assert!(EncryptedRefreshToken::from_envelope("plain-refresh-token").is_err());
         let encrypted = EncryptedRefreshToken::from_envelope("am1.1.nonce.ciphertext").unwrap();
         assert!(!format!("{encrypted:?}").contains("ciphertext"));
+    }
+
+    #[tokio::test]
+    async fn connection_revocation_is_owner_scoped_retryable_and_preserves_history() {
+        let repository = repository().await;
+        let user = owner();
+        repository.insert_user(&user).await.unwrap();
+        let other = User::new("other", "other@example.com", UserRole::Member, Utc::now()).unwrap();
+        repository.insert_user(&other).await.unwrap();
+        let connection = connection(&repository, &user).await;
+        let envelope = EncryptedRefreshToken::from_envelope("am1.1.nonce.ciphertext").unwrap();
+        repository
+            .update_refresh_token_envelope(connection.id, Some(&envelope))
+            .await
+            .unwrap();
+        repository
+            .record_first_authorized_subject(&connection.google_sub, Utc::now(), 5)
+            .await
+            .unwrap();
+        let created = AccessKey::generate(user.id, "key", [connection.id]).unwrap();
+        let key = repository.insert_access_key(&created).await.unwrap();
+        let draft =
+            ManagedDraft::new(connection.id, "draft", "<revoke@agentmail>", "body").unwrap();
+        repository.insert_draft(&draft).await.unwrap();
+        let (oauth_id, _, _) = insert_oauth(&repository, Duration::minutes(5)).await;
+        sqlx::query("UPDATE oauth_transactions SET target_connection_id=? WHERE id=?")
+            .bind(connection.id.to_string())
+            .bind(oauth_id.to_string())
+            .execute(repository.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO send_confirmations (id,token_hash,access_key_id,key_generation,connection_id,draft_id,draft_version,expires_at,created_at) VALUES (?,?,?,?,?,?,?,?,?)")
+            .bind(Uuid::now_v7().to_string()).bind("digest").bind(key.id.to_string()).bind(1_i64)
+            .bind(connection.id.to_string()).bind(draft.id.to_string()).bind("version")
+            .bind(encode_time(Utc::now())).bind(encode_time(Utc::now())).execute(repository.pool()).await.unwrap();
+        assert!(
+            repository
+                .begin_connection_revoke(other.id, connection.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !repository
+                .finish_connection_revoke(user.id, connection.id)
+                .await
+                .unwrap()
+        );
+        let first = repository
+            .begin_connection_revoke(user.id, connection.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.refresh_token_envelope, Some(envelope));
+        assert!(!format!("{first:?}").contains("ciphertext"));
+        assert_eq!(
+            repository
+                .begin_connection_revoke(user.id, connection.id)
+                .await
+                .unwrap(),
+            Some(first)
+        );
+        assert_eq!(
+            repository
+                .get_connection(connection.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ConnectionStatus::Revoking
+        );
+        for table in [
+            "access_key_grants",
+            "send_confirmations",
+            "oauth_transactions",
+        ] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+        assert!(
+            !repository
+                .finish_connection_revoke(other.id, connection.id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            repository
+                .finish_connection_revoke(user.id, connection.id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !repository
+                .finish_connection_revoke(user.id, connection.id)
+                .await
+                .unwrap()
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM managed_drafts")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(
+            repository
+                .personal_use_summary(5)
+                .await
+                .unwrap()
+                .historical_authorization_count,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn inactive_owner_cannot_begin_connection_revocation() {
+        let repository = repository().await;
+        let mut user = owner();
+        repository.insert_user(&user).await.unwrap();
+        let connection = connection(&repository, &user).await;
+        assert!(user.begin_revoke(Utc::now()));
+        repository.update_user(&user).await.unwrap();
+        assert!(
+            repository
+                .begin_connection_revoke(user.id, connection.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            repository
+                .get_connection(connection.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ConnectionStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_envelope_does_not_rollback_local_revocation() {
+        let repository = repository().await;
+        let user = owner();
+        repository.insert_user(&user).await.unwrap();
+        let connection = connection(&repository, &user).await;
+        sqlx::query("UPDATE gmail_connections SET refresh_token_envelope='invalid' WHERE id=?")
+            .bind(connection.id.to_string())
+            .execute(repository.pool())
+            .await
+            .unwrap();
+        let revocation = repository
+            .begin_connection_revoke(user.id, connection.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(revocation.refresh_token_envelope.is_none());
+        assert_eq!(
+            repository
+                .get_connection(connection.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ConnectionStatus::Revoking
+        );
+        assert!(
+            repository
+                .finish_connection_revoke(user.id, connection.id)
+                .await
+                .unwrap()
+        );
     }
     #[tokio::test]
     async fn users_and_connections_round_trip() {

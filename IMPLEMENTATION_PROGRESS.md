@@ -1,13 +1,12 @@
 # AgentMail v1 实现进度
 
-更新时间：2026-09-02
+更新时间：2026-09-08
 
 ## 当前状态
 
 - 工作分支：`feat/agentmail-v1`
 - 当前实现尚未全部完成。
 - Windows sandbox helper 仍会间歇返回 `helper_unknown_error: setup refresh had errors`；本轮通过用户批准的只读/构建命令和 Codex 标准 `apply_patch` 模式完成工作。
-- 用户已经取消“完成后关闭计算机”的要求；后续不得关机。
 
 ## 已提交里程碑
 
@@ -24,9 +23,13 @@
 11. `06b77b6 feat(gmail): manage production drafts`
 12. `dd44402 feat(gmail): persist safe send outcomes`
 13. `e501f0d feat(control): manage Access Keys`
-14. (pending) `feat(control-ui): owner HTML dashboard, invitations, members, capacity`
+14. `0f8b8ff feat(control-ui): owner HTML dashboard and invitations`
+15. 工作区：Connection 两阶段撤销、Google token revoke 与本地清理。
 
 ## 当前实现断点
+
+- 新增 `POST /control/connections/{connection_id}/revoke`：Owner/Member 的有效 session + `x-csrf-token`，只能撤销自己的 Connection。SQLite 事务先标记 `revoking` 并移除 grants、发送确认和绑定该 Connection 的 OAuth transactions，再尝试 Google token revoke；最多三次、单次三秒，尊重短 Retry-After，超预算返回远端未确认。无论远端成功或失败，随后清理本地 Connection、加密凭证与 managed draft 记录，不调用 Gmail 邮件/草稿删除。响应区分 `local_revoked` 与 `remote_revocation`，使用 `no-store`。请求断开不取消已启动的撤销操作；进程中断留下的 `revoking` 行可通过相同入口继续处理，尚无自动恢复扫描。
+- 撤销保留 Personal Use 历史授权账本；缺失或损坏的凭证不阻止本地失效。已发出的上游请求无法追溯取消；后续授权查询和 refresh 完成后的状态复核会拒绝该连接。此里程碑不等同于账号整体 revoke/delete，尚未增加连接管理 HTML 页面。
 
 - Gmail read、MIME、managed draft、安全发送、Access Key 与邀请/Member control-plane 管理已实现。
 - Owner control plane HTML 已接入 `serve`：Askama 模板（base + owner/{dashboard,invitations,members,capacity}.html），严格 CSP、`HttpOnly; Secure; SameSite=Lax` session + csrf cookie、双重 cookie session/csrf 绑定、PRG + flash 一次性 cookie 携带邀请 token；路由 `/control`、`/control/invitations` (GET list + POST create)、`/control/invitations/{id}/revoke`、`/control/invitations/{id}/regenerate`、`/control/members`、`/control/capacity`；所有 GET/POST 强制 Owner role，未登录 302 `/auth/google/login`，CSRF 错 flash=invalid_csrf；create/revoke/regenerate 复用 InviteService，regenerate 先 revoke 再 issue，旧 token 立即失效。Member session 角色被拒、Owner 账号 revoke 按钮暂未接 action（governance 里程碑）。
@@ -41,7 +44,7 @@
 - 邀请接受以 POST body 中的一次性 token 启动 Login OAuth；token 仅以 SHA-256 hash 绑定到 OAuth transaction，callback 仅以已验证、规范化 email 和精确 Google `sub` 原子接受邀请、创建 Member 与 session。重放、错误 email、过期或撤销邀请均不创建 session。
 - 常规 Google Login 会以精确 Google `sub` 与规范化 verified email 登录既有 active Owner 或 Member；没有既有用户时才保留首次 Owner bootstrap 规则。
 - Owner JSON API 已接入：`GET/POST /control/invitations`、`POST /control/invitations/{id}/revoke`、`POST /control/invitations/{id}/regenerate`；mutation 要求 Owner session+CSRF，列表不返回 hash，create/regenerate 的 token 只返回一次并 `Cache-Control: no-store`。regenerate 先 revoke 再 issue，因而 issuance 失败可留下无可用邀请，但绝不同时保留两个有效 token。
-- 最新本地完整验证：141 个 library tests、4 个 HTTP tests、5 个 REST/MCP tests，共 150 项；`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo check --all-targets --all-features --locked` 已通过。未执行部署、真实 Google 或浏览器 smoke。Terra 复审发现并已修正 rotate 后二次查询造成的一次性 credential 交付窗口。
+- 最新本地完整验证：152 个 library tests、4 个 HTTP tests、5 个 REST/MCP tests，共 161 项；`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo check --all-targets --all-features --locked` 已通过。未执行部署、真实 Google 或浏览器 smoke。Terra 复审发现并已修正 rotate 后二次查询造成的一次性 credential 交付窗口。
 
 ## 剩余实现里程碑
 
@@ -67,7 +70,7 @@
 
 ### 4. 连接生命周期
 
-- OAuth/连接撤销与本地凭证清除。
+- 已完成 Connection revoke JSON 入口、Google token revoke 与本地凭证清除；真实 Google 撤销仍待 smoke。
 - 凭证失效后的重新授权恢复流程。
 - reconciliation、连接状态刷新和异常恢复。
 

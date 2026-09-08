@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::{
     config::AppConfig,
     control_plane::{ControlPlaneError, ControlPlaneService, SessionCookiePolicy},
-    crypto::{CryptoError, encrypt_refresh_token, hash_token, verify_token},
+    crypto::{CryptoError, decrypt_refresh_token, encrypt_refresh_token, hash_token, verify_token},
     domain::{
         access::{AccessKey, AccessKeyId},
         identity::{
@@ -81,6 +81,10 @@ pub trait OAuthCodeExchanger: Send + Sync + 'static {
         code: &str,
         code_verifier: &SecretString,
     ) -> Result<TokenSet, GoogleTokenError>;
+
+    async fn revoke(&self, _token: &SecretString) -> Result<(), GoogleTokenError> {
+        Err(GoogleTokenError::Upstream)
+    }
 }
 
 /// Async verifier boundary so the callback can refresh JWKS on an unknown key.
@@ -104,6 +108,10 @@ impl OAuthCodeExchanger for GoogleTokenClient {
         code_verifier: &SecretString,
     ) -> Result<TokenSet, GoogleTokenError> {
         GoogleTokenClient::exchange_code(self, code, code_verifier).await
+    }
+
+    async fn revoke(&self, token: &SecretString) -> Result<(), GoogleTokenError> {
+        GoogleTokenClient::revoke(self, token).await
     }
 }
 
@@ -213,6 +221,10 @@ where
         .route(GMAIL_CALLBACK_PATH, get(gmail_callback::<V, E>))
         .route("/auth/google/gmail", post(gmail_start::<V, E>))
         .route("/auth/logout", post(logout::<V, E>))
+        .route(
+            "/control/connections/{connection_id}/revoke",
+            post(revoke_connection::<V, E>),
+        )
         .route(
             "/control/invitations",
             get(list_invitations::<V, E>).post(create_invitation::<V, E>),
@@ -845,6 +857,129 @@ where
     .await
 }
 
+/// Cut local access before contacting Google, then discard the local credential
+/// even when Google cannot confirm revocation. The spawned operation survives
+/// an HTTP client disconnect; process crashes leave a retryable revoking row.
+async fn revoke_connection<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    Path(connection_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let token_hash = match session_token_hash(&headers) {
+        Ok(hash) => hash,
+        Err(error) => return error_response(error),
+    };
+    let session = match state
+        .control_plane
+        .authenticate_session(&token_hash, Utc::now())
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => return error_response(error.into()),
+    };
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|value| value.to_str().ok());
+    if !csrf.is_some_and(|csrf| {
+        state
+            .control_plane
+            .verify_csrf(&session.csrf_token_hash, csrf)
+    }) {
+        return error_response(ControlHttpError::InvalidRequest);
+    }
+    let connection_id = ConnectionId::from_uuid(connection_id);
+    let operation = tokio::spawn(async move {
+        let Some(revocation) = state
+            .repository
+            .begin_connection_revoke(session.user_id, connection_id)
+            .await?
+        else {
+            return Ok::<_, RepositoryError>(None);
+        };
+        let remote_status = match revocation.refresh_token_envelope {
+            None => "not_available",
+            Some(envelope) => match decrypt_refresh_token(
+                envelope.as_str(),
+                &session.user_id.to_string(),
+                &connection_id.to_string(),
+                &state.config.encryption_keyring,
+            )
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            {
+                Some(token) => {
+                    revoke_google_with_retry(
+                        state.gmail_token_exchanger.as_ref(),
+                        &SecretString::from(token),
+                    )
+                    .await
+                }
+                None => "credential_unavailable",
+            },
+        };
+        state
+            .repository
+            .finish_connection_revoke(session.user_id, connection_id)
+            .await?;
+        Ok(Some(remote_status))
+    });
+    match operation.await {
+        Ok(Ok(Some(remote_status))) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({
+                "connection_id": connection_id.to_string(),
+                "local_revoked": true,
+                "remote_revocation": remote_status,
+            })),
+        )
+            .into_response(),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"connection_not_found"})),
+        )
+            .into_response(),
+        Ok(Err(error)) => error_response(error.into()),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"service_unavailable"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn revoke_google_with_retry<E: OAuthCodeExchanger>(
+    exchanger: &E,
+    token: &SecretString,
+) -> &'static str {
+    for attempt in 0..3 {
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(3), exchanger.revoke(token))
+                .await
+                .unwrap_or(Err(GoogleTokenError::Timeout));
+        match result {
+            Ok(()) => return "revoked",
+            Err(GoogleTokenError::RateLimited {
+                retry_after_seconds,
+            }) if attempt < 2 => {
+                let seconds = retry_after_seconds.unwrap_or(1);
+                if seconds > 1 {
+                    return "unconfirmed";
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+            }
+            Err(GoogleTokenError::Upstream | GoogleTokenError::Timeout) if attempt < 2 => {
+                tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1))).await;
+            }
+            Err(_) => return "unconfirmed",
+        }
+    }
+    "unconfirmed"
+}
+
 pub async fn gmail_start<V, E>(
     State(state): State<ControlHttpState<V, E>>,
     Query(query): Query<GmailStartQuery>,
@@ -1440,6 +1575,263 @@ mod tests {
             ),
         ]))
         .unwrap()
+    }
+
+    #[derive(Clone)]
+    struct RevokeExchanger {
+        repository: Repository,
+        connection_id: ConnectionId,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        failure: bool,
+    }
+
+    struct RejectedRevoke {
+        error: GoogleTokenError,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl OAuthCodeExchanger for RejectedRevoke {
+        async fn exchange_code(
+            &self,
+            _: &str,
+            _: &SecretString,
+        ) -> Result<TokenSet, GoogleTokenError> {
+            unreachable!()
+        }
+        async fn revoke(&self, _: &SecretString) -> Result<(), GoogleTokenError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(self.error.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_revoke_does_not_retry_permanent_errors_or_exceed_retry_after_budget() {
+        for error in [
+            GoogleTokenError::InvalidGrant,
+            GoogleTokenError::InvalidResponse,
+            GoogleTokenError::RateLimited {
+                retry_after_seconds: Some(3600),
+            },
+        ] {
+            let exchanger = RejectedRevoke {
+                error,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            };
+            assert_eq!(
+                revoke_google_with_retry(&exchanger, &SecretString::from("synthetic-refresh"))
+                    .await,
+                "unconfirmed"
+            );
+            assert_eq!(exchanger.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[async_trait]
+    impl OAuthCodeExchanger for RevokeExchanger {
+        async fn exchange_code(
+            &self,
+            _: &str,
+            _: &SecretString,
+        ) -> Result<TokenSet, GoogleTokenError> {
+            unreachable!()
+        }
+
+        async fn revoke(&self, _: &SecretString) -> Result<(), GoogleTokenError> {
+            assert_eq!(
+                self.repository
+                    .get_connection(self.connection_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                ConnectionStatus::Revoking
+            );
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.failure {
+                Err(GoogleTokenError::Upstream)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_revoke_authentication_csrf_and_ownership_are_required() {
+        let (app, repository, _, connection, session, csrf) = key_fixture(UserRole::Member).await;
+        let uri = format!("/control/connections/{}/revoke", connection.id);
+        for (session, csrf, expected) in [
+            (None, Some(csrf.as_str()), StatusCode::UNAUTHORIZED),
+            (Some(session.as_str()), None, StatusCode::BAD_REQUEST),
+            (
+                Some(session.as_str()),
+                Some("wrong"),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            assert_eq!(
+                control_json(&app, Method::POST, uri.clone(), session, csrf, json!({}))
+                    .await
+                    .0,
+                expected
+            );
+        }
+        let foreign = User::new(
+            "foreign",
+            "foreign@example.com",
+            UserRole::Member,
+            Utc::now(),
+        )
+        .unwrap();
+        repository.insert_user(&foreign).await.unwrap();
+        let foreign_connection = GmailConnection::new(
+            foreign.id,
+            "foreign-gmail",
+            "foreign@example.com",
+            vec![GMAIL_READONLY_SCOPE.into(), GMAIL_COMPOSE_SCOPE.into()],
+        )
+        .unwrap();
+        repository
+            .insert_connection(&foreign_connection, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            control_json(
+                &app,
+                Method::POST,
+                format!("/control/connections/{}/revoke", foreign_connection.id),
+                Some(&session),
+                Some(&csrf),
+                json!({})
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            repository
+                .get_connection(connection.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ConnectionStatus::Active
+        );
+        assert!(
+            repository
+                .get_connection(foreign_connection.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_revoke_cuts_access_before_google_and_cleans_up_on_failure() {
+        for failure in [false, true] {
+            let (_, repository, user, connection, session, csrf) =
+                key_fixture(UserRole::Member).await;
+            let config = test_config();
+            let envelope = EncryptedRefreshToken::from_envelope(
+                encrypt_refresh_token(
+                    b"synthetic-refresh",
+                    &user.id.to_string(),
+                    &connection.id.to_string(),
+                    &config.encryption_keyring,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            repository
+                .update_refresh_token_envelope(connection.id, Some(&envelope))
+                .await
+                .unwrap();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let exchanger = RevokeExchanger {
+                repository: repository.clone(),
+                connection_id: connection.id,
+                calls: calls.clone(),
+                failure,
+            };
+            let app = router(
+                ControlHttpState::new(
+                    config,
+                    repository.clone(),
+                    UnusedVerifier,
+                    exchanger.clone(),
+                    exchanger,
+                )
+                .unwrap(),
+            );
+            let (status, _, body) = control_json(
+                &app,
+                Method::POST,
+                format!("/control/connections/{}/revoke", connection.id),
+                Some(&session),
+                Some(&csrf),
+                json!({}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["local_revoked"], true);
+            assert_eq!(
+                body["remote_revocation"],
+                if failure { "unconfirmed" } else { "revoked" }
+            );
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                if failure { 3 } else { 1 }
+            );
+            assert!(
+                repository
+                    .get_connection(connection.id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!body.to_string().contains("synthetic-refresh"));
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_revoke_deletes_local_connection_without_usable_credential() {
+        for corrupt in [false, true] {
+            let (app, repository, _, connection, session, csrf) =
+                key_fixture(UserRole::Member).await;
+            if corrupt {
+                let envelope =
+                    EncryptedRefreshToken::from_envelope("am1.999.invalid.invalid").unwrap();
+                repository
+                    .update_refresh_token_envelope(connection.id, Some(&envelope))
+                    .await
+                    .unwrap();
+            }
+            let (status, _, body) = control_json(
+                &app,
+                Method::POST,
+                format!("/control/connections/{}/revoke", connection.id),
+                Some(&session),
+                Some(&csrf),
+                json!({}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                body["remote_revocation"],
+                if corrupt {
+                    "credential_unavailable"
+                } else {
+                    "not_available"
+                }
+            );
+            assert!(
+                repository
+                    .get_connection(connection.id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     async fn key_fixture(
