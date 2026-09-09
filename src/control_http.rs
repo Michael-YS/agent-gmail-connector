@@ -40,7 +40,9 @@ use crate::{
         OAuthFlowKind, OidcClaims, ValidatedOidcIdentity, validate_granted_gmail_scopes,
         validate_oidc_claims,
     },
-    repository::{EncryptedRefreshToken, Repository, RepositoryError, StoredAccessKey},
+    repository::{
+        EncryptedRefreshToken, Repository, RepositoryError, StoredAccessKey, UserRevocation,
+    },
 };
 
 const LOGIN_TRANSACTION_COOKIE: &str = "__Host-agentmail_login_tx";
@@ -222,35 +224,43 @@ where
         .route("/auth/google/gmail", post(gmail_start::<V, E>))
         .route("/auth/logout", post(logout::<V, E>))
         .route(
-            "/control/connections/{connection_id}/revoke",
+            "/control/api/account/delete",
+            post(delete_own_account::<V, E>),
+        )
+        .route(
+            "/control/api/members/{user_id}/revoke",
+            post(revoke_member::<V, E>),
+        )
+        .route(
+            "/control/api/connections/{connection_id}/revoke",
             post(revoke_connection::<V, E>),
         )
         .route(
-            "/control/invitations",
+            "/control/api/invitations",
             get(list_invitations::<V, E>).post(create_invitation::<V, E>),
         )
         .route(
-            "/control/invitations/{invitation_id}/revoke",
+            "/control/api/invitations/{invitation_id}/revoke",
             post(revoke_invitation::<V, E>),
         )
         .route(
-            "/control/invitations/{invitation_id}/regenerate",
+            "/control/api/invitations/{invitation_id}/regenerate",
             post(regenerate_invitation::<V, E>),
         )
         .route(
-            "/control/access-keys",
+            "/control/api/access-keys",
             get(list_access_keys::<V, E>).post(create_access_key::<V, E>),
         )
         .route(
-            "/control/access-keys/{key_id}/rotate",
+            "/control/api/access-keys/{key_id}/rotate",
             post(rotate_access_key::<V, E>),
         )
         .route(
-            "/control/access-keys/{key_id}/revoke",
+            "/control/api/access-keys/{key_id}/revoke",
             post(revoke_access_key::<V, E>),
         )
         .route(
-            "/control/access-keys/{key_id}/connections/{connection_id}",
+            "/control/api/access-keys/{key_id}/connections/{connection_id}",
             axum::routing::put(grant_access_key::<V, E>).delete(remove_access_key_grant::<V, E>),
         )
         .with_state(state)
@@ -442,11 +452,11 @@ where
     V: OidcTokenVerifier,
     E: OAuthCodeExchanger,
 {
-    let owner = match require_owner_session(&state, &headers, false).await {
-        Ok(owner) => owner,
+    let principal = match require_authenticated_session(&state, &headers, false).await {
+        Ok(principal) => principal,
         Err(response) => return response,
     };
-    match state.repository.list_access_keys(owner.user_id).await {
+    match state.repository.list_access_keys(principal.user_id).await {
         Ok(keys) => (
             StatusCode::OK,
             Json(json!({
@@ -467,8 +477,8 @@ where
     V: OidcTokenVerifier,
     E: OAuthCodeExchanger,
 {
-    let owner = match require_owner_session(&state, &headers, true).await {
-        Ok(owner) => owner,
+    let principal = match require_authenticated_session(&state, &headers, true).await {
+        Ok(principal) => principal,
         Err(response) => return response,
     };
     let connections = request
@@ -476,7 +486,7 @@ where
         .into_iter()
         .map(ConnectionId::from_uuid)
         .collect::<Vec<_>>();
-    let created = match AccessKey::generate(owner.user_id, request.name, connections) {
+    let created = match AccessKey::generate(principal.user_id, request.name, connections) {
         Ok(created) => created,
         Err(_) => return control_api_error(StatusCode::BAD_REQUEST, "invalid_request"),
     };
@@ -499,14 +509,14 @@ where
     V: OidcTokenVerifier,
     E: OAuthCodeExchanger,
 {
-    let owner = match require_owner_session(&state, &headers, true).await {
-        Ok(owner) => owner,
+    let principal = match require_authenticated_session(&state, &headers, true).await {
+        Ok(principal) => principal,
         Err(response) => return response,
     };
     let key_id = AccessKeyId::from_uuid(key_id);
     match state
         .repository
-        .rotate_access_key(owner.user_id, key_id)
+        .rotate_access_key(principal.user_id, key_id)
         .await
     {
         Ok(Some(rotated)) => credential_response(&rotated.key, rotated.credential),
@@ -525,12 +535,16 @@ where
     V: OidcTokenVerifier,
     E: OAuthCodeExchanger,
 {
-    let owner = match require_owner_session(&state, &headers, true).await {
-        Ok(owner) => owner,
+    let principal = match require_authenticated_session(&state, &headers, true).await {
+        Ok(principal) => principal,
         Err(response) => return response,
     };
     let key_id = AccessKeyId::from_uuid(key_id);
-    let existing = match state.repository.get_access_key(owner.user_id, key_id).await {
+    let existing = match state
+        .repository
+        .get_access_key(principal.user_id, key_id)
+        .await
+    {
         Ok(Some(key)) => key,
         Ok(None) => return control_api_error(StatusCode::NOT_FOUND, "not_found"),
         Err(error) => return error_response(error.into()),
@@ -538,12 +552,16 @@ where
     if existing.status.accepts_requests()
         && let Err(error) = state
             .repository
-            .revoke_access_key(owner.user_id, key_id)
+            .revoke_access_key(principal.user_id, key_id)
             .await
     {
         return error_response(error.into());
     }
-    match state.repository.get_access_key(owner.user_id, key_id).await {
+    match state
+        .repository
+        .get_access_key(principal.user_id, key_id)
+        .await
+    {
         Ok(Some(stored)) => (
             StatusCode::OK,
             Json(json!({"access_key": access_key_view(&stored)})),
@@ -589,12 +607,16 @@ where
     V: OidcTokenVerifier,
     E: OAuthCodeExchanger,
 {
-    let owner = match require_owner_session(state, headers, true).await {
-        Ok(owner) => owner,
+    let principal = match require_authenticated_session(state, headers, true).await {
+        Ok(principal) => principal,
         Err(response) => return response,
     };
     let key_id = AccessKeyId::from_uuid(key_id);
-    match state.repository.get_access_key(owner.user_id, key_id).await {
+    match state
+        .repository
+        .get_access_key(principal.user_id, key_id)
+        .await
+    {
         Ok(Some(key)) if key.status.accepts_requests() => {}
         Ok(Some(_)) => return control_api_error(StatusCode::CONFLICT, "invalid_state"),
         Ok(None) => return control_api_error(StatusCode::NOT_FOUND, "not_found"),
@@ -893,39 +915,7 @@ where
     }
     let connection_id = ConnectionId::from_uuid(connection_id);
     let operation = tokio::spawn(async move {
-        let Some(revocation) = state
-            .repository
-            .begin_connection_revoke(session.user_id, connection_id)
-            .await?
-        else {
-            return Ok::<_, RepositoryError>(None);
-        };
-        let remote_status = match revocation.refresh_token_envelope {
-            None => "not_available",
-            Some(envelope) => match decrypt_refresh_token(
-                envelope.as_str(),
-                &session.user_id.to_string(),
-                &connection_id.to_string(),
-                &state.config.encryption_keyring,
-            )
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            {
-                Some(token) => {
-                    revoke_google_with_retry(
-                        state.gmail_token_exchanger.as_ref(),
-                        &SecretString::from(token),
-                    )
-                    .await
-                }
-                None => "credential_unavailable",
-            },
-        };
-        state
-            .repository
-            .finish_connection_revoke(session.user_id, connection_id)
-            .await?;
-        Ok(Some(remote_status))
+        revoke_connection_account(&state, session.user_id, connection_id).await
     });
     match operation.await {
         Ok(Ok(Some(remote_status))) => (
@@ -948,6 +938,266 @@ where
             Json(json!({"error":"service_unavailable"})),
         )
             .into_response(),
+    }
+}
+
+pub(crate) async fn revoke_connection_account<V, E>(
+    state: &ControlHttpState<V, E>,
+    owner_id: UserId,
+    connection_id: ConnectionId,
+) -> Result<Option<&'static str>, RepositoryError>
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let Some(revocation) = state
+        .repository
+        .begin_connection_revoke(owner_id, connection_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let remote_status = match revocation.refresh_token_envelope {
+        None => "not_available",
+        Some(envelope) => match decrypt_refresh_token(
+            envelope.as_str(),
+            &owner_id.to_string(),
+            &connection_id.to_string(),
+            &state.config.encryption_keyring,
+        )
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        {
+            Some(token) => {
+                revoke_google_with_retry(
+                    state.gmail_token_exchanger.as_ref(),
+                    &SecretString::from(token),
+                )
+                .await
+            }
+            None => "credential_unavailable",
+        },
+    };
+    state
+        .repository
+        .finish_connection_revoke(owner_id, connection_id)
+        .await?;
+    Ok(Some(remote_status))
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct UserRevocationResult {
+    connections: usize,
+    remote_revoked: usize,
+    remote_unconfirmed: usize,
+    credential_unavailable: usize,
+}
+
+async fn delete_own_account<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    headers: HeaderMap,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let session = match require_authenticated_session(&state, &headers, true).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let state_for_task = state.clone();
+    let operation = tokio::spawn(async move {
+        revoke_member_account(&state_for_task, session.user_id, session.user_id).await
+    });
+    match operation.await {
+        Ok(Ok(Some(result))) => {
+            let mut response = user_revocation_response(session.user_id, result);
+            append_clear_auth_cookies(&mut response);
+            response
+        }
+        Ok(Ok(None)) => control_api_error(StatusCode::FORBIDDEN, "owner_cannot_be_deleted"),
+        Ok(Err(error)) => error_response(error.into()),
+        Err(_) => control_api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    }
+}
+
+async fn revoke_member<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    Path(user_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let owner = match require_owner_session(&state, &headers, true).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let user_id = UserId::from_uuid(user_id);
+    let state_for_task = state.clone();
+    let operation = tokio::spawn(async move {
+        revoke_member_account(&state_for_task, owner.user_id, user_id).await
+    });
+    match operation.await {
+        Ok(Ok(Some(result))) => user_revocation_response(user_id, result),
+        Ok(Ok(None)) => control_api_error(StatusCode::NOT_FOUND, "member_not_found"),
+        Ok(Err(error)) => error_response(error.into()),
+        Err(_) => control_api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    }
+}
+
+pub(crate) async fn revoke_member_account<V, E>(
+    state: &ControlHttpState<V, E>,
+    actor_id: UserId,
+    user_id: UserId,
+) -> Result<Option<UserRevocationResult>, RepositoryError>
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let Some(revocation) = state
+        .repository
+        .begin_user_revoke(actor_id, user_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    revoke_user_credentials(state, revocation).await.map(Some)
+}
+
+async fn require_authenticated_session<V, E>(
+    state: &ControlHttpState<V, E>,
+    headers: &HeaderMap,
+    require_csrf: bool,
+) -> Result<SessionContext, Response>
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let token_hash = session_token_hash(headers).map_err(error_response)?;
+    let session = state
+        .control_plane
+        .authenticate_session(&token_hash, Utc::now())
+        .await
+        .map_err(|error| error_response(error.into()))?;
+    if require_csrf {
+        let presented = headers
+            .get("x-csrf-token")
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| control_api_error(StatusCode::BAD_REQUEST, "invalid_csrf"))?;
+        if !state
+            .control_plane
+            .verify_csrf(&session.csrf_token_hash, presented)
+        {
+            return Err(control_api_error(StatusCode::BAD_REQUEST, "invalid_csrf"));
+        }
+    }
+    Ok(SessionContext {
+        user_id: session.user_id,
+        token_hash,
+        csrf_token_hash: session.csrf_token_hash,
+    })
+}
+
+async fn revoke_user_credentials<V, E>(
+    state: &ControlHttpState<V, E>,
+    revocation: UserRevocation,
+) -> Result<UserRevocationResult, RepositoryError>
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let mut result = UserRevocationResult {
+        connections: revocation.connections.len(),
+        ..UserRevocationResult::default()
+    };
+    for connection in revocation.connections {
+        let Some(envelope) = connection.refresh_token_envelope else {
+            result.credential_unavailable += 1;
+            continue;
+        };
+        let token = decrypt_refresh_token(
+            envelope.as_str(),
+            &revocation.user_id.to_string(),
+            &connection.connection_id.to_string(),
+            &state.config.encryption_keyring,
+        )
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(SecretString::from);
+        let Some(token) = token else {
+            result.credential_unavailable += 1;
+            continue;
+        };
+        match revoke_google_with_retry(state.gmail_token_exchanger.as_ref(), &token).await {
+            "revoked" => result.remote_revoked += 1,
+            _ => result.remote_unconfirmed += 1,
+        }
+    }
+    state
+        .repository
+        .finish_user_revoke(revocation.user_id)
+        .await?;
+    Ok(result)
+}
+
+/// Complete Member and standalone Connection revocations left by an
+/// interrupted process before the server begins accepting requests.
+pub async fn recover_pending_revocations<V, E>(
+    state: &ControlHttpState<V, E>,
+) -> Result<usize, RepositoryError>
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let users = state.repository.list_revoking_members().await?;
+    let mut completed = 0;
+    for user_id in users {
+        if let Some(revocation) = state.repository.resume_user_revoke(user_id).await? {
+            revoke_user_credentials(state, revocation).await?;
+            completed += 1;
+        }
+    }
+    for (owner_id, connection_id) in state.repository.list_revoking_connections().await? {
+        if revoke_connection_account(state, owner_id, connection_id)
+            .await?
+            .is_some()
+        {
+            completed += 1;
+        }
+    }
+    Ok(completed)
+}
+
+fn user_revocation_response(user_id: UserId, result: UserRevocationResult) -> Response {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "user_id": user_id.to_string(),
+            "local_revoked": true,
+            "connections": result.connections,
+            "remote_revoked": result.remote_revoked,
+            "remote_unconfirmed": result.remote_unconfirmed,
+            "credential_unavailable": result.credential_unavailable,
+        })),
+    )
+        .into_response()
+}
+
+fn append_clear_auth_cookies(response: &mut Response) {
+    let policy = SessionCookiePolicy::default();
+    for value in [
+        format!(
+            "{}=; HttpOnly; Secure; SameSite=Lax; Path={}; Max-Age=0",
+            policy.name, policy.path
+        ),
+        crate::control_ui::csrf_cookie_clear(),
+    ] {
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&value).expect("fixed cookie attributes are valid"),
+        );
     }
 }
 
@@ -1659,7 +1909,7 @@ mod tests {
     #[tokio::test]
     async fn connection_revoke_authentication_csrf_and_ownership_are_required() {
         let (app, repository, _, connection, session, csrf) = key_fixture(UserRole::Member).await;
-        let uri = format!("/control/connections/{}/revoke", connection.id);
+        let uri = format!("/control/api/connections/{}/revoke", connection.id);
         for (session, csrf, expected) in [
             (None, Some(csrf.as_str()), StatusCode::UNAUTHORIZED),
             (Some(session.as_str()), None, StatusCode::BAD_REQUEST),
@@ -1699,7 +1949,7 @@ mod tests {
             control_json(
                 &app,
                 Method::POST,
-                format!("/control/connections/{}/revoke", foreign_connection.id),
+                format!("/control/api/connections/{}/revoke", foreign_connection.id),
                 Some(&session),
                 Some(&csrf),
                 json!({})
@@ -1766,7 +2016,7 @@ mod tests {
             let (status, _, body) = control_json(
                 &app,
                 Method::POST,
-                format!("/control/connections/{}/revoke", connection.id),
+                format!("/control/api/connections/{}/revoke", connection.id),
                 Some(&session),
                 Some(&csrf),
                 json!({}),
@@ -1809,7 +2059,7 @@ mod tests {
             let (status, _, body) = control_json(
                 &app,
                 Method::POST,
-                format!("/control/connections/{}/revoke", connection.id),
+                format!("/control/api/connections/{}/revoke", connection.id),
                 Some(&session),
                 Some(&csrf),
                 json!({}),
@@ -1832,6 +2082,202 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn member_self_delete_clears_cookies_and_owner_cannot_self_delete() {
+        for role in [UserRole::Member, UserRole::Owner] {
+            let (app, repository, user, _connection, session, csrf) = key_fixture(role).await;
+            let (status, headers, body) = control_json(
+                &app,
+                Method::POST,
+                "/control/api/account/delete".to_owned(),
+                Some(&session),
+                Some(&csrf),
+                json!({}),
+            )
+            .await;
+            if role == UserRole::Member {
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body["local_revoked"], true);
+                assert!(repository.get_user(user.id).await.unwrap().is_none());
+                let cookies = headers
+                    .get_all(header::SET_COOKIE)
+                    .iter()
+                    .filter_map(|value| value.to_str().ok())
+                    .collect::<Vec<_>>();
+                assert!(
+                    cookies
+                        .iter()
+                        .any(|value| value.starts_with("__Host-agentmail_session=;"))
+                );
+                assert!(
+                    cookies
+                        .iter()
+                        .any(|value| value.starts_with("__Host-agentmail_csrf=;"))
+                );
+            } else {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert_eq!(body["error"], "owner_cannot_be_deleted");
+                assert!(repository.get_user(user.id).await.unwrap().is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_may_revoke_member_but_member_cannot_revoke_another_member() {
+        let (app, repository, owner, _connection, owner_session, owner_csrf) =
+            key_fixture(UserRole::Owner).await;
+        let member = User::new(
+            "member-to-revoke",
+            "member-to-revoke@example.com",
+            UserRole::Member,
+            Utc::now(),
+        )
+        .unwrap();
+        repository.insert_user(&member).await.unwrap();
+        let member_session = "member-revoke-session";
+        let member_csrf = "member-revoke-csrf";
+        let now = Utc::now();
+        repository
+            .insert_web_session(&NewWebSession {
+                id: SessionId::new(),
+                user_id: member.id,
+                token_hash: hash_token(member_session),
+                csrf_token_hash: hash_token(member_csrf),
+                idle_expires_at: now + Duration::hours(1),
+                absolute_expires_at: now + Duration::hours(1),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        let target = User::new(
+            "second-member",
+            "second-member@example.com",
+            UserRole::Member,
+            Utc::now(),
+        )
+        .unwrap();
+        repository.insert_user(&target).await.unwrap();
+        let target_path = format!("/control/api/members/{}/revoke", target.id);
+        assert_eq!(
+            control_json(
+                &app,
+                Method::POST,
+                target_path.clone(),
+                Some(member_session),
+                Some(member_csrf),
+                json!({}),
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert!(repository.get_user(target.id).await.unwrap().is_some());
+        let (status, _, body) = control_json(
+            &app,
+            Method::POST,
+            target_path,
+            Some(&owner_session),
+            Some(&owner_csrf),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["local_revoked"], true);
+        assert!(repository.get_user(target.id).await.unwrap().is_none());
+        assert!(repository.get_user(owner.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_finishes_interrupted_member_revocation() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        database.migrate().await.unwrap();
+        let repository = Repository::new(&database);
+        let member = User::new(
+            "interrupted-member",
+            "interrupted@example.com",
+            UserRole::Member,
+            Utc::now(),
+        )
+        .unwrap();
+        repository.insert_user(&member).await.unwrap();
+        let connection = GmailConnection::new(
+            member.id,
+            "interrupted-gmail",
+            "interrupted.mail@example.com",
+            vec![GMAIL_READONLY_SCOPE.into(), GMAIL_COMPOSE_SCOPE.into()],
+        )
+        .unwrap();
+        repository
+            .insert_connection(&connection, None)
+            .await
+            .unwrap();
+        repository
+            .begin_user_revoke(member.id, member.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(repository.get_user(member.id).await.unwrap().is_some());
+
+        let state = ControlHttpState::new(
+            test_config(),
+            repository.clone(),
+            UnusedVerifier,
+            UnusedExchanger,
+            UnusedExchanger,
+        )
+        .unwrap();
+        assert_eq!(recover_pending_revocations(&state).await.unwrap(), 1);
+        assert!(repository.get_user(member.id).await.unwrap().is_none());
+        let owner = User::new(
+            "recovery-owner",
+            "owner@example.com",
+            UserRole::Owner,
+            Utc::now(),
+        )
+        .unwrap();
+        repository.insert_user(&owner).await.unwrap();
+        let owner_connection = GmailConnection::new(
+            owner.id,
+            "owner-recovery-gmail",
+            "owner@example.com",
+            vec![GMAIL_READONLY_SCOPE.into(), GMAIL_COMPOSE_SCOPE.into()],
+        )
+        .unwrap();
+        repository
+            .insert_connection(&owner_connection, None)
+            .await
+            .unwrap();
+        repository
+            .begin_connection_revoke(owner.id, owner_connection.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recover_pending_revocations(&state).await.unwrap(), 1);
+        assert!(
+            repository
+                .get_connection(owner_connection.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(recover_pending_revocations(&state).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn json_and_html_control_routers_merge_without_route_conflicts() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        database.migrate().await.unwrap();
+        let state = ControlHttpState::new(
+            test_config(),
+            Repository::new(&database),
+            UnusedVerifier,
+            UnusedExchanger,
+            UnusedExchanger,
+        )
+        .unwrap();
+        let _combined = router(state.clone()).merge(crate::control_ui::router(state));
     }
 
     async fn key_fixture(
@@ -1974,7 +2420,7 @@ mod tests {
         let (status, _, _) = control_json(
             &app,
             Method::GET,
-            "/control/access-keys".to_owned(),
+            "/control/api/access-keys".to_owned(),
             None,
             None,
             Value::Null,
@@ -1985,7 +2431,7 @@ mod tests {
         let (status, _, listed) = control_json(
             &app,
             Method::GET,
-            "/control/access-keys".to_owned(),
+            "/control/api/access-keys".to_owned(),
             Some(&session),
             None,
             Value::Null,
@@ -2013,7 +2459,7 @@ mod tests {
         let (status, _, _) = control_json(
             &app,
             Method::POST,
-            "/control/access-keys".to_owned(),
+            "/control/api/access-keys".to_owned(),
             Some(&session),
             None,
             create_body.clone(),
@@ -2023,7 +2469,7 @@ mod tests {
         let (status, _, _) = control_json(
             &app,
             Method::POST,
-            "/control/access-keys".to_owned(),
+            "/control/api/access-keys".to_owned(),
             Some(&session),
             Some("wrong-csrf"),
             create_body.clone(),
@@ -2034,7 +2480,7 @@ mod tests {
         let (status, headers, created) = control_json(
             &app,
             Method::POST,
-            "/control/access-keys".to_owned(),
+            "/control/api/access-keys".to_owned(),
             Some(&session),
             Some(&csrf),
             create_body,
@@ -2061,7 +2507,7 @@ mod tests {
         );
 
         let grant_path = format!(
-            "/control/access-keys/{key_id}/connections/{}",
+            "/control/api/access-keys/{key_id}/connections/{}",
             connection.id
         );
         let (status, _, _) = control_json(
@@ -2121,7 +2567,7 @@ mod tests {
             AccessKey::generate(foreign.id, "foreign", [foreign_connection.id]).unwrap();
         let foreign_key = repository.insert_access_key(&foreign_key).await.unwrap();
         let foreign_grant_path = format!(
-            "/control/access-keys/{key_id}/connections/{}",
+            "/control/api/access-keys/{key_id}/connections/{}",
             foreign_connection.id
         );
         let (status, _, _) = control_json(
@@ -2137,7 +2583,7 @@ mod tests {
         let (status, _, _) = control_json(
             &app,
             Method::POST,
-            format!("/control/access-keys/{}/rotate", foreign_key.id),
+            format!("/control/api/access-keys/{}/rotate", foreign_key.id),
             Some(&session),
             Some(&csrf),
             Value::Null,
@@ -2148,7 +2594,7 @@ mod tests {
         let (status, headers, rotated) = control_json(
             &app,
             Method::POST,
-            format!("/control/access-keys/{key_id}/rotate"),
+            format!("/control/api/access-keys/{key_id}/rotate"),
             Some(&session),
             Some(&csrf),
             Value::Null,
@@ -2176,7 +2622,7 @@ mod tests {
         let (status, _, _) = control_json(
             &app,
             Method::POST,
-            format!("/control/access-keys/{key_id}/revoke"),
+            format!("/control/api/access-keys/{key_id}/revoke"),
             Some(&session),
             Some(&csrf),
             Value::Null,
@@ -2193,7 +2639,7 @@ mod tests {
         let (status, _, listed) = control_json(
             &app,
             Method::GET,
-            "/control/access-keys".to_owned(),
+            "/control/api/access-keys".to_owned(),
             Some(&session),
             None,
             Value::Null,
@@ -2204,25 +2650,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn access_key_routes_reject_member_session() {
-        let (app, _, _, _, session, csrf) = key_fixture(UserRole::Member).await;
-        let (status, _, _) = control_json(
+    async fn members_manage_own_access_keys_but_not_invitations() {
+        let (app, repository, member, connection, session, csrf) =
+            key_fixture(UserRole::Member).await;
+        let (status, _, listed) = control_json(
             &app,
             Method::GET,
-            "/control/access-keys".to_owned(),
+            "/control/api/access-keys".to_owned(),
             Some(&session),
             None,
             Value::Null,
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        let (status, _, _) = control_json(
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["access_keys"], json!([]));
+        let (status, headers, created) = control_json(
             &app,
             Method::POST,
-            "/control/access-keys".to_owned(),
+            "/control/api/access-keys".to_owned(),
             Some(&session),
             Some(&csrf),
-            json!({"name":"member-key"}),
+            json!({"name":"member-key","connection_ids":[connection.id]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        assert!(
+            created["credential"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("amk_"))
+        );
+        assert_eq!(
+            repository.list_access_keys(member.id).await.unwrap().len(),
+            1
+        );
+        let (status, _, _) = control_json(
+            &app,
+            Method::GET,
+            "/control/api/invitations".to_owned(),
+            Some(&session),
+            None,
+            Value::Null,
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -2236,7 +2709,7 @@ mod tests {
         let (status, _, _) = control_json(
             &app,
             Method::POST,
-            "/control/invitations".to_owned(),
+            "/control/api/invitations".to_owned(),
             Some(&session),
             None,
             create.clone(),
@@ -2246,7 +2719,7 @@ mod tests {
         let (status, headers, created) = control_json(
             &app,
             Method::POST,
-            "/control/invitations".to_owned(),
+            "/control/api/invitations".to_owned(),
             Some(&session),
             Some(&csrf),
             create,
@@ -2267,7 +2740,7 @@ mod tests {
         let (status, _, listed) = control_json(
             &app,
             Method::GET,
-            "/control/invitations".to_owned(),
+            "/control/api/invitations".to_owned(),
             Some(&session),
             None,
             Value::Null,
@@ -2280,7 +2753,7 @@ mod tests {
         let (status, _, _) = control_json(
             &app,
             Method::POST,
-            format!("/control/invitations/{invitation_id}/regenerate"),
+            format!("/control/api/invitations/{invitation_id}/regenerate"),
             Some(&session),
             None,
             Value::Null,
@@ -2290,7 +2763,7 @@ mod tests {
         let (status, headers, regenerated) = control_json(
             &app,
             Method::POST,
-            format!("/control/invitations/{invitation_id}/regenerate"),
+            format!("/control/api/invitations/{invitation_id}/regenerate"),
             Some(&session),
             Some(&csrf),
             Value::Null,
@@ -2310,7 +2783,7 @@ mod tests {
         let (status, _, _) = control_json(
             &member_app,
             Method::GET,
-            "/control/invitations".to_owned(),
+            "/control/api/invitations".to_owned(),
             Some(&member_session),
             None,
             Value::Null,
@@ -2320,7 +2793,7 @@ mod tests {
         let (status, _, _) = control_json(
             &member_app,
             Method::POST,
-            "/control/invitations".to_owned(),
+            "/control/api/invitations".to_owned(),
             Some(&member_session),
             Some(&member_csrf),
             json!({"target_email":"x@example.com"}),

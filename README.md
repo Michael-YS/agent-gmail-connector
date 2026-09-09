@@ -2,7 +2,7 @@
 
 AgentMail 是一个面向 agent 的 Gmail 安全访问层。当前仓库已经实现 Rust/Axum 服务骨架、SQLite schema 与显式迁移、secret 文件加载、refresh token 信封加密、Access Key/grant 领域模型、OAuth/OIDC 的 state/nonce/PKCE 与 claims 语义核心、固定 callback 的 Google token exchange/refresh client、原子 Owner bootstrap、既有 active Owner/Member 的精确 Google `sub`+规范化 verified email 登录、hash-only web session/control-plane 应用服务、一次性邀请制与 Google 双 client 安全配置、SQLite repository、限流/无内容审计数据模型、共享 mailbox 读取服务、带响应上限和 MIME 安全处理的 Gmail HTTP client、REST 消息搜索 OpenAPI、最小 MCP JSON-RPC 搜索工具、managed draft、持久化两阶段发送状态机、稳定 Message-ID Sent 对账，以及带双重 25 MiB 限制的安全 MIME 构建层。
 
-重要：当前版本仍不是可投入生产的完整 v1。真实 RS256/JWKS 验签、Login/Gmail callback、session/CSRF、加密 refresh token、凭据刷新、REST 邮件读取、无附件 managed draft 写入、持久化安全发送，以及 Owner 专用 Access Key 与邀请 HTTP 管理入口已接入 `serve`。邀请 token 仅从 `POST /auth/invitations/accept` 的 body 接收，OAuth transaction 只持久化 hash；callback 以已验证 email 与精确 Google `sub` 原子创建 Member/session。Owner 通过 `GET/POST /control/invitations` 和 `POST /control/invitations/{id}/revoke|regenerate` 管理邀请；mutation 要求有效 Owner session+CSRF，list 不返回 hash，create/regenerate token 只显示一次并 `no-store`。Access Key mutation 同样要求 Owner session+CSRF；create/rotate credential 只显示一次并强制 `no-store`，数据库只保存 hash。发送确认 token 同样只以 hash 入库；超时、5xx 或进程重启后只按稳定 Message-ID 查询 Sent Mail，无法确认则进入 `send_state_unknown`，不会自动重发。Owner HTML 控制面已完成；Member 管理/账号删除、Member/Connection HTML、完整 MCP Streamable HTTP/rmcp、HTTP multipart 附件入口、发布供应链和真实 Google/浏览器 smoke 仍未完成，详见 [TESTING_GAPS.md](TESTING_GAPS.md)。在剩余安全验收完成前，不要把本仓库部署为真实邮件服务。
+重要：当前版本仍不是可投入生产的完整 v1。真实 OIDC/OAuth、加密 refresh token、REST 邮件读取、managed draft 和安全发送、Owner 邀请/成员管理、Member 连接与 Access Key 管理及账号删除已接入 `serve`。HTML 页面使用 `/control/...`，JSON 管理 API 使用 `/control/api/...`，避免路由冲突。邀请、session、Access Key 和发送确认明文均不进入数据库；create/rotate 只显示一次并 `no-store`。完整 MCP Streamable HTTP/rmcp、HTTP multipart 附件入口、发布供应链和真实 Google/浏览器 smoke 仍未完成，详见 [TESTING_GAPS.md](TESTING_GAPS.md)。在剩余安全验收完成前，不要把本仓库部署为真实邮件服务。
 
 ## 本地验证
 
@@ -141,4 +141,6 @@ chmod 0755 scripts/backup.sh scripts/migrate.sh
 
 机器接口只接受 `Authorization: Bearer amk_<public-id>.<secret>`，显式拒绝 query-string token；每次 Connection 操作都检查 owner、状态与 grant。所有响应生成 request ID，并设置 CSP、`nosniff`、`no-referrer`、`no-store` 等安全头。
 
-连接撤销：`POST /control/connections/{connection_id}/revoke` 使用 Owner 或 Member 的登录 session cookie 与 `x-csrf-token`，只能操作自己的连接。先原子切断本地 grants、发送确认与待处理重授权，再尝试撤销 Google token；最后删除本地连接、加密凭证及受管草稿记录，保留 Gmail 中的邮件和草稿。响应 `local_revoked=true` 表示本地清理完成，`remote_revocation` 为 `revoked`、`unconfirmed`、`not_available` 或 `credential_unavailable`，分别表示远端确认、远端未确认、凭证缺失/格式无效或凭证无法解密。远端未确认时需在 Google 账号授权页检查。进程中断留下的 `revoking` 连接可再次调用同一入口处理；当前没有自动恢复扫描，也没有连接管理 HTML 页面。
+连接撤销：HTML 使用 `/control/account`，JSON 使用 `POST /control/api/connections/{connection_id}/revoke`；Owner 或 Member 只能操作自己的连接。先原子切断本地 grants、发送确认与待处理重授权，再尝试撤销 Google token；最后删除本地连接、加密凭证及受管草稿记录，保留 Gmail 中的邮件和草稿。远端未确认时需在 Google 账号授权页检查。
+
+Member 可在 `/control/account` 连接或重新授权 Gmail、撤销连接、创建/轮换/撤销 Access Key、原子更新 grants，并删除自己的 AgentMail 账号。Owner 可从 `/control/members` 撤销 Member。账号撤销会立即失效 session、Access Key、grant、发送确认与 OAuth transaction，然后逐个尝试撤销 Google token 并删除本地用户数据；不会删除 Gmail 数据。启动时会恢复中断的 `revoking` Member，历史 Gmail 授权计数保持单调。Owner 账号不能通过控制面删除或降级。

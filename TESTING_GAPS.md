@@ -1,26 +1,26 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：152 项 library（含邀请接受、Member 重登、Owner 邀请 list/create/revoke/regenerate、OAuth hash 绑定、重放/错误 email/atomic session、Owner HTML 控制面：dashboard / invitations list+create+revoke+regenerate / members / capacity，CSRF cookie、flash 一次性 token、Member 角色拒绝、未登录 302）、4 项 HTTP 安全与 managed-draft 契约测试、5 项 REST/MCP 契约测试，共 161 项；并已运行 `cargo fmt --check`、`cargo check --all-targets --all-features --locked`、`cargo clippy --all-targets --all-features -- -D warnings`。未执行部署、真实 Google 或浏览器 smoke。
+本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：162 项 library（含邀请接受、Owner/Member 登录、邀请与账号 HTML/JSON 管理、Connection revoke 与中断恢复、Access Key create/rotate/revoke/grants、CSRF/所有权约束和一次性 credential）、4 项 HTTP 安全与 managed-draft 契约测试、5 项 REST/MCP 契约测试，共 171 项；并已运行 `cargo fmt --check`、`cargo check --all-targets --all-features --locked`、`cargo clippy --all-targets --all-features -- -D warnings`。未执行部署、真实 Google 或浏览器 smoke。
 
 ## A. 尚未实现，因此目前无法执行的测试
 
 ### A1. Google OIDC 登录与邀请制 control plane
 
-- 已实现：真实 RS256/JWKS verifier（固定 discovery、no-redirect、响应上限、缓存与 unknown-kid 冷却）、flow-scoped 单次 callback、固定双 client token exchange、Owner/Member session、session cookie/CSRF、Login/Gmail HTTP 路由，以及 Owner Access Key 和邀请创建/list/revoke/regenerate API。邀请 token 只从 POST body 接收，以 hash 绑定 Login OAuth transaction；callback 以 verified email+精确 Google sub 原子接受邀请并创建 Member/session。剩余缺口：Member 管理、账号删除、Member/Connection HTML 页面和真实 Google 浏览器登录。
+- 已实现：真实 RS256/JWKS verifier、flow-scoped 单次 callback、Owner/Member session、邀请 API/HTML、Member Connection/Access Key HTML、账号自删与 Owner revoke。管理 JSON API 使用 `/control/api/...`，HTML 使用 `/control/...`。剩余外部缺口：真实 Google 浏览器登录、连接/重新授权和账号撤销 smoke。
 - 实现后测试：用 fake OIDC server 覆盖成功、错误 state/nonce、错误 issuer/audience、过期 token、未验证 email、邀请 email 不一致、邀请重放、session idle/absolute expiry 和 CSRF；再用 Dev Project 浏览器登录。
 - 命令目标：`cargo test --test oidc_contract --all-features`。
 - 通过标准：所有失败在创建用户/session 前被拒绝；数据库和日志不出现 authorization code、state、nonce、access token 或 ID token。
 
 ### A2. Gmail OAuth Connection 与真实 Google adapter
 
-- 已实现：offline consent、完整 scope 校验、Connection callback、加密 refresh token、single-flight access-token cache、`invalid_grant` reauth、原 connection 的 owner/sub 绑定 reauthorize、带 8 MiB 响应上限的 Gmail client、production 读取 adapter、无附件 managed draft 的真实 create/update/delete/send，以及稳定 Message-ID 的 Sent 对账。Connection revoke JSON 入口及 Google token revoke 已完成本地实现和测试：session+CSRF、同用户所有权、本地先失效、短期有界重试、远端失败仍清除本地凭证。剩余缺口：Connection 管理 HTML、进程中断后的自动恢复扫描和真实 Gmail smoke。
+- 已实现：offline consent、完整 scope 校验、Connection callback、加密 refresh token、single-flight access-token cache、`invalid_grant` reauth、production Gmail adapter、Connection revoke JSON/HTML 与 Google token revoke。Member 账号和独立 Connection 撤销都会在启动时恢复中断状态。剩余缺口：真实 Gmail smoke。
 - 实现后测试：fake Google server 覆盖部分授权、refresh、invalid_grant、429/5xx/Retry-After、timeout、revoke；Dev 账号完成连接、搜索、读取、线程和附件流。
 - 命令目标：`cargo test --test gmail_adapter --all-features`，以及人工 `scripts/smoke-gmail.sh --prepare-only`。
 - 通过标准：缺少 `gmail.readonly` 或 `gmail.compose` 不创建 Connection；refresh token 仅以 XChaCha20-Poly1305 envelope 入库；查询和邮件内容不进日志。
 
 ### A3. 数据库 repository 与 control plane CRUD
 
-- 已实现：SQLite repository 已覆盖 users/invitations/sessions/connections/access keys/grants/managed drafts/audit/首次授权 ledger；Owner Access Key 与邀请 list/create/revoke/regenerate API 使用 session+CSRF，邀请 token 与 session 只存 hash；邀请接受和既有 active Member/Owner 的精确 identity 登录会原子创建 session。Owner HTML 控制面（dashboard / invitations / members / capacity）已接入并通过 9 项 UI 单元测试（认证/CSRF/角色/一次性 token）。剩余缺口：Member 管理与账号删除。
+- 已实现：SQLite repository 已覆盖 users/invitations/sessions/connections/access keys/grants/managed drafts/audit/首次授权 ledger；Owner/Member 各自的 Access Key 与 Connection 管理使用 session+CSRF，Member 自删与 Owner revoke 原子失效本地权限，启动恢复中断撤销。剩余缺口转入真实浏览器/Google 外部验收。
 - 实现后测试：临时 SQLite 覆盖 Owner/Member、邀请、Connection、key create/rotate/revoke、grant 变更、账号删除与跨重启恢复。
 - 命令目标：`cargo test --test repository_roundtrip --all-features`。
 - 通过标准：重启后状态不丢失；key/confirmation/session 只存 hash；唯一 Owner、唯一 Gmail sub 与 first-authorization ledger 约束生效。
@@ -41,7 +41,7 @@
 
 ### A6. 限流、审计、账号撤销与清理
 
-- 缺口：限流窗口、4 路读取并发、send-unknown refund、无内容 AuditEvent 与 repository 写入已实现；rate bucket 数据库读写、transport 接入、30 天清理和完整账号撤销编排尚未完成。
+- 缺口：限流窗口、4 路读取并发、send-unknown refund、无内容 AuditEvent、repository 写入和完整账号撤销编排已实现；rate bucket 数据库读写、transport 接入及 30 天清理尚未完成。
 - 实现后测试：冻结时间并跨重启验证 120/min、30 prepare/hour、10/hour、50/day、20 recipients；账号/key/grant/Connection revoke 的并发请求立即失败；审计字段白名单快照。
 - 命令目标：`cargo test --test security_flows --all-features`。
 - 通过标准：429 含 retry seconds；日志/审计不包含地址、主题、正文、snippet、附件名、查询或任何 token。
@@ -51,7 +51,7 @@
 ### B0. Connection 撤销的外部与中断验收
 
 - 本地已验证：Google 200/4xx/429/5xx/timeout 分类、错误正文有界、Owner/Member 同用户 session+CSRF、撤销前失效、grants/confirmation/OAuth transaction 清理、历史授权计数保留、损坏凭证仍清理、refresh 进行中撤销拒绝返回 token。
-- 待验证：真实垃圾邮箱 token revoke；HTTP 客户端断开后清理完成；进程在本地失效后终止，重启后使用相同 revoke 入口完成清理。当前没有自动扫描恢复，必须主动重新调用。
+- 待验证：真实垃圾邮箱 token revoke；HTTP 客户端断开后清理完成；进程在本地失效后终止，重启扫描自动完成清理。
 - Google 失败时 `local_revoked=true` 不代表 Google 已确认撤销；`remote_revocation=unconfirmed` 需要用户在 Google 账号授权页检查。已经发出的上游请求不能追溯取消。
 
 ### B1. cargo-audit 与 cargo-deny

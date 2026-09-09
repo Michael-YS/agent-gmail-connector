@@ -1887,6 +1887,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 login_token_client,
                 gmail_token_client,
             )?;
+            crate::control_http::recover_pending_revocations(&control_state).await?;
             let state = AppState::new(Some(db), live_adapter);
             let control_router = crate::control_http::router(control_state.clone())
                 .layer(middleware::from_fn(request_context));

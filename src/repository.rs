@@ -21,7 +21,7 @@ use crate::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, SecondsFormat, Utc};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::{fmt, num::TryFromIntError};
 use uuid::Uuid;
 
@@ -46,6 +46,20 @@ pub enum RepositoryError {
 /// Credential retained until Google revocation succeeds. Debug redacts the envelope.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectionRevocation {
+    pub refresh_token_envelope: Option<EncryptedRefreshToken>,
+}
+
+/// Credentials retained while a Member account is being revoked. The
+/// encrypted envelopes remain redacted by their own `Debug` implementation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserRevocation {
+    pub user_id: UserId,
+    pub connections: Vec<UserConnectionRevocation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserConnectionRevocation {
+    pub connection_id: ConnectionId,
     pub refresh_token_envelope: Option<EncryptedRefreshToken>,
 }
 
@@ -832,6 +846,78 @@ impl Repository {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Begin or resume Member deletion. A Member may delete itself; an active
+    /// Owner may revoke a Member. Owner accounts can never enter this flow.
+    /// Local sessions, keys, grants, confirmations, and OAuth transactions are
+    /// invalidated in the same transaction that marks the account revoking.
+    pub async fn begin_user_revoke(
+        &self,
+        actor_id: UserId,
+        user_id: UserId,
+    ) -> Result<Option<UserRevocation>, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let allowed: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM users target WHERE target.id=? AND target.role='member' AND (target.id=? OR EXISTS(SELECT 1 FROM users actor WHERE actor.id=? AND actor.role='owner' AND actor.status='active')))",
+        )
+        .bind(user_id.to_string())
+        .bind(actor_id.to_string())
+        .bind(actor_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        if allowed == 0 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let revocation = begin_user_revoke_in_transaction(&mut tx, user_id).await?;
+        tx.commit().await?;
+        Ok(Some(revocation))
+    }
+
+    /// Resume cleanup after a process interruption. Only an already-revoking
+    /// Member can be loaded through this internal recovery entry point.
+    pub async fn resume_user_revoke(
+        &self,
+        user_id: UserId,
+    ) -> Result<Option<UserRevocation>, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let resumable: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id=? AND role='member' AND status='revoking')",
+        )
+        .bind(user_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        if resumable == 0 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let revocation = begin_user_revoke_in_transaction(&mut tx, user_id).await?;
+        tx.commit().await?;
+        Ok(Some(revocation))
+    }
+
+    pub async fn list_revoking_members(&self) -> Result<Vec<UserId>, RepositoryError> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM users WHERE role='member' AND status='revoking' ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|value| parse_uuid(value).map(UserId::from_uuid))
+            .collect()
+    }
+
+    /// Remove a fully revoked Member and all remaining user-scoped metadata.
+    /// The monotonic authorized Gmail subject ledger is intentionally separate
+    /// and survives this delete.
+    pub async fn finish_user_revoke(&self, user_id: UserId) -> Result<bool, RepositoryError> {
+        let result =
+            sqlx::query("DELETE FROM users WHERE id=? AND role='member' AND status='revoking'")
+                .bind(user_id.to_string())
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// List only Member accounts with owner-safe, non-content aggregate metadata.
     pub async fn list_member_summaries(&self) -> Result<Vec<MemberSummary>, RepositoryError> {
         let rows = sqlx::query(
@@ -917,6 +1003,18 @@ impl Repository {
     ) -> Result<Vec<GmailConnection>, RepositoryError> {
         let rows = sqlx::query(
             "SELECT id,owner_id,google_sub,primary_email,status,granted_scopes,last_used_at FROM gmail_connections WHERE owner_id=? AND status='active' ORDER BY primary_email,id",
+        )
+        .bind(user_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(connection_from_row).collect()
+    }
+    pub async fn list_connections_for_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<Vec<GmailConnection>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT id,owner_id,google_sub,primary_email,status,granted_scopes,last_used_at FROM gmail_connections WHERE owner_id=? ORDER BY primary_email,id",
         )
         .bind(user_id.to_string())
         .fetch_all(&self.pool)
@@ -1017,6 +1115,24 @@ impl Repository {
         .await?;
         tx.commit().await?;
         Ok(deleted.rows_affected() == 1)
+    }
+
+    pub async fn list_revoking_connections(
+        &self,
+    ) -> Result<Vec<(UserId, ConnectionId)>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT c.owner_id,c.id FROM gmail_connections c JOIN users u ON u.id=c.owner_id WHERE c.status='revoking' AND u.status='active' ORDER BY c.owner_id,c.id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    UserId::from_uuid(parse_uuid(row.try_get::<String, _>("owner_id")?)?),
+                    ConnectionId::from_uuid(parse_uuid(row.try_get::<String, _>("id")?)?),
+                ))
+            })
+            .collect()
     }
     pub async fn update_refresh_token_envelope(
         &self,
@@ -1337,6 +1453,55 @@ impl Repository {
         }
         Ok(())
     }
+
+    /// Atomically replace an active key's grants with active Connections owned
+    /// by the same active user. An empty set is valid.
+    pub async fn replace_access_key_grants(
+        &self,
+        owner_id: UserId,
+        key_id: AccessKeyId,
+        connections: &[ConnectionId],
+    ) -> Result<bool, RepositoryError> {
+        let mut unique = connections.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        let mut tx = self.pool.begin().await?;
+        let valid_key: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM access_keys k JOIN users u ON u.id=k.owner_id WHERE k.id=? AND k.owner_id=? AND k.status='active' AND u.status='active')")
+            .bind(key_id.to_string())
+            .bind(owner_id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+        if valid_key == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        for connection in &unique {
+            let valid: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM gmail_connections WHERE id=? AND owner_id=? AND status='active')")
+                .bind(connection.to_string())
+                .bind(owner_id.to_string())
+                .fetch_one(&mut *tx)
+                .await?;
+            if valid == 0 {
+                return Err(RepositoryError::InvalidValue(
+                    "grant requires active same-owner connection".to_owned(),
+                ));
+            }
+        }
+        sqlx::query("DELETE FROM access_key_grants WHERE access_key_id=?")
+            .bind(key_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        for connection in unique {
+            sqlx::query("INSERT INTO access_key_grants (access_key_id,connection_id,created_at) VALUES (?,?,?)")
+                .bind(key_id.to_string())
+                .bind(connection.to_string())
+                .bind(encode_time(Utc::now()))
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
     pub async fn access_key_allows(
         &self,
         key: AccessKeyId,
@@ -1604,6 +1769,71 @@ impl Repository {
             last_used_at: parse_opt_time(row.try_get("last_used_at")?)?,
         })
     }
+}
+
+async fn begin_user_revoke_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: UserId,
+) -> Result<UserRevocation, RepositoryError> {
+    let user = user_id.to_string();
+    sqlx::query("UPDATE users SET status='revoking',updated_at=? WHERE id=? AND role='member'")
+        .bind(encode_time(Utc::now()))
+        .bind(&user)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("UPDATE gmail_connections SET status='revoking',updated_at=? WHERE owner_id=?")
+        .bind(encode_time(Utc::now()))
+        .bind(&user)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM web_sessions WHERE user_id=?")
+        .bind(&user)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM oauth_transactions WHERE initiated_by=? OR target_connection_id IN (SELECT id FROM gmail_connections WHERE owner_id=?)")
+        .bind(&user)
+        .bind(&user)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM send_confirmations WHERE access_key_id IN (SELECT id FROM access_keys WHERE owner_id=?) OR connection_id IN (SELECT id FROM gmail_connections WHERE owner_id=?)")
+        .bind(&user)
+        .bind(&user)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM access_key_grants WHERE access_key_id IN (SELECT id FROM access_keys WHERE owner_id=?) OR connection_id IN (SELECT id FROM gmail_connections WHERE owner_id=?)")
+        .bind(&user)
+        .bind(&user)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("UPDATE access_keys SET status='revoked',generation=generation+1,updated_at=? WHERE owner_id=? AND status='active'")
+        .bind(encode_time(Utc::now()))
+        .bind(&user)
+        .execute(&mut **tx)
+        .await?;
+
+    let rows = sqlx::query(
+        "SELECT id,refresh_token_envelope FROM gmail_connections WHERE owner_id=? ORDER BY id",
+    )
+    .bind(&user)
+    .fetch_all(&mut **tx)
+    .await?;
+    let connections = rows
+        .into_iter()
+        .map(|row| {
+            let id = parse_uuid(row.try_get::<String, _>("id")?)?;
+            let envelope = row
+                .try_get::<Option<String>, _>("refresh_token_envelope")?
+                .and_then(|value| EncryptedRefreshToken::from_envelope(value).ok());
+            Ok(UserConnectionRevocation {
+                connection_id: ConnectionId::from_uuid(id),
+                refresh_token_envelope: envelope,
+            })
+        })
+        .collect::<Result<Vec<_>, RepositoryError>>()?;
+    Ok(UserRevocation {
+        user_id,
+        connections,
+    })
 }
 
 pub struct StoredAccessKey {
@@ -2327,6 +2557,188 @@ mod tests {
                 .unwrap()
         );
     }
+
+    #[tokio::test]
+    async fn member_revocation_is_immediate_retryable_and_preserves_history() {
+        let repository = repository().await;
+        let owner = owner();
+        repository.insert_user(&owner).await.unwrap();
+        let member = User::new(
+            "member-sub",
+            "member@example.com",
+            UserRole::Member,
+            Utc::now(),
+        )
+        .unwrap();
+        let other = User::new(
+            "other-sub",
+            "other@example.com",
+            UserRole::Member,
+            Utc::now(),
+        )
+        .unwrap();
+        repository.insert_user(&member).await.unwrap();
+        repository.insert_user(&other).await.unwrap();
+        let connection = GmailConnection::new(
+            member.id,
+            "member-gmail-sub",
+            "member.mail@example.com",
+            vec![GMAIL_READONLY_SCOPE.into(), GMAIL_COMPOSE_SCOPE.into()],
+        )
+        .unwrap();
+        let envelope = EncryptedRefreshToken::from_envelope("am1.1.nonce.member-secret").unwrap();
+        repository
+            .insert_connection(&connection, Some(&envelope))
+            .await
+            .unwrap();
+        repository
+            .record_first_authorized_subject(&connection.google_sub, Utc::now(), 5)
+            .await
+            .unwrap();
+        let generated = AccessKey::generate(member.id, "member-key", [connection.id]).unwrap();
+        let credential = generated.credential.clone();
+        let key = repository.insert_access_key(&generated).await.unwrap();
+        repository
+            .insert_web_session(&NewWebSession {
+                id: SessionId::new(),
+                user_id: member.id,
+                token_hash: hash_token("member-session"),
+                csrf_token_hash: hash_token("member-csrf"),
+                idle_expires_at: Utc::now() + chrono::Duration::hours(1),
+                absolute_expires_at: Utc::now() + chrono::Duration::hours(1),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        let (oauth_id, _, _) = insert_oauth(&repository, Duration::minutes(5)).await;
+        sqlx::query(
+            "UPDATE oauth_transactions SET initiated_by=?,target_connection_id=? WHERE id=?",
+        )
+        .bind(member.id.to_string())
+        .bind(connection.id.to_string())
+        .bind(oauth_id.to_string())
+        .execute(repository.pool())
+        .await
+        .unwrap();
+
+        assert!(
+            repository
+                .begin_user_revoke(other.id, member.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let first = repository
+            .begin_user_revoke(owner.id, member.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.user_id, member.id);
+        assert_eq!(first.connections.len(), 1);
+        assert_eq!(first.connections[0].connection_id, connection.id);
+        assert_eq!(first.connections[0].refresh_token_envelope, Some(envelope));
+        assert!(!format!("{first:?}").contains("member-secret"));
+        assert_eq!(
+            repository
+                .get_user(member.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            UserStatus::Revoking
+        );
+        assert_eq!(
+            repository
+                .get_connection(connection.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ConnectionStatus::Revoking
+        );
+        assert!(
+            repository
+                .lookup_web_session(&hash_token("member-session"), Utc::now())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository
+                .authenticate_access_key(&credential)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !repository
+                .access_key_allows(key.id, connection.id)
+                .await
+                .unwrap()
+        );
+        let oauth_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_transactions")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(oauth_count, 0);
+        assert_eq!(
+            repository.list_revoking_members().await.unwrap(),
+            vec![member.id]
+        );
+        assert_eq!(
+            repository.resume_user_revoke(member.id).await.unwrap(),
+            Some(first)
+        );
+
+        assert!(repository.finish_user_revoke(member.id).await.unwrap());
+        assert!(!repository.finish_user_revoke(member.id).await.unwrap());
+        assert!(repository.get_user(member.id).await.unwrap().is_none());
+        assert!(
+            repository
+                .get_connection(connection.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            repository
+                .personal_use_summary(5)
+                .await
+                .unwrap()
+                .historical_authorization_count,
+            1
+        );
+        assert!(repository.get_user(owner.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn member_may_self_delete_but_owner_cannot() {
+        let repository = repository().await;
+        let owner = owner();
+        repository.insert_user(&owner).await.unwrap();
+        let member = User::new(
+            "member-sub",
+            "member@example.com",
+            UserRole::Member,
+            Utc::now(),
+        )
+        .unwrap();
+        repository.insert_user(&member).await.unwrap();
+        assert!(
+            repository
+                .begin_user_revoke(owner.id, owner.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository
+                .begin_user_revoke(member.id, member.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
     #[tokio::test]
     async fn users_and_connections_round_trip() {
         let repository = repository().await;
@@ -2723,6 +3135,21 @@ mod tests {
                 .await,
             Err(RepositoryError::InvalidValue(_))
         ));
+        assert!(matches!(
+            repository
+                .replace_access_key_grants(first.id, stored.id, &[foreign_connection.id])
+                .await,
+            Err(RepositoryError::InvalidValue(_))
+        ));
+        assert!(
+            repository
+                .get_access_key(first.id, stored.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .grants
+                .is_empty()
+        );
         assert!(
             !repository
                 .access_key_allows(stored.id, foreign_connection.id)

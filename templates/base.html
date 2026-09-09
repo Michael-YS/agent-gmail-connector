@@ -43,12 +43,13 @@ label.field { display: block; margin: 0.5rem 0; }
 {% if show_invitations %}<a href="/control/invitations">Invitations</a>{% endif %}
 {% if show_members %}<a href="/control/members">Members</a>{% endif %}
 {% if show_capacity %}<a href="/control/capacity">Capacity</a>{% endif %}
+{% if session_email_is_some %}<a href="/control/account">Account</a>{% endif %}
 </nav>
 {% if session_email_is_some %}<span class="session">Signed in as <strong>{{ session_email }}</strong></span>{% endif %}
 </header>
 {% block content %}{% endblock %}
 <footer>
-<p class="muted">AgentMail routes Gmail through a hardened control plane. Tokens, addresses, subjects, and message bodies are never displayed, logged, or audited by this UI.</p>
+<p class="muted">AgentMail shows only account metadata and credentials created or rotated in this session. Gmail tokens, message subjects, bodies, attachments, and mailbox queries are never rendered, logged, or audited by this UI.</p>
 </footer>
 </body>
 </html>

@@ -19,7 +19,7 @@
 {% else %}
 <table>
 <thead>
-<tr><th>Email</th><th>Status</th><th>Connections</th><th>Access keys</th><th>Last activity</th></tr>
+<tr><th>Email</th><th>Status</th><th>Connections</th><th>Access keys</th><th>Last activity</th><th>Action</th></tr>
 </thead>
 <tbody>
 {% for m in members %}
@@ -29,6 +29,7 @@
 <td>{{ m.connection_count }}</td>
 <td>{{ m.access_key_count }}</td>
 <td>{{ m.last_activity }}{% if m.is_revoking %} <span class="muted">(revoke pending)</span>{% endif %}</td>
+<td>{% if m.can_revoke %}<form class="inline" method="post" action="/control/members/{{ m.id }}/revoke"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="warn" type="submit">Revoke account</button></form>{% else %}<span class="muted">Unavailable</span>{% endif %}</td>
 </tr>
 {% endfor %}
 </tbody>

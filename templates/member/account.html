@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Account · AgentMail{% endblock %}
+{% block content %}
+<h1>Account</h1>
+{% if flash_is_some %}<div class="flash {{ flash_css_class }}">{% if flash_token_is_some %}<p>{{ flash_label }} Access Key: <code>{{ flash_token }}</code></p><p class="muted">Copy it now. It cannot be shown again after this page.</p>{% else %}<p>{{ flash_message }}</p>{% endif %}</div>{% endif %}
+<section class="card">
+<h2>Gmail connections</h2>
+<p class="muted">Revoking a connection immediately removes local grants and credentials. AgentMail never deletes Gmail messages or drafts.</p>
+<form method="post" action="/control/account/connections/new"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Connect Gmail</button></form>
+{% if connections_empty %}<p class="muted">No Gmail connections.</p>{% else %}
+<table>
+<thead><tr><th>Email</th><th>Status</th><th>Scopes</th><th>Last used</th><th>Action</th></tr></thead>
+<tbody>{% for c in connections %}<tr>
+<td>{{ c.email }}</td><td>{{ c.status }}</td><td>{{ c.scopes }}</td><td>{{ c.last_used }}</td>
+<td>{% if c.can_reauthorize %}<form class="inline" method="post" action="/control/account/connections/{{ c.id }}/reauthorize"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Reauthorize</button></form>{% endif %} {% if c.can_revoke %}<form class="inline" method="post" action="/control/account/connections/{{ c.id }}/revoke"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="warn" type="submit">Revoke connection</button></form>{% else %}<span class="muted">Cleanup pending</span>{% endif %}</td>
+</tr>{% endfor %}</tbody>
+</table>{% endif %}
+</section>
+<section class="card">
+<h2>Access Keys</h2>
+<p class="muted">Credentials are shown once when created or rotated. Each key can use only its selected active Gmail connections.</p>
+<form method="post" action="/control/account/access-keys">
+<label class="field">Name <input type="text" name="name" required maxlength="100"></label>
+{% for c in active_connections %}<label class="field"><input type="checkbox" name="connection_ids" value="{{ c.id }}"> {{ c.email }}</label>{% endfor %}
+<input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Create Access Key</button>
+</form>
+{% if access_keys_empty %}<p class="muted">No Access Keys.</p>{% else %}
+{% for k in access_keys %}<section class="card"><h3>{{ k.name }}</h3><p><code>{{ k.public_prefix }}</code> · {{ k.status }} · last used {{ k.last_used }}</p>
+{% if k.active %}<form method="post" action="/control/account/access-keys/{{ k.id }}/grants">
+{% for c in k.connections %}<label class="field"><input type="checkbox" name="connection_ids" value="{{ c.id }}"{% if c.checked %} checked{% endif %}> {{ c.email }}</label>{% endfor %}
+<input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Update grants</button></form>
+<form class="inline" method="post" action="/control/account/access-keys/{{ k.id }}/rotate"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="warn" type="submit">Rotate</button></form>
+<form class="inline" method="post" action="/control/account/access-keys/{{ k.id }}/revoke"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="warn" type="submit">Revoke</button></form>{% endif %}
+</section>{% endfor %}{% endif %}
+</section>
+<section class="card">
+<h2>Delete AgentMail account</h2>
+{% if may_delete_account %}
+<p class="muted">This revokes all local sessions, Access Keys, grants, confirmations, and Gmail credentials. Gmail data is left untouched.</p>
+<form method="post" action="/control/account/delete"><input type="hidden" name="_csrf" value="{{ csrf }}"><button class="warn" type="submit">Delete my AgentMail account</button></form>
+{% else %}<p class="muted">The Owner account cannot be deleted or demoted in the control plane.</p>{% endif %}
+</section>
+{% endblock %}

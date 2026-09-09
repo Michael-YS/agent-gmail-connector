@@ -1,7 +1,7 @@
-//! Owner-facing control-plane HTML pages.
+//! Owner and Member control-plane HTML pages.
 //!
 //! These handlers complement the JSON control-plane API in [`crate::control_http`].
-//! They share the same session model, CSRF token, and Owner role enforcement, but
+//! They share the same session model and CSRF token, and enforce each route's role, but
 //! additionally:
 //!
 //! - render Askama templates with strict CSP and no external assets,
@@ -9,15 +9,16 @@
 //! - redirect browser users to `/auth/google/login` on session failure instead
 //!   of returning JSON error bodies.
 //!
-//! HTTP responses must never include Gmail addresses, subjects, message bodies,
-//! query strings, tokens, or Access Key secrets. Templates rely on Askama's
-//! default HTML escaping for every user-controlled field.
+//! Account pages show the signed-in user's address and explicitly requested
+//! one-time credentials. Other tokens, subjects, message bodies, attachment data,
+//! and mailbox query strings are never rendered. Templates rely on Askama's default
+//! HTML escaping for every user-controlled field.
 #![allow(dead_code, clippy::result_large_err)]
 
 use askama::Template;
 use axum::{
     Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -28,10 +29,12 @@ use uuid::Uuid;
 
 use crate::{
     control_http::{
-        ControlHttpState, OAuthCodeExchanger, OidcTokenVerifier, SessionContext, cookie_value,
+        ControlHttpState, GmailStartQuery, OAuthCodeExchanger, OidcTokenVerifier, SessionContext,
+        cookie_value, gmail_start, revoke_connection_account, revoke_member_account,
     },
     control_plane::SessionCookiePolicy,
-    domain::identity::{InvitationId, User, UserRole, UserStatus},
+    domain::access::{AccessKey, AccessKeyId},
+    domain::identity::{ConnectionStatus, InvitationId, User, UserRole, UserStatus},
     invitations::{InviteError, InviteService},
     repository::RepositoryError,
 };
@@ -117,12 +120,14 @@ struct MembersTemplate<'a> {
 }
 
 struct MemberRow {
+    id: Uuid,
     email: String,
     status: String,
     connection_count: u32,
     access_key_count: u32,
     last_activity: String,
     is_revoking: bool,
+    can_revoke: bool,
 }
 
 #[derive(Template)]
@@ -147,6 +152,57 @@ struct CapacityTemplate<'a> {
     flash_message: &'a str,
 }
 
+#[derive(Template)]
+#[template(path = "member/account.html")]
+struct AccountTemplate<'a> {
+    show_dashboard: bool,
+    show_invitations: bool,
+    show_members: bool,
+    show_capacity: bool,
+    session_email_is_some: bool,
+    session_email: &'a str,
+    csrf: &'a str,
+    connections: Vec<AccountConnectionRow>,
+    connections_empty: bool,
+    active_connections: Vec<AccountConnectionChoice>,
+    access_keys: Vec<AccountKeyRow>,
+    access_keys_empty: bool,
+    may_delete_account: bool,
+    flash_is_some: bool,
+    flash_token_is_some: bool,
+    flash_css_class: &'a str,
+    flash_label: &'a str,
+    flash_token: &'a str,
+    flash_message: &'a str,
+}
+
+struct AccountConnectionRow {
+    id: Uuid,
+    email: String,
+    status: String,
+    scopes: String,
+    last_used: String,
+    can_revoke: bool,
+    can_reauthorize: bool,
+}
+
+#[derive(Clone)]
+struct AccountConnectionChoice {
+    id: Uuid,
+    email: String,
+    checked: bool,
+}
+
+struct AccountKeyRow {
+    id: Uuid,
+    name: String,
+    public_prefix: String,
+    status: String,
+    last_used: String,
+    active: bool,
+    connections: Vec<AccountConnectionChoice>,
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateInvitationForm {
     target_email: String,
@@ -155,6 +211,21 @@ struct CreateInvitationForm {
 
 #[derive(Debug, Deserialize, Default)]
 struct CsrfOnlyForm {
+    _csrf: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateAccessKeyForm {
+    name: String,
+    #[serde(default)]
+    connection_ids: Vec<Uuid>,
+    _csrf: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplaceAccessKeyGrantsForm {
+    #[serde(default)]
+    connection_ids: Vec<Uuid>,
     _csrf: String,
 }
 
@@ -178,7 +249,38 @@ where
             post(regenerate_invitation::<V, E>),
         )
         .route("/control/members", get(members_page::<V, E>))
+        .route("/control/members/{id}/revoke", post(revoke_member::<V, E>))
         .route("/control/capacity", get(capacity_page::<V, E>))
+        .route("/control/account", get(account_page::<V, E>))
+        .route("/control/account/delete", post(delete_own_account::<V, E>))
+        .route(
+            "/control/account/connections/{id}/revoke",
+            post(revoke_own_connection::<V, E>),
+        )
+        .route(
+            "/control/account/connections/new",
+            post(start_gmail_connection::<V, E>),
+        )
+        .route(
+            "/control/account/connections/{id}/reauthorize",
+            post(reauthorize_gmail_connection::<V, E>),
+        )
+        .route(
+            "/control/account/access-keys",
+            post(create_own_access_key::<V, E>),
+        )
+        .route(
+            "/control/account/access-keys/{id}/rotate",
+            post(rotate_own_access_key::<V, E>),
+        )
+        .route(
+            "/control/account/access-keys/{id}/revoke",
+            post(revoke_own_access_key::<V, E>),
+        )
+        .route(
+            "/control/account/access-keys/{id}/grants",
+            post(replace_own_access_key_grants::<V, E>),
+        )
         .with_state(state)
 }
 
@@ -477,6 +579,7 @@ where
     let rows: Vec<MemberRow> = members
         .into_iter()
         .map(|member| MemberRow {
+            id: member.id.into_uuid(),
             email: member.email,
             status: user_status_label(&member.status).to_owned(),
             connection_count: member.connection_count,
@@ -486,6 +589,7 @@ where
                 .map(format_rfc3339)
                 .unwrap_or_else(|| "—".to_owned()),
             is_revoking: matches!(member.status, UserStatus::Revoking),
+            can_revoke: matches!(member.status, UserStatus::Active),
         })
         .collect();
     let members_empty = rows.is_empty();
@@ -515,6 +619,43 @@ where
     });
     append_clear_flash_cookie(&mut response);
     response
+}
+
+async fn revoke_member<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    body: String,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let (_owner, session) = match load_owner_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if body.len() > MAX_FORM_BYTES {
+        return redirect_flash("/control/members", ("invalid_request", None));
+    }
+    let form: CsrfOnlyForm = match serde_urlencoded::from_str(&body) {
+        Ok(form) => form,
+        Err(_) => return redirect_flash("/control/members", ("invalid_request", None)),
+    };
+    if let Err(response) = require_csrf(&state, &session, &form._csrf) {
+        return response;
+    }
+    let state_for_task = state.clone();
+    let target = crate::domain::identity::UserId::from_uuid(id);
+    let operation = tokio::spawn(async move {
+        revoke_member_account(&state_for_task, session.user_id, target).await
+    });
+    match operation.await {
+        Ok(Ok(Some(_))) => redirect_flash("/control/members", ("member_revoked", None)),
+        Ok(Ok(None)) => redirect_flash("/control/members", ("not_found", None)),
+        Ok(Err(error)) => server_error(error),
+        Err(_) => server_error(RepositoryError::Conflict),
+    }
 }
 
 async fn capacity_page<V, E>(
@@ -569,6 +710,498 @@ where
     });
     append_clear_flash_cookie(&mut response);
     response
+}
+
+async fn account_page<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    headers: HeaderMap,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let (user, _session) = match load_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let csrf = match csrf_cookie(&headers) {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let raw_connections = match state.repository.list_connections_for_user(user.id).await {
+        Ok(connections) => connections,
+        Err(error) => return server_error(error),
+    };
+    let connections = raw_connections
+        .iter()
+        .map(|connection| AccountConnectionRow {
+            id: connection.id.into_uuid(),
+            email: connection.email.clone(),
+            status: connection_status_label(connection.status).to_owned(),
+            scopes: connection.granted_scopes.join(", "),
+            last_used: connection
+                .last_used_at
+                .map(format_rfc3339)
+                .unwrap_or_else(|| "—".to_owned()),
+            can_revoke: !matches!(connection.status, ConnectionStatus::Revoking),
+            can_reauthorize: matches!(connection.status, ConnectionStatus::ReauthRequired),
+        })
+        .collect::<Vec<_>>();
+    let connections_empty = connections.is_empty();
+    let active_connections = raw_connections
+        .iter()
+        .filter(|connection| connection.status == ConnectionStatus::Active)
+        .map(|connection| AccountConnectionChoice {
+            id: connection.id.into_uuid(),
+            email: connection.email.clone(),
+            checked: false,
+        })
+        .collect::<Vec<_>>();
+    let access_keys = match state.repository.list_access_keys(user.id).await {
+        Ok(keys) => keys
+            .into_iter()
+            .map(|key| AccountKeyRow {
+                id: key.id.into_uuid(),
+                name: key.name,
+                public_prefix: key.public_prefix,
+                status: if key.status.accepts_requests() {
+                    "Active".to_owned()
+                } else {
+                    "Revoked".to_owned()
+                },
+                last_used: key
+                    .last_used_at
+                    .map(format_rfc3339)
+                    .unwrap_or_else(|| "—".to_owned()),
+                active: key.status.accepts_requests(),
+                connections: active_connections
+                    .iter()
+                    .map(|connection| AccountConnectionChoice {
+                        id: connection.id,
+                        email: connection.email.clone(),
+                        checked: key.grants.contains(
+                            crate::domain::identity::ConnectionId::from_uuid(connection.id),
+                        ),
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => return server_error(error),
+    };
+    let access_keys_empty = access_keys.is_empty();
+    let flash = match take_flash(&headers) {
+        Ok(flash) => flash,
+        Err(response) => return response,
+    };
+    let is_owner = user.role == UserRole::Owner;
+    let mut response = render(AccountTemplate {
+        show_dashboard: is_owner,
+        show_invitations: is_owner,
+        show_members: is_owner,
+        show_capacity: is_owner,
+        session_email_is_some: true,
+        session_email: &user.email,
+        csrf: &csrf,
+        connections_empty,
+        connections,
+        active_connections,
+        access_keys_empty,
+        access_keys,
+        may_delete_account: !is_owner,
+        flash_is_some: flash.is_some(),
+        flash_token_is_some: flash.as_ref().is_some_and(|f| f.token.is_some()),
+        flash_css_class: flash.as_ref().map(|f| f.css_class).unwrap_or(""),
+        flash_label: flash.as_ref().map(|f| f.label).unwrap_or(""),
+        flash_token: flash
+            .as_ref()
+            .and_then(|f| f.token.as_deref())
+            .unwrap_or(""),
+        flash_message: flash.as_ref().and_then(|f| f.message).unwrap_or(""),
+    });
+    append_clear_flash_cookie(&mut response);
+    response
+}
+
+async fn revoke_own_connection<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    body: String,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let (_user, session) = match load_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let form = match csrf_form(&body) {
+        Ok(form) => form,
+        Err(()) => return redirect_flash("/control/account", ("invalid_request", None)),
+    };
+    if let Err(response) = require_csrf(&state, &session, &form._csrf) {
+        return response;
+    }
+    let state_for_task = state.clone();
+    let connection_id = crate::domain::identity::ConnectionId::from_uuid(id);
+    let operation = tokio::spawn(async move {
+        revoke_connection_account(&state_for_task, session.user_id, connection_id).await
+    });
+    match operation.await {
+        Ok(Ok(Some(_))) => redirect_flash("/control/account", ("connection_revoked", None)),
+        Ok(Ok(None)) => redirect_flash("/control/account", ("not_found", None)),
+        Ok(Err(error)) => server_error(error),
+        Err(_) => server_error(RepositoryError::Conflict),
+    }
+}
+
+async fn start_gmail_connection<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    gmail_form_start(state, headers, body, None).await
+}
+
+async fn reauthorize_gmail_connection<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    body: String,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    gmail_form_start(state, headers, body, Some(id)).await
+}
+
+async fn gmail_form_start<V, E>(
+    state: ControlHttpState<V, E>,
+    mut headers: HeaderMap,
+    body: String,
+    connection_id: Option<Uuid>,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let form = match csrf_form(&body) {
+        Ok(form) => form,
+        Err(()) => return redirect_flash("/control/account", ("invalid_request", None)),
+    };
+    let csrf = match HeaderValue::from_str(&form._csrf) {
+        Ok(value) => value,
+        Err(_) => return redirect_flash("/control/account", ("invalid_request", None)),
+    };
+    headers.insert("x-csrf-token", csrf);
+    gmail_start(
+        State(state),
+        Query(GmailStartQuery { connection_id }),
+        headers,
+    )
+    .await
+}
+
+async fn create_own_access_key<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let (_user, session) = match load_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if body.len() > MAX_FORM_BYTES {
+        return redirect_flash("/control/account", ("invalid_request", None));
+    }
+    let form = match parse_create_access_key_form(&body) {
+        Ok(form) => form,
+        Err(_) => return redirect_flash("/control/account", ("invalid_request", None)),
+    };
+    if let Err(response) = require_csrf(&state, &session, &form._csrf) {
+        return response;
+    }
+    let connections = form
+        .connection_ids
+        .into_iter()
+        .map(crate::domain::identity::ConnectionId::from_uuid)
+        .collect::<Vec<_>>();
+    let generated = match AccessKey::generate(session.user_id, form.name, connections) {
+        Ok(generated) => generated,
+        Err(_) => return redirect_flash("/control/account", ("invalid_request", None)),
+    };
+    let credential = generated.credential.clone();
+    match state.repository.insert_access_key(&generated).await {
+        Ok(_) => redirect_flash("/control/account", ("key_created", Some(credential))),
+        Err(RepositoryError::InvalidValue(_)) => {
+            redirect_flash("/control/account", ("invalid_request", None))
+        }
+        Err(error) => server_error(error),
+    }
+}
+
+async fn rotate_own_access_key<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    body: String,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let (_user, session) = match load_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let form = match csrf_form(&body) {
+        Ok(form) => form,
+        Err(()) => return redirect_flash("/control/account", ("invalid_request", None)),
+    };
+    if let Err(response) = require_csrf(&state, &session, &form._csrf) {
+        return response;
+    }
+    match state
+        .repository
+        .rotate_access_key(session.user_id, AccessKeyId::from_uuid(id))
+        .await
+    {
+        Ok(Some(rotated)) => redirect_flash(
+            "/control/account",
+            ("key_rotated", Some(rotated.credential)),
+        ),
+        Ok(None) => redirect_flash("/control/account", ("not_found", None)),
+        Err(RepositoryError::Conflict) => {
+            redirect_flash("/control/account", ("invalid_state", None))
+        }
+        Err(error) => server_error(error),
+    }
+}
+
+async fn revoke_own_access_key<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    body: String,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let (_user, session) = match load_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let form = match csrf_form(&body) {
+        Ok(form) => form,
+        Err(()) => return redirect_flash("/control/account", ("invalid_request", None)),
+    };
+    if let Err(response) = require_csrf(&state, &session, &form._csrf) {
+        return response;
+    }
+    let key_id = AccessKeyId::from_uuid(id);
+    match state
+        .repository
+        .get_access_key(session.user_id, key_id)
+        .await
+    {
+        Ok(Some(key)) if key.status.accepts_requests() => {
+            match state
+                .repository
+                .revoke_access_key(session.user_id, key_id)
+                .await
+            {
+                Ok(true) => redirect_flash("/control/account", ("key_revoked", None)),
+                Ok(false) => redirect_flash("/control/account", ("not_found", None)),
+                Err(error) => server_error(error),
+            }
+        }
+        Ok(Some(_)) => redirect_flash("/control/account", ("key_revoked", None)),
+        Ok(None) => redirect_flash("/control/account", ("not_found", None)),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn replace_own_access_key_grants<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    body: String,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let (_user, session) = match load_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if body.len() > MAX_FORM_BYTES {
+        return redirect_flash("/control/account", ("invalid_request", None));
+    }
+    let form = match parse_replace_access_key_grants_form(&body) {
+        Ok(form) => form,
+        Err(_) => return redirect_flash("/control/account", ("invalid_request", None)),
+    };
+    if let Err(response) = require_csrf(&state, &session, &form._csrf) {
+        return response;
+    }
+    let connections = form
+        .connection_ids
+        .into_iter()
+        .map(crate::domain::identity::ConnectionId::from_uuid)
+        .collect::<Vec<_>>();
+    match state
+        .repository
+        .replace_access_key_grants(session.user_id, AccessKeyId::from_uuid(id), &connections)
+        .await
+    {
+        Ok(true) => redirect_flash("/control/account", ("grants_updated", None)),
+        Ok(false) => redirect_flash("/control/account", ("not_found", None)),
+        Err(RepositoryError::InvalidValue(_)) => {
+            redirect_flash("/control/account", ("invalid_request", None))
+        }
+        Err(error) => server_error(error),
+    }
+}
+
+async fn delete_own_account<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let (user, session) = match load_session(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if user.role == UserRole::Owner {
+        return redirect_flash("/control/account", ("owner_delete_forbidden", None));
+    }
+    let form = match csrf_form(&body) {
+        Ok(form) => form,
+        Err(()) => return redirect_flash("/control/account", ("invalid_request", None)),
+    };
+    if let Err(response) = require_csrf(&state, &session, &form._csrf) {
+        return response;
+    }
+    let state_for_task = state.clone();
+    let operation = tokio::spawn(async move {
+        revoke_member_account(&state_for_task, session.user_id, session.user_id).await
+    });
+    match operation.await {
+        Ok(Ok(Some(_))) => {
+            let mut response = Redirect::to("/").into_response();
+            clear_auth_cookies(&mut response);
+            response
+        }
+        Ok(Ok(None)) => redirect_flash("/control/account", ("owner_delete_forbidden", None)),
+        Ok(Err(error)) => server_error(error),
+        Err(_) => server_error(RepositoryError::Conflict),
+    }
+}
+
+fn csrf_form(body: &str) -> Result<CsrfOnlyForm, ()> {
+    if body.len() > MAX_FORM_BYTES {
+        return Err(());
+    }
+    serde_urlencoded::from_str(body).map_err(|_| ())
+}
+
+fn parse_create_access_key_form(body: &str) -> Result<CreateAccessKeyForm, ()> {
+    if body.len() > MAX_FORM_BYTES {
+        return Err(());
+    }
+    let mut name = None;
+    let mut csrf = None;
+    let mut connection_ids = Vec::new();
+    for (key, value) in url::form_urlencoded::parse(body.as_bytes()) {
+        match key.as_ref() {
+            "name" if name.is_none() => name = Some(value.into_owned()),
+            "_csrf" if csrf.is_none() => csrf = Some(value.into_owned()),
+            "connection_ids" => connection_ids.push(value.parse::<Uuid>().map_err(|_| ())?),
+            _ => return Err(()),
+        }
+    }
+    Ok(CreateAccessKeyForm {
+        name: name.ok_or(())?,
+        connection_ids,
+        _csrf: csrf.ok_or(())?,
+    })
+}
+
+fn parse_replace_access_key_grants_form(body: &str) -> Result<ReplaceAccessKeyGrantsForm, ()> {
+    if body.len() > MAX_FORM_BYTES {
+        return Err(());
+    }
+    let mut csrf = None;
+    let mut connection_ids = Vec::new();
+    for (key, value) in url::form_urlencoded::parse(body.as_bytes()) {
+        match key.as_ref() {
+            "_csrf" if csrf.is_none() => csrf = Some(value.into_owned()),
+            "connection_ids" => connection_ids.push(value.parse::<Uuid>().map_err(|_| ())?),
+            _ => return Err(()),
+        }
+    }
+    Ok(ReplaceAccessKeyGrantsForm {
+        connection_ids,
+        _csrf: csrf.ok_or(())?,
+    })
+}
+
+async fn load_session<V, E>(
+    state: &ControlHttpState<V, E>,
+    headers: &HeaderMap,
+) -> Result<(User, SessionContext), Response>
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let token_hash = session_token_hash_from_headers(headers).map_err(|_| redirect_to_login())?;
+    let session = state
+        .control_plane
+        .authenticate_session(&token_hash, Utc::now())
+        .await
+        .map_err(|_| redirect_to_login())?;
+    let user = state
+        .repository
+        .get_user(session.user_id)
+        .await
+        .map_err(server_error)?
+        .filter(|user| user.status.accepts_requests())
+        .ok_or_else(redirect_to_login)?;
+    Ok((
+        user,
+        SessionContext {
+            user_id: session.user_id,
+            token_hash,
+            csrf_token_hash: session.csrf_token_hash,
+        },
+    ))
+}
+
+fn clear_auth_cookies(response: &mut Response) {
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear_session_cookie()).expect("fixed cookie attributes"),
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&csrf_cookie_clear()).expect("fixed cookie attributes"),
+    );
 }
 
 async fn load_owner_session<V, E>(
@@ -679,11 +1312,53 @@ fn build_flash(kind: String, token: Option<String>) -> Result<Option<FlashParts>
             token,
             message: None,
         })),
+        "key_created" => Ok(Some(FlashParts {
+            css_class: "",
+            label: "Created",
+            token,
+            message: None,
+        })),
+        "key_rotated" => Ok(Some(FlashParts {
+            css_class: "warn",
+            label: "Rotated",
+            token,
+            message: None,
+        })),
         "revoked" => Ok(Some(FlashParts {
             css_class: "",
             label: "Revoked",
             token: None,
             message: Some("Invitation revoked."),
+        })),
+        "member_revoked" => Ok(Some(FlashParts {
+            css_class: "",
+            label: "Revoked",
+            token: None,
+            message: Some("Member account revoked and local data removed."),
+        })),
+        "connection_revoked" => Ok(Some(FlashParts {
+            css_class: "",
+            label: "Revoked",
+            token: None,
+            message: Some("Gmail connection revoked and local credentials removed."),
+        })),
+        "key_revoked" => Ok(Some(FlashParts {
+            css_class: "",
+            label: "Revoked",
+            token: None,
+            message: Some("Access Key revoked."),
+        })),
+        "grants_updated" => Ok(Some(FlashParts {
+            css_class: "",
+            label: "Updated",
+            token: None,
+            message: Some("Access Key connection grants updated."),
+        })),
+        "owner_delete_forbidden" => Ok(Some(FlashParts {
+            css_class: "warn",
+            label: "Unavailable",
+            token: None,
+            message: Some("The Owner account cannot be deleted in the control plane."),
         })),
         "not_found" => Ok(Some(FlashParts {
             css_class: "warn",
@@ -810,6 +1485,14 @@ fn user_status_label(status: &UserStatus) -> &'static str {
     match status {
         UserStatus::Active => "Active",
         UserStatus::Revoking => "Revoking",
+    }
+}
+
+fn connection_status_label(status: ConnectionStatus) -> &'static str {
+    match status {
+        ConnectionStatus::Active => "Active",
+        ConnectionStatus::ReauthRequired => "Reauthorization required",
+        ConnectionStatus::Revoking => "Revoking",
     }
 }
 
@@ -1071,6 +1754,198 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn member_account_page_lists_own_connection_and_supports_revoke() {
+        let (app, repo, member, session, csrf) = owner_fixture(UserRole::Member).await;
+        let connection = repo
+            .list_connections_for_user(member.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let (status, _, body) =
+            get_page(&app, "/control/account", Some(&session), Some(&csrf)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("member@example.com"));
+        assert!(body.contains("Delete my AgentMail account"));
+        assert!(body.contains("Connect Gmail"));
+        assert!(body.contains(&format!(
+            "/control/account/connections/{}/revoke",
+            connection.id
+        )));
+        let (start_status, start_headers, _) = post_form(
+            &app,
+            "/control/account/connections/new",
+            &session,
+            &csrf,
+            "_csrf=ui-test-csrf",
+        )
+        .await;
+        assert!(
+            start_status == StatusCode::SEE_OTHER || start_status == StatusCode::TEMPORARY_REDIRECT
+        );
+        assert!(
+            start_headers
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("https://accounts.google.com/"))
+        );
+        let (status, headers, _) = post_form(
+            &app,
+            &format!("/control/account/connections/{}/revoke", connection.id),
+            &session,
+            &csrf,
+            "_csrf=ui-test-csrf",
+        )
+        .await;
+        assert!(status == StatusCode::SEE_OTHER || status == StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            headers
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/control/account")
+        );
+        assert!(repo.get_connection(connection.id).await.unwrap().is_none());
+        assert!(repo.get_user(member.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn member_self_delete_form_clears_auth_cookies() {
+        let (app, repo, member, session, csrf) = owner_fixture(UserRole::Member).await;
+        let (status, headers, _) = post_form(
+            &app,
+            "/control/account/delete",
+            &session,
+            &csrf,
+            "_csrf=ui-test-csrf",
+        )
+        .await;
+        assert!(status == StatusCode::SEE_OTHER || status == StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            headers
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/")
+        );
+        let cookies = headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+        assert!(
+            cookies
+                .iter()
+                .any(|value| value.starts_with("__Host-agentmail_session=;"))
+        );
+        assert!(
+            cookies
+                .iter()
+                .any(|value| value.starts_with("__Host-agentmail_csrf=;"))
+        );
+        assert!(repo.get_user(member.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn member_manages_access_key_and_plaintext_is_flash_only() {
+        let (app, repo, member, session, csrf) = owner_fixture(UserRole::Member).await;
+        let connection = repo
+            .list_connections_for_user(member.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let (status, headers, _) = post_form(
+            &app,
+            "/control/account/access-keys",
+            &session,
+            &csrf,
+            &format!(
+                "name=member-key&connection_ids={}&_csrf=ui-test-csrf",
+                connection.id
+            ),
+        )
+        .await;
+        assert!(status == StatusCode::SEE_OTHER || status == StatusCode::TEMPORARY_REDIRECT);
+        let flash = flash_from_headers(&headers).unwrap();
+        let credential = flash
+            .strip_prefix("key_created|")
+            .expect("one-time credential flash");
+        assert!(credential.starts_with("amk_"));
+        let key = repo
+            .list_access_keys(member.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(key.grants.contains(connection.id));
+        assert!(
+            repo.authenticate_access_key(credential)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let (_, _, body) = get_page(&app, "/control/account", Some(&session), Some(&csrf)).await;
+        assert!(!body.contains(credential));
+        assert!(body.contains(&key.public_prefix));
+
+        let (_, rotate_headers, _) = post_form(
+            &app,
+            &format!("/control/account/access-keys/{}/rotate", key.id),
+            &session,
+            &csrf,
+            "_csrf=ui-test-csrf",
+        )
+        .await;
+        let rotated = flash_from_headers(&rotate_headers)
+            .unwrap()
+            .strip_prefix("key_rotated|")
+            .unwrap()
+            .to_owned();
+        assert!(
+            repo.authenticate_access_key(credential)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repo.authenticate_access_key(&rotated)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        post_form(
+            &app,
+            &format!("/control/account/access-keys/{}/grants", key.id),
+            &session,
+            &csrf,
+            "_csrf=ui-test-csrf",
+        )
+        .await;
+        assert!(
+            repo.get_access_key(member.id, key.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .grants
+                .is_empty()
+        );
+        post_form(
+            &app,
+            &format!("/control/account/access-keys/{}/revoke", key.id),
+            &session,
+            &csrf,
+            "_csrf=ui-test-csrf",
+        )
+        .await;
+        assert!(
+            repo.authenticate_access_key(&rotated)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn members_page_lists_summaries_without_rediscovering_secrets() {
         let (app, repo, _owner, session, csrf) = owner_fixture(UserRole::Owner).await;
         let member = User::new(
@@ -1088,8 +1963,48 @@ mod tests {
         assert!(body.contains("Active"));
         assert!(body.contains("Connections"));
         assert!(body.contains("Access keys"));
+        assert!(body.contains(&format!("/control/members/{}/revoke", member.id)));
+        assert!(body.contains("Revoke account"));
         assert!(!body.contains("secret_hash"));
         assert!(!body.contains("__Host-agentmail_csrf"));
+    }
+
+    #[tokio::test]
+    async fn owner_member_revoke_form_requires_csrf_and_removes_member() {
+        let (app, repo, _owner, session, csrf) = owner_fixture(UserRole::Owner).await;
+        let member = User::new(
+            "member-revoke-ui",
+            "revoke-ui@example.com",
+            UserRole::Member,
+            Utc::now(),
+        )
+        .unwrap();
+        repo.insert_user(&member).await.unwrap();
+        let path = format!("/control/members/{}/revoke", member.id);
+        let (_, bad_headers, _) =
+            post_form(&app, &path, &session, &csrf, "_csrf=wrong-token").await;
+        assert!(
+            flash_from_headers(&bad_headers)
+                .unwrap_or_default()
+                .contains("invalid_csrf")
+        );
+        assert!(repo.get_user(member.id).await.unwrap().is_some());
+
+        let (status, headers, _) =
+            post_form(&app, &path, &session, &csrf, "_csrf=ui-test-csrf").await;
+        assert!(status == StatusCode::SEE_OTHER || status == StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            headers
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/control/members")
+        );
+        assert!(
+            flash_from_headers(&headers)
+                .unwrap_or_default()
+                .contains("member_revoked")
+        );
+        assert!(repo.get_user(member.id).await.unwrap().is_none());
     }
 
     #[tokio::test]
