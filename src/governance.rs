@@ -20,6 +20,15 @@ pub enum LimitKind {
 }
 
 impl LimitKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiPerMinute => "api_per_minute",
+            Self::PreparePerHour => "prepare_per_hour",
+            Self::SendPerHour => "send_per_hour",
+            Self::SendPerDay => "send_per_day",
+        }
+    }
+
     pub const fn limit(self) -> u32 {
         match self {
             Self::ApiPerMinute => 120,

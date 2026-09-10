@@ -17,6 +17,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Weak},
+    time::Instant,
 };
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
@@ -36,9 +37,13 @@ use crate::{
     google_gmail::GoogleGmailClient,
     google_oidc::GoogleJwksVerifier,
     google_token::GoogleTokenClient,
+    governance::{
+        AuditContext, AuditEvent, AuditOperation, AuditResult, ChargeReceipt, LimitKind,
+        RateBucket, RateLimitExceeded, RequestId,
+    },
     live_gmail_adapter::LiveGmailAdapter,
     mailbox_service::{MailboxReadError, MailboxReadService, MessageSearchResult},
-    repository::{DurableSendClaim, Repository},
+    repository::{DurableRateCharge, DurableSendClaim, RateChargeError, Repository},
 };
 
 #[derive(Debug, Clone, Subcommand)]
@@ -76,6 +81,7 @@ pub struct AppState {
     pub confirmations:
         Arc<RwLock<HashMap<crate::domain::delivery::ConfirmationId, SendConfirmation>>>,
     pub pending_tokens: Arc<RwLock<HashMap<String, crate::domain::delivery::ConfirmationId>>>,
+    pub rate_buckets: Arc<Mutex<HashMap<String, RateBucket>>>,
 }
 impl AppState {
     pub fn new(database: Option<Database>, adapter: Arc<dyn GmailAdapter>) -> Self {
@@ -93,6 +99,7 @@ impl AppState {
             draft_locks: Arc::new(RwLock::new(HashMap::new())),
             confirmations: Arc::new(RwLock::new(HashMap::new())),
             pending_tokens: Arc::new(RwLock::new(HashMap::new())),
+            rate_buckets: Arc::new(Mutex::new(HashMap::new())),
         }
     }
     pub fn empty() -> Self {
@@ -131,6 +138,7 @@ impl AppState {
             draft_locks: Arc::new(RwLock::new(HashMap::new())),
             confirmations: Arc::new(RwLock::new(HashMap::new())),
             pending_tokens: Arc::new(RwLock::new(HashMap::new())),
+            rate_buckets: Arc::new(Mutex::new(HashMap::new())),
         };
         (state, credential, cid)
     }
@@ -140,6 +148,12 @@ struct AuthContext {
     key: AccessKeyId,
     user: UserId,
     generation: u64,
+}
+
+#[derive(Debug)]
+enum RateReservation {
+    Persistent(Vec<DurableRateCharge>),
+    Memory(Vec<(String, ChargeReceipt)>),
 }
 use crate::domain::access::AccessKeyId;
 
@@ -163,6 +177,145 @@ fn error_response(
     );
     response
 }
+
+fn rate_limit_response(error: RateLimitExceeded, headers: &HeaderMap) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"error":{
+            "code":"rate_limited",
+            "message":"rate limit exceeded",
+            "request_id":request_id(headers),
+            "retryable":true,
+            "retry_after_seconds":error.retry_after_seconds
+        }})),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::from_str(&error.retry_after_seconds.to_string())
+            .expect("retry seconds are a valid header"),
+    );
+    response
+}
+
+async fn reserve_limits(
+    state: &AppState,
+    headers: &HeaderMap,
+    limits: &[(String, LimitKind)],
+    now: chrono::DateTime<Utc>,
+) -> Result<RateReservation, Response> {
+    if let Some(repository) = &state.repository {
+        return match repository.charge_rate_limits(limits, now).await {
+            Ok(charges) => Ok(RateReservation::Persistent(charges)),
+            Err(RateChargeError::Exceeded(error)) => Err(rate_limit_response(error, headers)),
+            Err(RateChargeError::Repository(_)) => Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "service temporarily unavailable",
+                headers,
+            )),
+        };
+    }
+    let mut buckets = state.rate_buckets.lock().await;
+    let mut charges: Vec<(String, ChargeReceipt)> = Vec::with_capacity(limits.len());
+    for (subject, kind) in limits {
+        let bucket_key = format!("{}:{subject}", kind.as_str());
+        let bucket = buckets
+            .entry(bucket_key.clone())
+            .or_insert_with(|| RateBucket::new(&bucket_key, *kind, now));
+        match bucket.charge(now) {
+            Ok(receipt) => charges.push((bucket_key, receipt)),
+            Err(error) => {
+                for (key, mut receipt) in charges {
+                    if let Some(bucket) = buckets.get_mut(&key) {
+                        bucket.refund(&mut receipt, now);
+                    }
+                }
+                return Err(rate_limit_response(error, headers));
+            }
+        }
+    }
+    Ok(RateReservation::Memory(charges))
+}
+
+async fn refund_limits(
+    state: &AppState,
+    headers: &HeaderMap,
+    reservation: RateReservation,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), Response> {
+    match reservation {
+        RateReservation::Persistent(charges) => state
+            .repository
+            .as_ref()
+            .expect("persistent rate reservation requires repository")
+            .refund_rate_limits(charges, now)
+            .await
+            .map(|_| ())
+            .map_err(|_| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service_unavailable",
+                    "service temporarily unavailable",
+                    headers,
+                )
+            }),
+        RateReservation::Memory(charges) => {
+            let mut buckets = state.rate_buckets.lock().await;
+            for (key, mut receipt) in charges {
+                if let Some(bucket) = buckets.get_mut(&key) {
+                    bucket.refund(&mut receipt, now);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn audit_result(status: StatusCode) -> AuditResult {
+    match status {
+        StatusCode::UNAUTHORIZED => AuditResult::Unauthorized,
+        StatusCode::FORBIDDEN => AuditResult::Forbidden,
+        StatusCode::NOT_FOUND => AuditResult::NotFound,
+        StatusCode::CONFLICT => AuditResult::Conflict,
+        StatusCode::TOO_MANY_REQUESTS => AuditResult::RateLimited,
+        StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT => AuditResult::Unavailable,
+        status if status.is_success() => AuditResult::Ok,
+        _ => AuditResult::Error,
+    }
+}
+
+async fn audit_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    context: AuthContext,
+    connection_id: Option<ConnectionId>,
+    operation: AuditOperation,
+    started: Instant,
+    response: Response,
+) -> Response {
+    if let Some(repository) = &state.repository {
+        let request_id = RequestId::try_from(request_id(headers))
+            .unwrap_or_else(|_| RequestId::try_from("unavailable").expect("fixed request id"));
+        let event = AuditEvent::metadata(
+            AuditContext {
+                user_id: Some(context.user),
+                access_key_id: Some(context.key),
+                connection_id,
+            },
+            operation,
+            audit_result(response.status()),
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            request_id,
+            Utc::now(),
+        );
+        if let Err(error) = repository.record_audit_event(&event).await {
+            tracing::warn!(error = %error, operation = operation.as_str(), "audit write failed");
+        }
+    }
+    response
+}
+
 async fn auth(
     headers: &HeaderMap,
     query: Option<&str>,
@@ -230,11 +383,19 @@ async fn auth(
                     headers,
                 )
             })?;
-        return Ok(AuthContext {
+        let context = AuthContext {
             key: key.id,
             user: key.owner_id,
             generation: key.generation,
-        });
+        };
+        reserve_limits(
+            state,
+            headers,
+            &[(context.key.to_string(), LimitKind::ApiPerMinute)],
+            Utc::now(),
+        )
+        .await?;
+        return Ok(context);
     }
     let keys = state.keys.read().await;
     let key = keys.get(&parsed.public_id).ok_or_else(|| {
@@ -261,11 +422,20 @@ async fn auth(
             headers,
         ));
     }
-    Ok(AuthContext {
+    let context = AuthContext {
         key: key.id,
         user: key.owner_id,
         generation: key.generation,
-    })
+    };
+    drop(keys);
+    reserve_limits(
+        state,
+        headers,
+        &[(context.key.to_string(), LimitKind::ApiPerMinute)],
+        Utc::now(),
+    )
+    .await?;
+    Ok(context)
 }
 async fn authorize(
     headers: &HeaderMap,
@@ -274,6 +444,15 @@ async fn authorize(
     connection: ConnectionId,
 ) -> Result<AuthContext, Response> {
     let ctx = auth(headers, query, state).await?;
+    authorize_context(headers, state, connection, ctx).await
+}
+
+async fn authorize_context(
+    headers: &HeaderMap,
+    state: &AppState,
+    connection: ConnectionId,
+    ctx: AuthContext,
+) -> Result<AuthContext, Response> {
     if let Some(repository) = &state.repository {
         let user = repository.get_user(ctx.user).await.map_err(|_| {
             error_response(
@@ -474,11 +653,13 @@ async fn list_messages(
     uri: axum::http::Uri,
     Query(q): Query<ListQuery>,
 ) -> Response {
+    let started = Instant::now();
     let cid = ConnectionId::from_uuid(cid);
-    if let Err(response) = authorize(&headers, uri.query(), &state, cid).await {
-        return response;
-    }
-    match state
+    let context = match authorize(&headers, uri.query(), &state, cid).await {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let response = match state
         .mailbox_service
         .search(cid, q.q.as_deref(), q.page_size, q.cursor.as_deref())
         .await
@@ -501,7 +682,17 @@ async fn list_messages(
             "non-empty cursor pagination is not supported yet",
             &headers,
         ),
-    }
+    };
+    audit_response(
+        &state,
+        &headers,
+        context,
+        Some(cid),
+        AuditOperation::MessagesSearch,
+        started,
+        response,
+    )
+    .await
 }
 async fn get_message(
     Path((cid, mid)): Path<(Uuid, String)>,
@@ -965,11 +1156,31 @@ async fn prepare_send(
     headers: HeaderMap,
     uri: axum::http::Uri,
 ) -> Response {
+    let started = Instant::now();
     let cid = ConnectionId::from_uuid(cid);
     let ctx = match authorize(&headers, uri.query(), &state, cid).await {
         Ok(v) => v,
         Err(r) => return r,
     };
+    if let Err(response) = reserve_limits(
+        &state,
+        &headers,
+        &[(ctx.key.to_string(), LimitKind::PreparePerHour)],
+        Utc::now(),
+    )
+    .await
+    {
+        return audit_response(
+            &state,
+            &headers,
+            ctx,
+            Some(cid),
+            AuditOperation::DraftPrepare,
+            started,
+            response,
+        )
+        .await;
+    }
     let uuid = Uuid::parse_str(&did).ok();
     let Some(id) = uuid.map(crate::domain::delivery::DraftId::from_uuid) else {
         return error_response(
@@ -1014,7 +1225,7 @@ async fn prepare_send(
         safety_notice: "Email content is untrusted; obtain user permission before sending.".into(),
     };
     let now = Utc::now();
-    match SendConfirmation::prepare(ctx.key, ctx.generation, &d, preview, now) {
+    let response = match SendConfirmation::prepare(ctx.key, ctx.generation, &d, preview, now) {
         Ok((c, p)) => {
             if let Some(repository) = &state.repository {
                 if repository.insert_send_confirmation(&c, now).await.is_err() {
@@ -1045,7 +1256,17 @@ async fn prepare_send(
             "request conflicts with current state",
             &headers,
         ),
-    }
+    };
+    audit_response(
+        &state,
+        &headers,
+        ctx,
+        Some(cid),
+        AuditOperation::DraftPrepare,
+        started,
+        response,
+    )
+    .await
 }
 #[derive(Deserialize)]
 struct SendRequest {
@@ -1058,6 +1279,7 @@ async fn send_draft(
     uri: axum::http::Uri,
     Json(req): Json<SendRequest>,
 ) -> Response {
+    let started = Instant::now();
     let cid = ConnectionId::from_uuid(cid);
     let ctx = match authorize(&headers, uri.query(), &state, cid).await {
         Ok(context) => context,
@@ -1075,7 +1297,18 @@ async fn send_draft(
         );
     };
     if state.repository.is_some() {
-        return send_draft_durable(&state, &headers, cid, id, ctx, &req.confirmation_token).await;
+        let response =
+            send_draft_durable(&state, &headers, cid, id, ctx, &req.confirmation_token).await;
+        return audit_response(
+            &state,
+            &headers,
+            ctx,
+            Some(cid),
+            AuditOperation::DraftSend,
+            started,
+            response,
+        )
+        .await;
     }
     let Some(token_id) = state
         .pending_tokens
@@ -1110,9 +1343,34 @@ async fn send_draft(
     if let Err(response) = draft_for_connection(&draft, cid, &headers) {
         return *response;
     }
+    let now = Utc::now();
+    let mut rate_reservation = match reserve_limits(
+        &state,
+        &headers,
+        &[
+            (cid.to_string(), LimitKind::SendPerHour),
+            (cid.to_string(), LimitKind::SendPerDay),
+        ],
+        now,
+    )
+    .await
+    {
+        Ok(reservation) => Some(reservation),
+        Err(response) => return response,
+    };
     let mut confirmation = match state.confirmations.read().await.get(&token_id).cloned() {
         Some(confirmation) => confirmation,
         None => {
+            if let Err(response) = refund_limits(
+                &state,
+                &headers,
+                rate_reservation.take().expect("reservation exists"),
+                now,
+            )
+            .await
+            {
+                return response;
+            }
             return error_response(
                 StatusCode::UNAUTHORIZED,
                 "invalid_confirmation",
@@ -1126,9 +1384,19 @@ async fn send_draft(
         ctx.key,
         ctx.generation,
         &mut draft,
-        Utc::now(),
+        now,
     ) {
         Ok(Some(replayed)) => {
+            if let Err(response) = refund_limits(
+                &state,
+                &headers,
+                rate_reservation.take().expect("reservation exists"),
+                now,
+            )
+            .await
+            {
+                return response;
+            }
             if let Some(repository) = &state.repository
                 && repository
                     .update_draft(&draft, &draft.version)
@@ -1149,6 +1417,16 @@ async fn send_draft(
         }
         Ok(None) => {}
         Err(_) => {
+            if let Err(response) = refund_limits(
+                &state,
+                &headers,
+                rate_reservation.take().expect("reservation exists"),
+                now,
+            )
+            .await
+            {
+                return response;
+            }
             return error_response(
                 StatusCode::UNAUTHORIZED,
                 "invalid_confirmation",
@@ -1196,6 +1474,19 @@ async fn send_draft(
             code: "upstream_unavailable".to_owned(),
         },
     };
+    if matches!(&outcome, SendOutcome::Failed { .. })
+        && let Err(response) = refund_limits(
+            &state,
+            &headers,
+            rate_reservation
+                .take()
+                .expect("claimed send keeps reservation"),
+            now,
+        )
+        .await
+    {
+        return response;
+    }
     let result = match confirmation.complete(&mut draft, outcome) {
         Ok(result) => result,
         Err(_) => {
@@ -1226,10 +1517,20 @@ async fn send_draft(
             &headers,
         );
     }
-    ok_json(
+    let response = ok_json(
         json!({"connection_id":cid,"draft_id":id,"outcome":result.outcome,"replayed":result.replayed}),
         &headers,
+    );
+    audit_response(
+        &state,
+        &headers,
+        ctx,
+        Some(cid),
+        AuditOperation::DraftSend,
+        started,
+        response,
     )
+    .await
 }
 
 async fn send_draft_durable(
@@ -1260,13 +1561,38 @@ async fn send_draft_durable(
     if let Err(response) = draft_for_connection(&draft, connection_id, headers) {
         return *response;
     }
+    let now = Utc::now();
+    let mut rate_reservation = match reserve_limits(
+        state,
+        headers,
+        &[
+            (connection_id.to_string(), LimitKind::SendPerHour),
+            (connection_id.to_string(), LimitKind::SendPerDay),
+        ],
+        now,
+    )
+    .await
+    {
+        Ok(reservation) => Some(reservation),
+        Err(response) => return response,
+    };
     let digest = SendConfirmation::token_digest_hex(token);
     let claim = match repository
-        .claim_send_confirmation(&digest, auth.key, auth.generation, &draft, Utc::now())
+        .claim_send_confirmation(&digest, auth.key, auth.generation, &draft, now)
         .await
     {
         Ok(Some(claim)) => claim,
         Ok(None) => {
+            if let Err(response) = refund_limits(
+                state,
+                headers,
+                rate_reservation.take().expect("reservation exists"),
+                now,
+            )
+            .await
+            {
+                return response;
+            }
             return error_response(
                 StatusCode::UNAUTHORIZED,
                 "invalid_confirmation",
@@ -1275,6 +1601,16 @@ async fn send_draft_durable(
             );
         }
         Err(_) => {
+            if let Err(response) = refund_limits(
+                state,
+                headers,
+                rate_reservation.take().expect("reservation exists"),
+                now,
+            )
+            .await
+            {
+                return response;
+            }
             return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "service_unavailable",
@@ -1285,6 +1621,16 @@ async fn send_draft_durable(
     };
     let (mut confirmation, mut draft, outcome) = match claim {
         DurableSendClaim::Replayed { outcome, .. } => {
+            if let Err(response) = refund_limits(
+                state,
+                headers,
+                rate_reservation.take().expect("reservation exists"),
+                now,
+            )
+            .await
+            {
+                return response;
+            }
             return ok_json(
                 json!({"connection_id":connection_id,"draft_id":draft_id,"outcome":outcome,"replayed":true}),
                 headers,
@@ -1313,10 +1659,33 @@ async fn send_draft_durable(
             (confirmation, draft, outcome)
         }
         DurableSendClaim::InProgress { confirmation } => {
+            if let Err(response) = refund_limits(
+                state,
+                headers,
+                rate_reservation.take().expect("reservation exists"),
+                now,
+            )
+            .await
+            {
+                return response;
+            }
             let outcome = reconcile_sent_outcome(state, connection_id, &draft.message_id).await;
             (confirmation, draft, outcome)
         }
     };
+    if matches!(&outcome, SendOutcome::Failed { .. })
+        && let Err(response) = refund_limits(
+            state,
+            headers,
+            rate_reservation
+                .take()
+                .expect("claimed send keeps reservation"),
+            now,
+        )
+        .await
+    {
+        return response;
+    }
     let result = match confirmation.complete(&mut draft, outcome) {
         Ok(result) => result,
         Err(_) => {
@@ -1661,9 +2030,10 @@ async fn mcp(
     uri: axum::http::Uri,
     body: Bytes,
 ) -> Response {
-    if let Err(response) = auth(&headers, uri.query(), &state).await {
-        return response;
-    }
+    let auth = match auth(&headers, uri.query(), &state).await {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
     let payload: Value = match serde_json::from_slice(&body) {
         Ok(payload) => payload,
         Err(_) => return mcp_error(Value::Null, -32700, "parse error", &headers),
@@ -1703,10 +2073,11 @@ async fn mcp(
                 Err(_) => return mcp_error(request.id, -32602, "invalid tool arguments", &headers),
             };
             let cid = ConnectionId::from_uuid(args.connection_id);
-            if let Err(response) = authorize(&headers, uri.query(), &state, cid).await {
+            if let Err(response) = authorize_context(&headers, &state, cid, auth).await {
                 return response;
             }
-            match state
+            let started = Instant::now();
+            let response = match state
                 .mailbox_service
                 .search(
                     cid,
@@ -1743,7 +2114,17 @@ async fn mcp(
                 Err(MailboxReadError::Adapter(
                     AdapterError::Unavailable | AdapterError::Timeout,
                 )) => mcp_error(request.id, -32003, "upstream service unavailable", &headers),
-            }
+            };
+            audit_response(
+                &state,
+                &headers,
+                auth,
+                Some(cid),
+                AuditOperation::MessagesSearch,
+                started,
+                response,
+            )
+            .await
         }
         _ => mcp_error(request.id, -32601, "method not found", &headers),
     }
@@ -1859,6 +2240,25 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             let db = Database::connect(config.database_url.clone()).await?;
             db.ensure_current().await?;
             let repository = Repository::new(&db);
+            repository
+                .cleanup_metadata(Utc::now(), config.audit_retention_days)
+                .await?;
+            let cleanup_repository = repository.clone();
+            let audit_retention_days = config.audit_retention_days;
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3_600));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    if let Err(error) = cleanup_repository
+                        .cleanup_metadata(Utc::now(), audit_retention_days)
+                        .await
+                    {
+                        tracing::warn!(error = %error, "metadata cleanup failed");
+                    }
+                }
+            });
             let oidc_verifier = GoogleJwksVerifier::new()?;
             let login_token_client = GoogleTokenClient::new(
                 config.google_login_client_id.clone(),
@@ -1914,6 +2314,7 @@ mod tests {
     use crate::repository::Repository;
     use axum::body::Body;
     use http::{Method, Request};
+    use sqlx::Row;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
@@ -2252,5 +2653,200 @@ mod tests {
         assert_eq!(replay["replayed"], true);
         assert_eq!(adapter.send_calls.load(Ordering::SeqCst), 1);
         assert_eq!(adapter.reconcile_calls.load(Ordering::SeqCst), 1);
+        let repository = state.repository.as_ref().unwrap();
+        let counts: Vec<i64> = sqlx::query_scalar(
+            "SELECT request_count FROM rate_limit_buckets WHERE bucket_key IN (?,?) ORDER BY bucket_key",
+        )
+        .bind(format!("send_per_day:{connection}"))
+        .bind(format!("send_per_hour:{connection}"))
+        .fetch_all(repository.pool())
+        .await
+        .unwrap();
+        assert_eq!(counts, vec![1, 1], "replay must not consume send quota");
+        let send_audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE operation='draft.send' AND result_category='ok'",
+        )
+        .fetch_one(repository.pool())
+        .await
+        .unwrap();
+        assert_eq!(send_audits, 2, "initial send and replay are both audited");
+    }
+
+    #[tokio::test]
+    async fn api_rate_limit_returns_retry_seconds_and_header() {
+        let (state, credential, _) = AppState::test_fixture();
+        let key_id = state.keys.read().await.values().next().unwrap().id;
+        let now = Utc::now();
+        let bucket_key = format!("api_per_minute:{key_id}");
+        let mut bucket = RateBucket::new(&bucket_key, LimitKind::ApiPerMinute, now);
+        bucket.request_count = LimitKind::ApiPerMinute.limit() - 1;
+        state.rate_buckets.lock().await.insert(bucket_key, bucket);
+        let app = router(state);
+        let allowed = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/connections")
+                    .header("authorization", format!("Bearer {credential}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let response = app
+            .oneshot(
+                Request::get("/api/v1/connections")
+                    .header("authorization", format!("Bearer {credential}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "rate_limited");
+        assert!(body["error"]["retry_after_seconds"].as_u64().unwrap() >= 1);
+    }
+
+    #[tokio::test]
+    async fn mcp_request_charges_api_limit_once() {
+        let (state, credential, _) = AppState::test_fixture();
+        let app = router(state.clone());
+        let response = app
+            .oneshot(
+                Request::post("/mcp")
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let buckets = state.rate_buckets.lock().await;
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets.values().next().unwrap().request_count, 1);
+    }
+
+    #[tokio::test]
+    async fn prepare_limit_is_enforced_before_confirmation_creation() {
+        let (state, credential, connection) = AppState::test_fixture();
+        let key_id = state.keys.read().await.values().next().unwrap().id;
+        let app = router(state.clone());
+        let (status, created) = json_request(
+            &app,
+            Method::POST,
+            format!("/api/v1/connections/{connection}/drafts"),
+            &credential,
+            json!({"subject":"limited","body":"body","to":["to@example.com"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let draft_id = created["managed_draft"]["id"].as_str().unwrap();
+        let now = Utc::now();
+        let bucket_key = format!("prepare_per_hour:{key_id}");
+        let mut bucket = RateBucket::new(&bucket_key, LimitKind::PreparePerHour, now);
+        bucket.request_count = LimitKind::PreparePerHour.limit();
+        state.rate_buckets.lock().await.insert(bucket_key, bucket);
+        let (status, body) = json_request(
+            &app,
+            Method::POST,
+            format!("/api/v1/connections/{connection}/drafts/{draft_id}/prepare-send"),
+            &credential,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"]["code"], "rate_limited");
+        assert!(state.confirmations.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_limit_does_not_consume_confirmation() {
+        let (state, credential, connection) = AppState::test_fixture();
+        let app = router(state.clone());
+        let (_, created) = json_request(
+            &app,
+            Method::POST,
+            format!("/api/v1/connections/{connection}/drafts"),
+            &credential,
+            json!({"subject":"limited","body":"body","to":["to@example.com"]}),
+        )
+        .await;
+        let draft_id = created["managed_draft"]["id"].as_str().unwrap();
+        let (_, prepared) = json_request(
+            &app,
+            Method::POST,
+            format!("/api/v1/connections/{connection}/drafts/{draft_id}/prepare-send"),
+            &credential,
+            json!({}),
+        )
+        .await;
+        let token = prepared["confirmation_token"].as_str().unwrap();
+        let now = Utc::now();
+        let bucket_key = format!("send_per_hour:{connection}");
+        let mut bucket = RateBucket::new(&bucket_key, LimitKind::SendPerHour, now);
+        bucket.request_count = LimitKind::SendPerHour.limit();
+        state
+            .rate_buckets
+            .lock()
+            .await
+            .insert(bucket_key.clone(), bucket);
+        let request = json!({"confirmation_token":token});
+        let (limited, body) = json_request(
+            &app,
+            Method::POST,
+            format!("/api/v1/connections/{connection}/drafts/{draft_id}/send"),
+            &credential,
+            request.clone(),
+        )
+        .await;
+        assert_eq!(limited, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"]["code"], "rate_limited");
+        state.rate_buckets.lock().await.remove(&bucket_key);
+        let (sent, body) = json_request(
+            &app,
+            Method::POST,
+            format!("/api/v1/connections/{connection}/drafts/{draft_id}/send"),
+            &credential,
+            request,
+        )
+        .await;
+        assert_eq!(sent, StatusCode::OK);
+        assert_eq!(body["replayed"], false);
+    }
+
+    #[tokio::test]
+    async fn rest_search_records_metadata_only_audit() {
+        let (state, credential, connection, _) = persisted_state().await;
+        let repository = state.repository.clone().unwrap();
+        let (status, _) = json_request(
+            &router(state),
+            Method::GET,
+            format!("/api/v1/connections/{connection}/messages?q=secret-query"),
+            &credential,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let row = sqlx::query(
+            "SELECT user_id,access_key_id,connection_id,operation,result_category,request_id FROM audit_events",
+        )
+        .fetch_one(repository.pool())
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("operation"), "messages.search");
+        assert_eq!(row.get::<String, _>("result_category"), "ok");
+        assert_eq!(
+            row.get::<String, _>("connection_id"),
+            connection.to_string()
+        );
+        assert_ne!(row.get::<String, _>("request_id"), "secret-query");
     }
 }

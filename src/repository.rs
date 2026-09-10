@@ -16,11 +16,11 @@ use crate::{
             UserStatus, normalize_email,
         },
     },
-    governance::AuditEvent,
+    governance::{AuditEvent, LimitKind, RateBucket, RateLimitExceeded, audit_cleanup_cutoff},
     oauth::{OAuthFlowKind, OAuthTransactionRecord, validate_granted_gmail_scopes},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::{fmt, num::TryFromIntError};
 use uuid::Uuid;
@@ -41,6 +41,29 @@ pub enum RepositoryError {
     PersonalUseLimitReached,
     #[error("integer value is out of range")]
     IntegerRange(#[from] TryFromIntError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RateChargeError {
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+    #[error(transparent)]
+    Exceeded(#[from] RateLimitExceeded),
+}
+
+/// One durable rate-limit reservation. Ownership of this value makes a refund
+/// single-use within the process; the database update additionally binds it to
+/// the exact fixed window.
+#[derive(Debug)]
+pub struct DurableRateCharge {
+    bucket_key: String,
+    window_started_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CleanupResult {
+    pub audit_events: u64,
+    pub rate_buckets: u64,
 }
 
 /// Credential retained until Google revocation succeeds. Debug redacts the envelope.
@@ -1711,6 +1734,123 @@ impl Repository {
     pub async fn record_audit_event(&self, e: &AuditEvent) -> Result<(), RepositoryError> {
         sqlx::query("INSERT INTO audit_events (id,user_id,access_key_id,connection_id,operation,result_category,latency_ms,request_id,created_at) VALUES (?,?,?,?,?,?,?,?,?)").bind(e.id.to_string()).bind(e.user_id.map(|v|v.to_string())).bind(e.access_key_id.map(|v|v.to_string())).bind(e.connection_id.map(|v|v.to_string())).bind(e.operation.as_str()).bind(e.result_category.as_str()).bind(i64::try_from(e.latency_ms)?).bind(e.request_id.as_str()).bind(encode_time(e.created_at)).execute(&self.pool).await?;
         Ok(())
+    }
+
+    /// Atomically reserve one or more fixed-window limits. A failure rolls back
+    /// every reservation in this call, so hourly and daily send limits cannot
+    /// become partially charged.
+    pub async fn charge_rate_limits(
+        &self,
+        limits: &[(String, LimitKind)],
+        now: DateTime<Utc>,
+    ) -> Result<Vec<DurableRateCharge>, RateChargeError> {
+        let mut tx = self.pool.begin().await.map_err(RepositoryError::from)?;
+        let mut charges = Vec::with_capacity(limits.len());
+        for (subject, kind) in limits {
+            if subject.is_empty()
+                || subject.len() > 128
+                || !subject
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return Err(RepositoryError::InvalidValue("rate limit subject".into()).into());
+            }
+            let bucket_key = format!("{}:{subject}", kind.as_str());
+            let window_started_at = RateBucket::new(&bucket_key, *kind, now).window_started_at;
+            let window = encode_time(window_started_at);
+            let updated = encode_time(now);
+            let charged = sqlx::query_scalar::<_, String>(
+                "INSERT INTO rate_limit_buckets (bucket_key,window_started_at,request_count,updated_at) VALUES (?,?,1,?) \
+                 ON CONFLICT(bucket_key) DO UPDATE SET \
+                   window_started_at=excluded.window_started_at, \
+                   request_count=CASE WHEN rate_limit_buckets.window_started_at<>excluded.window_started_at THEN 1 ELSE rate_limit_buckets.request_count+1 END, \
+                   updated_at=excluded.updated_at \
+                 WHERE rate_limit_buckets.window_started_at<>excluded.window_started_at OR rate_limit_buckets.request_count<? \
+                 RETURNING window_started_at",
+            )
+            .bind(&bucket_key)
+            .bind(&window)
+            .bind(&updated)
+            .bind(i64::from(kind.limit()))
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(RepositoryError::from)?;
+            if charged.is_none() {
+                let stored_start: String = sqlx::query_scalar(
+                    "SELECT window_started_at FROM rate_limit_buckets WHERE bucket_key=?",
+                )
+                .bind(&bucket_key)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(RepositoryError::from)?;
+                let stored_start = parse_time(stored_start).map_err(RateChargeError::from)?;
+                let reset = stored_start + Duration::seconds(kind.window_seconds());
+                let retry_after_seconds = (reset - now).num_seconds().max(1) as u64;
+                tx.rollback().await.map_err(RepositoryError::from)?;
+                return Err(RateLimitExceeded {
+                    retry_after_seconds,
+                }
+                .into());
+            }
+            charges.push(DurableRateCharge {
+                bucket_key,
+                window_started_at,
+            });
+        }
+        tx.commit().await.map_err(RepositoryError::from)?;
+        Ok(charges)
+    }
+
+    /// Refund fixed-window reservations after a request is proven not to have
+    /// consumed send capacity. A stale-window or already-empty bucket is left
+    /// unchanged.
+    pub async fn refund_rate_limits(
+        &self,
+        charges: Vec<DurableRateCharge>,
+        now: DateTime<Utc>,
+    ) -> Result<u64, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let mut refunded = 0;
+        for charge in charges {
+            let changed = sqlx::query(
+                "UPDATE rate_limit_buckets SET request_count=request_count-1,updated_at=? \
+                 WHERE bucket_key=? AND window_started_at=? AND request_count>0",
+            )
+            .bind(encode_time(now))
+            .bind(charge.bucket_key)
+            .bind(encode_time(charge.window_started_at))
+            .execute(&mut *tx)
+            .await?;
+            refunded += changed.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(refunded)
+    }
+
+    /// Remove metadata past its retention boundary. Rate buckets only need the
+    /// longest fixed window, so a two-day grace period safely covers daily
+    /// counters while keeping the table bounded.
+    pub async fn cleanup_metadata(
+        &self,
+        now: DateTime<Utc>,
+        audit_retention_days: u32,
+    ) -> Result<CleanupResult, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let audit_events = sqlx::query("DELETE FROM audit_events WHERE created_at<?")
+            .bind(encode_time(audit_cleanup_cutoff(now, audit_retention_days)))
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        let rate_buckets = sqlx::query("DELETE FROM rate_limit_buckets WHERE updated_at<?")
+            .bind(encode_time(now - Duration::days(2)))
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(CleanupResult {
+            audit_events,
+            rate_buckets,
+        })
     }
     pub async fn record_first_authorized_subject(
         &self,
@@ -3934,5 +4074,123 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(operation, "draft.prepare");
+    }
+
+    #[tokio::test]
+    async fn durable_rate_limits_are_atomic_persistent_and_refundable() {
+        let repository = repository().await;
+        let now = DateTime::parse_from_rfc3339("2026-09-09T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let subject = Uuid::now_v7().simple().to_string();
+        for _ in 0..10 {
+            repository
+                .charge_rate_limits(
+                    &[
+                        (subject.clone(), LimitKind::SendPerHour),
+                        (subject.clone(), LimitKind::SendPerDay),
+                    ],
+                    now,
+                )
+                .await
+                .unwrap();
+        }
+        let error = repository
+            .charge_rate_limits(
+                &[
+                    (subject.clone(), LimitKind::SendPerDay),
+                    (subject.clone(), LimitKind::SendPerHour),
+                ],
+                now,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RateChargeError::Exceeded(RateLimitExceeded {
+                retry_after_seconds: 3_600
+            })
+        ));
+        let daily_count: i64 =
+            sqlx::query_scalar("SELECT request_count FROM rate_limit_buckets WHERE bucket_key=?")
+                .bind(format!("send_per_day:{subject}"))
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        assert_eq!(daily_count, 10, "failed pair must roll back daily charge");
+
+        let next_hour = now + Duration::hours(1);
+        let charges = repository
+            .charge_rate_limits(
+                &[
+                    (subject.clone(), LimitKind::SendPerHour),
+                    (subject.clone(), LimitKind::SendPerDay),
+                ],
+                next_hour,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .refund_rate_limits(charges, next_hour)
+                .await
+                .unwrap(),
+            2
+        );
+        let reopened = repository.clone();
+        let hourly_count: i64 =
+            sqlx::query_scalar("SELECT request_count FROM rate_limit_buckets WHERE bucket_key=?")
+                .bind(format!("send_per_hour:{subject}"))
+                .fetch_one(reopened.pool())
+                .await
+                .unwrap();
+        assert_eq!(hourly_count, 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_cleanup_respects_audit_retention_and_daily_window_grace() {
+        let repository = repository().await;
+        let now = DateTime::parse_from_rfc3339("2026-09-09T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        for (request_id, created_at) in [
+            ("old", now - Duration::days(31)),
+            ("fresh", now - Duration::days(29)),
+        ] {
+            repository
+                .record_audit_event(&AuditEvent::metadata(
+                    crate::governance::AuditContext::default(),
+                    crate::governance::AuditOperation::Health,
+                    crate::governance::AuditResult::Ok,
+                    1,
+                    crate::governance::RequestId::try_from(request_id).unwrap(),
+                    created_at,
+                ))
+                .await
+                .unwrap();
+        }
+        repository
+            .charge_rate_limits(&[("fresh_subject".into(), LimitKind::SendPerDay)], now)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO rate_limit_buckets (bucket_key,window_started_at,request_count,updated_at) VALUES (?,?,1,?)")
+            .bind("send_per_day:old_subject")
+            .bind(encode_time(now - Duration::days(4)))
+            .bind(encode_time(now - Duration::days(3)))
+            .execute(repository.pool())
+            .await
+            .unwrap();
+        let result = repository.cleanup_metadata(now, 30).await.unwrap();
+        assert_eq!(result.audit_events, 1);
+        assert_eq!(result.rate_buckets, 1);
+        let audit_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let bucket_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rate_limit_buckets")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!((audit_count, bucket_count), (1, 1));
     }
 }

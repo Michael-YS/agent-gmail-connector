@@ -25,7 +25,8 @@
 13. `e501f0d feat(control): manage Access Keys`
 14. `0f8b8ff feat(control-ui): owner HTML dashboard and invitations`
 15. `3f45d95 feat(connections): revoke Gmail access safely`
-16. 工作区：Member 控制面、Access Key 自助管理与账号撤销/删除。
+16. `11d78f2 feat(control): manage members and accounts`
+17. 工作区：持久化限流、机器端无内容审计与自动清理。
 
 ## 当前实现断点
 
@@ -41,11 +42,13 @@
 - 无附件 managed draft 已接入真实 Gmail create/update/delete：使用稳定 Message-ID 和安全 MIME，按草稿独立串行化，从 SQLite 恢复重启后的 managed record，保持 expected-version 乐观锁，并对 create 持久化失败做补偿删除、对 delete 404 做幂等成功。
 - confirmation token 只以 SHA-256 hash 入库；prepare 先持久化再返回明文一次；claim/outcome 与 managed draft 状态分别在 SQLite 事务中原子更新。相同 token 重放首次结果，不再次发送。
 - production send 已启用单次 Gmail `drafts.send`。Timeout、5xx/Unavailable、429 和 claim 后进程重启均只按系统生成的 `@agentmail.invalid` Message-ID 查询 Sent；要求精确 Message-ID header 与 `SENT` 标签，无法确认则持久化 `send_state_unknown`，绝不盲目重发。
+- 限流已接入 REST/MCP 共用认证和发送链路：每把 Access Key 120 次 API/MCP 调用/分钟、30 次 prepare/小时；每个 Connection 10 次发送/小时、50 次/天。小时/日额度在同一 SQLite 事务内预占，确认重放、无效确认和明确失败会原子返还，`send_state_unknown` 保留占用；429 返回 header/body retry 秒数。机器端 search/prepare/send 审计只写 ID、操作、结果、延迟、request ID 和时间。
+- `AUDIT_RETENTION_DAYS` 默认 30（范围 1–3650）；`serve` 启动时及每小时清理到期审计和已越过最长窗口的限流桶。
 - Access Key 管理 JSON API 位于 `/control/api/access-keys...`，Owner/Member 都只能管理自己的 key；所有 mutation 要求 session+CSRF，跨用户 IDOR 被拒绝。HTML 管理位于 `/control/account`。初始及替换 grants 在 repository 事务内验证 active same-owner Connection；create/rotate credential 只显示一次并 `Cache-Control: no-store`，SQLite 只存 Argon2 hash。
 - 邀请接受以 POST body 中的一次性 token 启动 Login OAuth；token 仅以 SHA-256 hash 绑定到 OAuth transaction，callback 仅以已验证、规范化 email 和精确 Google `sub` 原子接受邀请、创建 Member 与 session。重放、错误 email、过期或撤销邀请均不创建 session。
 - 常规 Google Login 会以精确 Google `sub` 与规范化 verified email 登录既有 active Owner 或 Member；没有既有用户时才保留首次 Owner bootstrap 规则。
 - Owner JSON API 已接入：`GET/POST /control/api/invitations`、`POST /control/api/invitations/{id}/revoke`、`POST /control/api/invitations/{id}/regenerate`；HTML 保留 `/control/invitations...`。mutation 要求 Owner session+CSRF，列表不返回 hash，create/regenerate token 只返回一次并 `Cache-Control: no-store`。
-- 最新本地完整验证：162 个 library tests、4 个 HTTP tests、5 个 REST/MCP tests，共 171 项；`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo check --all-targets --all-features --locked` 已通过。未执行部署、真实 Google 或浏览器 smoke。
+- 最新本地完整验证：169 个 library tests、4 个 HTTP tests、5 个 REST/MCP tests，共 178 项；`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo check --all-targets --all-features --locked` 已通过。未执行部署、真实 Google 或浏览器 smoke。
 
 ## 剩余实现里程碑
 

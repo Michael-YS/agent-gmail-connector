@@ -13,6 +13,8 @@ use crate::crypto::Keyring;
 
 pub const DEFAULT_PERSONAL_USE_USER_LIMIT: u16 = 90;
 pub const MAX_PERSONAL_USE_USER_LIMIT: u16 = 99;
+pub const DEFAULT_AUDIT_RETENTION_DAYS: u32 = 30;
+pub const MAX_AUDIT_RETENTION_DAYS: u32 = 3_650;
 const MAX_SECRET_BYTES: usize = 4 * 1024;
 const MAX_KEYRING_FILE_BYTES: usize = 64 * 1024;
 
@@ -71,6 +73,7 @@ pub struct AppConfig {
     pub public_base_url: Url,
     pub owner_email: String,
     pub personal_use_user_limit: u16,
+    pub audit_retention_days: u32,
     pub database_url: String,
     pub session_secret: SecretString,
     pub csrf_secret: SecretString,
@@ -88,6 +91,7 @@ impl fmt::Debug for AppConfig {
             .field("public_base_url", &self.public_base_url)
             .field("owner_email", &self.owner_email)
             .field("personal_use_user_limit", &self.personal_use_user_limit)
+            .field("audit_retention_days", &self.audit_retention_days)
             .field("database_url", &self.database_url)
             .field("session_secret", &"[REDACTED]")
             .field("csrf_secret", &"[REDACTED]")
@@ -167,6 +171,21 @@ impl AppConfig {
                 reason: "must be greater than zero".to_owned(),
             });
         }
+        let audit_retention_days = values.remove("AUDIT_RETENTION_DAYS").map_or(
+            Ok(DEFAULT_AUDIT_RETENTION_DAYS),
+            |value| {
+                value.parse::<u32>().map_err(|_| ConfigError::Invalid {
+                    field: "AUDIT_RETENTION_DAYS",
+                    reason: "must be an integer".to_owned(),
+                })
+            },
+        )?;
+        if audit_retention_days == 0 || audit_retention_days > MAX_AUDIT_RETENTION_DAYS {
+            return Err(ConfigError::Invalid {
+                field: "AUDIT_RETENTION_DAYS",
+                reason: format!("must be between 1 and {MAX_AUDIT_RETENTION_DAYS}"),
+            });
+        }
         let database_url = values
             .remove("DATABASE_URL")
             .unwrap_or_else(|| "sqlite://agentmail.db".to_owned());
@@ -218,6 +237,7 @@ impl AppConfig {
             public_base_url,
             owner_email,
             personal_use_user_limit,
+            audit_retention_days,
             database_url,
             session_secret,
             csrf_secret,
@@ -486,6 +506,19 @@ mod tests {
             AppConfig::from_map(values),
             Err(ConfigError::UserLimitTooHigh)
         ));
+        let mut values = map();
+        values.insert("AUDIT_RETENTION_DAYS".to_owned(), "0".to_owned());
+        assert!(matches!(
+            AppConfig::from_map(values),
+            Err(ConfigError::Invalid {
+                field: "AUDIT_RETENTION_DAYS",
+                ..
+            })
+        ));
+        assert_eq!(
+            AppConfig::from_map(map()).unwrap().audit_retention_days,
+            DEFAULT_AUDIT_RETENTION_DAYS
+        );
     }
 
     #[test]

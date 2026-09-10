@@ -1,6 +1,6 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：162 项 library（含邀请接受、Owner/Member 登录、邀请与账号 HTML/JSON 管理、Connection revoke 与中断恢复、Access Key create/rotate/revoke/grants、CSRF/所有权约束和一次性 credential）、4 项 HTTP 安全与 managed-draft 契约测试、5 项 REST/MCP 契约测试，共 171 项；并已运行 `cargo fmt --check`、`cargo check --all-targets --all-features --locked`、`cargo clippy --all-targets --all-features -- -D warnings`。未执行部署、真实 Google 或浏览器 smoke。
+本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：169 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端无内容审计和保留期清理）、4 项 HTTP 安全与 managed-draft 契约测试、5 项 REST/MCP 契约测试，共 178 项；并已运行 `cargo fmt --check`、`cargo check --all-targets --all-features --locked`、`cargo clippy --all-targets --all-features -- -D warnings`。未执行部署、真实 Google 或浏览器 smoke。
 
 ## A. 尚未实现，因此目前无法执行的测试
 
@@ -41,8 +41,8 @@
 
 ### A6. 限流、审计、账号撤销与清理
 
-- 缺口：限流窗口、4 路读取并发、send-unknown refund、无内容 AuditEvent、repository 写入和完整账号撤销编排已实现；rate bucket 数据库读写、transport 接入及 30 天清理尚未完成。
-- 实现后测试：冻结时间并跨重启验证 120/min、30 prepare/hour、10/hour、50/day、20 recipients；账号/key/grant/Connection revoke 的并发请求立即失败；审计字段白名单快照。
+- 已实现：4 路读取并发、20 收件人限制、跨重启 SQLite 固定窗口、REST/MCP 120/key/min、30 prepare/key/hour、10 send/Connection/hour、50 send/Connection/day、原子小时/日预占、重放/无效/明确失败返还、unknown 保留占用、429 header/body retry 秒数、机器端 search/prepare/send 无内容审计，以及可配置保留期的启动/每小时清理。
+- 剩余缺口：control-plane mutation/OAuth 审计接线及并发撤销压力测试。
 - 命令目标：`cargo test --test security_flows --all-features`。
 - 通过标准：429 含 retry seconds；日志/审计不包含地址、主题、正文、snippet、附件名、查询或任何 token。
 
