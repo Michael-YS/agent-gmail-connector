@@ -40,7 +40,10 @@
 28. `a303a2d test(mcp): lock transport contract snapshots`
 29. `425f760 docs: clarify mcp endpoint migration`
 30. `d265b16 feat(mcp): align canonical streamable endpoint`
-31. 当前工作区干净；剩余为真实 client、部署与 Google 外部验收。
+31. `a7b2abe build: adopt aws-lc jwt backend and audit guards`
+32. `544bbc7 feat(connections): surface reauth_required across machine APIs`
+33. `637dc3f feat(control): add json connection reauthorize endpoint`
+34. `e10064d ops: add bounded gmail smoke script`
 
 ## 当前实现断点
 
@@ -65,7 +68,10 @@
 - 邀请接受以 POST body 中的一次性 token 启动 Login OAuth；token 仅以 SHA-256 hash 绑定到 OAuth transaction，callback 仅以已验证、规范化 email 和精确 Google `sub` 原子接受邀请、创建 Member 与 session。重放、错误 email、过期或撤销邀请均不创建 session。
 - 常规 Google Login 会以精确 Google `sub` 与规范化 verified email 登录既有 active Owner 或 Member；没有既有用户时才保留首次 Owner bootstrap 规则。
 - Owner JSON API 已接入：`GET/POST /control/api/invitations`、`POST /control/api/invitations/{id}/revoke`、`POST /control/api/invitations/{id}/regenerate`；HTML 保留 `/control/invitations...`。mutation 要求 Owner session+CSRF，列表不返回 hash，create/regenerate token 只返回一次并 `Cache-Control: no-store`。
-- 最新本地完整验证：188 个 library tests、4 个 HTTP tests、15 个 REST/MCP tests，共 207 项；`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo test --all-targets --all-features --locked` 已通过。未执行部署、真实 Google 或浏览器 smoke。
+- Connection 生命周期新增机器端可感知的 reauth 分类：Gmail API 401 或 Google refresh `invalid_grant` 会把 Connection 原子标记为 `reauth_required`（`invalid_grant` 在凭证提供方内持久化；Gmail 401 由 adapter 经 `mark_reauth_required` 持久化并清除内存 token）。REST 对 grant 仍有效但状态为 `reauth_required` 的 Connection 返回 403 `reauth_required`（owner 不匹配或无 grant 仍是统一 403 `forbidden`，grant 检查改用与连接状态无关的 `access_key_grant_exists`）；MCP JSON-RPC 兼容面映射为 -32005，rmcp Streamable 桥按错误类别透传；发送失败 outcome 新增 `reauth_required`（401 不可能已投递，不做 Sent 对账）。
+- 新增 JSON 控制面入口 `POST /control/api/connections/{connection_id}/reauthorize`：Owner/Member 的有效 session + CSRF，缺失或他人连接返回 404 `connection_not_found`，`revoking` 状态返回 409 `connection_revoking`，Active/`reauth_required` 均可发起；成功返回 `authorize_url` 与 Gmail transaction cookie（`Cache-Control: no-store`），并以 `connection.reauthorize` 记录无内容审计。HTML `/control/account` 流程不变。
+- 新增 `scripts/smoke-gmail.sh`（垃圾邮箱 + 单收件人 allowlist 的真实 Gmail smoke 入口，默认 prepare-only，`--send` 需交互确认）。
+- 最新本地完整验证：193 个 library tests、4 个 HTTP tests、16 个 REST/MCP tests，共 213 项；`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo test --all-targets --all-features --locked` 已通过。`cargo audit 0.22.2 --ignore RUSTSEC-2023-0071` 通过，且 `cargo tree --target all --all-features -i rsa` 证明 rsa 仅存在于未启用的 sqlx-mysql 可选分支；`cargo deny 0.20.2` 的 advisory/license/source 检查通过（仅 duplicate-version warnings）。未执行部署、真实 Google 或浏览器 smoke。
 
 ## 剩余实现里程碑
 
@@ -91,9 +97,8 @@
 
 ### 4. 连接生命周期
 
-- 已完成 Connection revoke JSON/HTML 入口、Google token revoke、本地凭证清除和启动恢复；真实 Google 撤销仍待 smoke。
-- 凭证失效后的重新授权恢复流程。
-- reconciliation、连接状态刷新和异常恢复。
+- 已完成 Connection revoke JSON/HTML 入口、Google token revoke、本地凭证清除和启动恢复；`reauth_required` 已持久化并在 REST/MCP 以独立错误码暴露，JSON reauthorize 入口已接入；真实 Google 撤销仍待 smoke。
+- reconciliation、周期性连接状态刷新仍未实现（v1 边界允许：只在请求路径按需检测 401/invalid_grant 并标记，无后台探测）。
 
 ### 5. 文档与发布验证
 

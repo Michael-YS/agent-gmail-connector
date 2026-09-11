@@ -1,19 +1,19 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：188 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端及控制面/OAuth 无内容审计、并发撤销压力测试和保留期清理、Gmail thread/attachment/draft read、reply-all、HTTP multipart 与 MCP base64 草稿附件、持久化 REST/MCP 创建幂等性、MCP JSON-RPC 错误审计分类、rmcp Streamable HTTP 草稿幂等性、内容协商、Host rebinding 及无状态协议负向测试）、4 项 HTTP 安全与 managed-draft 契约测试、15 项 REST/MCP 契约测试，共 207 项；并已运行 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets --all-features --locked`。未执行部署、真实 Google 或浏览器 smoke。
+本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：193 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端及控制面/OAuth 无内容审计、并发撤销压力测试和保留期清理、Gmail thread/attachment/draft read、reply-all、HTTP multipart 与 MCP base64 草稿附件、持久化 REST/MCP 创建幂等性、MCP JSON-RPC 错误审计分类、rmcp Streamable HTTP 草稿幂等性、内容协商、Host rebinding 及无状态协议负向测试、Gmail 401/invalid_grant → `reauth_required` 持久化与 REST/MCP 独立错误码、JSON reauthorize 入口）、4 项 HTTP 安全与 managed-draft 契约测试、16 项 REST/MCP 契约测试，共 213 项；并已运行 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets --all-features --locked`。未执行部署、真实 Google 或浏览器 smoke。
 
 ## A. 尚未实现，因此目前无法执行的测试
 
 ### A1. Google OIDC 登录与邀请制 control plane
 
-- 已实现：真实 RS256/JWKS verifier、flow-scoped 单次 callback、Owner/Member session、邀请 API/HTML、Member Connection/Access Key HTML、账号自删与 Owner revoke。管理 JSON API 使用 `/control/api/...`，HTML 使用 `/control/...`。剩余外部缺口：真实 Google 浏览器登录、连接/重新授权和账号撤销 smoke。
+- 已实现：真实 RS256/JWKS verifier、flow-scoped 单次 callback、Owner/Member session、邀请 API/HTML、Member Connection/Access Key HTML、账号自删与 Owner revoke、JSON reauthorize 入口（`POST /control/api/connections/{id}/reauthorize`）。管理 JSON API 使用 `/control/api/...`，HTML 使用 `/control/...`。剩余外部缺口：真实 Google 浏览器登录、连接/重新授权和账号撤销 smoke。
 - 实现后测试：用 fake OIDC server 覆盖成功、错误 state/nonce、错误 issuer/audience、过期 token、未验证 email、邀请 email 不一致、邀请重放、session idle/absolute expiry 和 CSRF；再用 Dev Project 浏览器登录。
 - 命令目标：`cargo test --test oidc_contract --all-features`。
 - 通过标准：所有失败在创建用户/session 前被拒绝；数据库和日志不出现 authorization code、state、nonce、access token 或 ID token。
 
 ### A2. Gmail OAuth Connection 与真实 Google adapter
 
-- 已实现：offline consent、完整 scope 校验、Connection callback、加密 refresh token、single-flight access-token cache、`invalid_grant` reauth、production Gmail adapter、Connection revoke JSON/HTML 与 Google token revoke。Member 账号和独立 Connection 撤销都会在启动时恢复中断状态。剩余缺口：真实 Gmail smoke。
+- 已实现：offline consent、完整 scope 校验、Connection callback、加密 refresh token、single-flight access-token cache、`invalid_grant` reauth、production Gmail adapter、Connection revoke JSON/HTML 与 Google token revoke。Member 账号和独立 Connection 撤销都会在启动时恢复中断状态。Gmail 401/refresh `invalid_grant` 现在都会持久化 `reauth_required` 并以独立错误码暴露（REST 403 `reauth_required`、JSON-RPC -32005、rmcp 透传类别），JSON reauthorize 入口已接入。剩余缺口：真实 Gmail smoke（入口脚本 `scripts/smoke-gmail.sh` 已存在，见 B6）。
 - 实现后测试：fake Google server 覆盖部分授权、refresh、invalid_grant、429/5xx/Retry-After、timeout、revoke；Dev 账号完成连接、搜索、读取、线程和附件流。
 - 命令目标：`cargo test --test gmail_adapter --all-features`，以及人工 `scripts/smoke-gmail.sh --prepare-only`。
 - 通过标准：缺少 `gmail.readonly` 或 `gmail.compose` 不创建 Connection；refresh token 仅以 XChaCha20-Poly1305 envelope 入库；查询和邮件内容不进日志。
@@ -56,10 +56,10 @@
 
 ### B1. cargo-audit 与 cargo-deny
 
-- 前置条件：安装 `cargo-audit`、`cargo-deny` 并允许访问 advisory/index。
-- 命令：`cargo audit --locked`; `cargo deny check`。
+- 前置条件：安装 `cargo-audit 0.22.2`、`cargo-deny 0.20.2` 并允许访问 advisory/index。
+- 命令：先运行 `cargo tree --locked --target all --all-features -i rsa`，确认 SQLite-only 构建不解析 rsa；再运行 `cargo audit --ignore RUSTSEC-2023-0071`; `cargo deny check`（`cargo audit` 不提供 `--locked` 选项；构建检查仍使用 `--locked`）。
 - 期望：无未处理 advisory、许可证或来源违规。
-- 当前原因：本机未安装这两个 cargo 子命令；CI 已配置执行。
+- 当前结果：已将 `jsonwebtoken 11` 的密码学后端切到 `aws_lc_rs`，运行时依赖图不再包含 rsa；Cargo.lock 仍记录 sqlx-mysql 的未启用可选依赖，因此 CI/release 对 `RUSTSEC-2023-0071` 使用带原因的窄例外，并用 `cargo tree` 守卫确保 rsa 不可达。`cargo-audit 0.22.2 --ignore RUSTSEC-2023-0071` 通过；`cargo-deny 0.20.2` 的 advisory/license/source 检查通过，保留 duplicate-version warnings。该例外必须在启用 MySQL 或更换 JWT 后端时重新审查。
 
 ### B2. Docker/Compose 与容器安全
 
@@ -93,5 +93,5 @@
 ### B6. Google Dev/Prod 与真实 Gmail smoke
 
 - 前置条件：Dev/Prod Cloud Projects、测试 Gmail、正确 OAuth clients/scopes/callbacks、明确的测试收件 allowlist。
-- 方法：完成 A1-A6 后登录、连接 Gmail、创建带 `[AgentMail E2E <run-id>]` 的 managed draft，默认只执行 prepare；人工核对 preview 后才确认发送到测试账号自身。
+- 方法：完成 A1-A6 后登录、连接 Gmail，运行 `scripts/smoke-gmail.sh`（默认 prepare-only，创建带 `[AgentMail E2E <run-id>]` 的单个 managed draft）；人工核对 preview 后用 `--send` 交互确认发送到测试账号自身。
 - 期望：只产生一个预期草稿/邮件，不改既有标签或已读状态；token 加密入库；所有 revoke 立即切断本地权限。

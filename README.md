@@ -143,8 +143,8 @@ chmod 0755 scripts/backup.sh scripts/migrate.sh
 - `/mcp-streamable` rmcp Streamable HTTP 临时别名
 - `/health/live`、`/health/ready`
 
-机器接口只接受 `Authorization: Bearer amk_<public-id>.<secret>`，显式拒绝 query-string token；每次 Connection 操作都检查 owner、状态与 grant。所有响应生成 request ID，并设置 CSP、`nosniff`、`no-referrer`、`no-store` 等安全头。
+机器接口只接受 `Authorization: Bearer amk_<public-id>.<secret>`，显式拒绝 query-string token；每次 Connection 操作都检查 owner、状态与 grant。Connection 的 Google 凭证失效（Gmail 401 或 refresh `invalid_grant`）会被持久化为 `reauth_required`，机器接口对 grant 仍有效但需要重新授权的 Connection 返回 REST 403 `reauth_required` / JSON-RPC -32005，与统一拒绝的 403 `forbidden` 可区分。所有响应生成 request ID，并设置 CSP、`nosniff`、`no-referrer`、`no-store` 等安全头。
 
 连接撤销：HTML 使用 `/control/account`，JSON 使用 `POST /control/api/connections/{connection_id}/revoke`；Owner 或 Member 只能操作自己的连接。先原子切断本地 grants、发送确认与待处理重授权，再尝试撤销 Google token；最后删除本地连接、加密凭证及受管草稿记录，保留 Gmail 中的邮件和草稿。远端未确认时需在 Google 账号授权页检查。
 
-Member 可在 `/control/account` 连接或重新授权 Gmail、撤销连接、创建/轮换/撤销 Access Key、原子更新 grants，并删除自己的 AgentMail 账号。Owner 可从 `/control/members` 撤销 Member。账号撤销会立即失效 session、Access Key、grant、发送确认与 OAuth transaction，然后逐个尝试撤销 Google token 并删除本地用户数据；不会删除 Gmail 数据。启动时会恢复中断的 `revoking` Member，历史 Gmail 授权计数保持单调。Owner 账号不能通过控制面删除或降级。
+Member 可在 `/control/account` 连接或重新授权 Gmail（JSON 入口为 `POST /control/api/connections/{connection_id}/reauthorize`，返回 authorize URL 与 transaction cookie）、撤销连接、创建/轮换/撤销 Access Key、原子更新 grants，并删除自己的 AgentMail 账号。Owner 可从 `/control/members` 撤销 Member。账号撤销会立即失效 session、Access Key、grant、发送确认与 OAuth transaction，然后逐个尝试撤销 Google token 并删除本地用户数据；不会删除 Gmail 数据。启动时会恢复中断的 `revoking` Member，历史 Gmail 授权计数保持单调。Owner 账号不能通过控制面删除或降级。
