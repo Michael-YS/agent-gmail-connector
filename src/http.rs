@@ -783,19 +783,26 @@ async fn list_drafts(
     headers: HeaderMap,
     uri: axum::http::Uri,
 ) -> Response {
+    let started = Instant::now();
     let cid = ConnectionId::from_uuid(cid);
-    if authorize(&headers, uri.query(), &state, cid).await.is_err() {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "access denied",
-            &headers,
-        );
-    }
-    match draft_list_payload(&state, cid).await {
+    let context = match authorize(&headers, uri.query(), &state, cid).await {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let response = match draft_list_payload(&state, cid).await {
         Ok(payload) => ok_json(payload, &headers),
         Err(e) => adapter_response(e, &headers),
-    }
+    };
+    audit_response(
+        &state,
+        &headers,
+        context,
+        Some(cid),
+        AuditOperation::DraftsList,
+        started,
+        response,
+    )
+    .await
 }
 async fn get_draft(
     Path((cid, did)): Path<(Uuid, String)>,
@@ -803,19 +810,26 @@ async fn get_draft(
     headers: HeaderMap,
     uri: axum::http::Uri,
 ) -> Response {
+    let started = Instant::now();
     let cid = ConnectionId::from_uuid(cid);
-    if authorize(&headers, uri.query(), &state, cid).await.is_err() {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "access denied",
-            &headers,
-        );
-    }
-    match draft_get_payload(&state, cid, &did).await {
+    let context = match authorize(&headers, uri.query(), &state, cid).await {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let response = match draft_get_payload(&state, cid, &did).await {
         Ok(payload) => ok_json(payload, &headers),
         Err(e) => adapter_response(e, &headers),
-    }
+    };
+    audit_response(
+        &state,
+        &headers,
+        context,
+        Some(cid),
+        AuditOperation::DraftsGet,
+        started,
+        response,
+    )
+    .await
 }
 
 async fn draft_list_payload(
