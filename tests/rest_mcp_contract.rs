@@ -161,6 +161,132 @@ async fn rest_and_mcp_draft_reads_share_auth_and_adapter() {
 }
 
 #[tokio::test]
+async fn mcp_thread_and_bounded_base64_attachment_reads_use_mailbox_service() {
+    let (state, credential, connection, adapter) = AppState::test_fixture_with_adapter();
+    let message = agentmail::adapter::MailMessage {
+        metadata: agentmail::domain::mailbox::MessageMetadata {
+            id: "message-1".into(),
+            thread_id: Some("thread-1".into()),
+            sent_at: None,
+            from: None,
+            to: vec![],
+            cc: vec![],
+            subject: "untrusted subject".into(),
+            snippet: "untrusted snippet".into(),
+            attachments: vec![],
+        },
+        body: "untrusted body".into(),
+        body_is_html: false,
+        html_body: None,
+        headers: vec![],
+    };
+    adapter.insert_message(connection, message).await;
+    adapter
+        .insert_attachment(
+            connection,
+            "message-1",
+            agentmail::adapter::MailAttachment {
+                info: agentmail::domain::mailbox::AttachmentInfo {
+                    id: "attachment-1".into(),
+                    filename: "report.txt".into(),
+                    content_type: "text/plain".into(),
+                    size_bytes: 5,
+                    inline: false,
+                },
+                data: b"hello".to_vec(),
+                inline_content_id: None,
+            },
+        )
+        .await;
+
+    let thread = build_router(state.clone())
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(mcp_request(
+                    "tools/call",
+                    7,
+                    json!({"name":"threads.get","arguments":{"connection_id":connection,"thread_id":"thread-1"}}),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let thread = response_json(thread).await;
+    assert_eq!(
+        thread["result"]["structuredContent"]["messages"][0]["body"],
+        "untrusted body"
+    );
+    assert_eq!(
+        thread["result"]["structuredContent"]["untrusted_email_content"],
+        true
+    );
+
+    let attachment = build_router(state.clone())
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(mcp_request(
+                    "tools/call",
+                    8,
+                    json!({"name":"messages.get_attachment","arguments":{"connection_id":connection,"message_id":"message-1","attachment_id":"attachment-1"}}),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let attachment = response_json(attachment).await;
+    assert_eq!(
+        attachment["result"]["structuredContent"]["data_base64"],
+        "aGVsbG8="
+    );
+    assert_eq!(
+        attachment["result"]["structuredContent"]["untrusted_attachment_data"],
+        true
+    );
+
+    adapter
+        .insert_attachment(
+            connection,
+            "message-1",
+            agentmail::adapter::MailAttachment {
+                info: agentmail::domain::mailbox::AttachmentInfo {
+                    id: "attachment-large".into(),
+                    filename: "large.bin".into(),
+                    content_type: "application/octet-stream".into(),
+                    size_bytes: 4 * 1024 * 1024 + 1,
+                    inline: false,
+                },
+                data: vec![0; 4 * 1024 * 1024 + 1],
+                inline_content_id: None,
+            },
+        )
+        .await;
+    let too_large = build_router(state)
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(mcp_request(
+                    "tools/call",
+                    9,
+                    json!({"name":"messages.get_attachment","arguments":{"connection_id":connection,"message_id":"message-1","attachment_id":"attachment-large"}}),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let too_large = response_json(too_large).await;
+    assert_eq!(too_large["error"]["code"], -32602);
+    assert_eq!(
+        too_large["error"]["message"],
+        "attachment exceeds 4 MiB MCP limit"
+    );
+}
+
+#[tokio::test]
 async fn openapi_describes_search_security_and_safe_contract() {
     let response = build_router(AppState::empty())
         .oneshot(
@@ -210,6 +336,22 @@ async fn mcp_tools_list_exposes_search_schema_and_compatibility_note() {
         json!(["connection_id"])
     );
     let tools = value["result"]["tools"].as_array().unwrap();
+    let thread_get = tools
+        .iter()
+        .find(|tool| tool["name"] == "threads.get")
+        .unwrap();
+    assert_eq!(
+        thread_get["inputSchema"]["required"],
+        json!(["connection_id", "thread_id"])
+    );
+    let attachment_get = tools
+        .iter()
+        .find(|tool| tool["name"] == "messages.get_attachment")
+        .unwrap();
+    assert_eq!(
+        attachment_get["inputSchema"]["required"],
+        json!(["connection_id", "message_id", "attachment_id"])
+    );
     let drafts_list = tools
         .iter()
         .find(|tool| tool["name"] == "drafts.list")

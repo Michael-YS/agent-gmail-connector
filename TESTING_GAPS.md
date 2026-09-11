@@ -34,7 +34,7 @@
 
 ### A5. 完整 REST OpenAPI 与 rmcp schema
 
-- 缺口：OpenAPI 已描述消息搜索且 REST/MCP 复用认证、grant 与 `MailboxReadService`，最小 JSON-RPC 已实现 `messages.search`、`messages.get`、`drafts.list` 和 `drafts.get`；其余 REST paths/tools、rmcp Streamable HTTP、session lifecycle 与 schema snapshot 尚未实现。
+- 缺口：OpenAPI 已描述消息搜索且 REST/MCP 复用认证、grant 与 `MailboxReadService`，最小 JSON-RPC 已实现 `messages.search`、`messages.get`、`threads.get`、有 4 MiB 上限的 `messages.get_attachment`、`drafts.list` 和 `drafts.get`；其余 REST paths/tools、rmcp Streamable HTTP、session lifecycle 与 schema snapshot 尚未实现。
 - 实现后测试：导出 OpenAPI/MCP schema，运行 snapshot 与真实 MCP client；比较 HTTP/MCP 的领域字段和错误码。
 - 命令目标：`cargo test --test transport_contract --all-features`，`cargo test --test mcp_schema --all-features`。
 - 通过标准：tools 标明邮件内容不可信和发送需用户许可；MCP 与 REST 共享认证、grant、状态机和审计逻辑。
