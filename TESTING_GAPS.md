@@ -1,6 +1,6 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：178 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端及控制面/OAuth 无内容审计和保留期清理、Gmail thread/attachment/draft read、reply-all、HTTP multipart 与 MCP base64 草稿附件、持久化创建幂等性）、4 项 HTTP 安全与 managed-draft 契约测试、9 项 REST/MCP 契约测试，共 191 项；并已运行 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets`。未执行部署、真实 Google 或浏览器 smoke。
+本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：183 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端及控制面/OAuth 无内容审计、并发撤销压力测试和保留期清理、Gmail thread/attachment/draft read、reply-all、HTTP multipart 与 MCP base64 草稿附件、持久化 REST/MCP 创建幂等性、rmcp Streamable HTTP skeleton）、4 项 HTTP 安全与 managed-draft 契约测试、13 项 REST/MCP 契约测试，共 200 项；并已运行 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets`。未执行部署、真实 Google 或浏览器 smoke。
 
 ## A. 尚未实现，因此目前无法执行的测试
 
@@ -32,9 +32,9 @@
 - 命令目标：`cargo test --test mime_and_drafts --all-features`。
 - 通过标准：非 managed draft 只能读取；版本变化返回 `409 draft_changed`；超时不自动重发，无法对账进入 `send_state_unknown`。
 
-### A5. 完整 REST OpenAPI 与 rmcp schema
+### A5. MCP Streamable HTTP 与 rmcp schema
 
-- 缺口：OpenAPI 已描述消息搜索且 REST/MCP 复用认证、grant 与 `MailboxReadService`，最小 JSON-RPC 已实现 `messages.search`、`messages.get`、`threads.get`、有 4 MiB 上限的 `messages.get_attachment`、`drafts.list`、`drafts.get` 和带 4 MiB base64 小附件的 `drafts.create`；其余 REST paths/tools、rmcp Streamable HTTP、session lifecycle 与 schema snapshot 尚未实现。
+- OpenAPI 已覆盖全部现有 REST 路由、参数、JSON/multipart 请求体、二进制附件响应、统一错误响应和 bearer 安全。兼容 JSON-RPC 已实现当前全部草稿读写工具；`/mcp-streamable` 已接入官方 rmcp 无状态 Streamable HTTP，并暴露同一工具 schema，当前所有工具通过受控兼容 bridge，草稿创建按 JSON-RPC 调用生成稳定的持久化幂等键。审计包装已覆盖已知 `tools/call` 操作且不读取邮件内容；剩余为原生迁移全部工具、session/协议负向测试、schema snapshot，以及是否将兼容端点切换为 `/mcp` 的决策。
 - 实现后测试：导出 OpenAPI/MCP schema，运行 snapshot 与真实 MCP client；比较 HTTP/MCP 的领域字段和错误码。
 - 命令目标：`cargo test --test transport_contract --all-features`，`cargo test --test mcp_schema --all-features`。
 - 通过标准：tools 标明邮件内容不可信和发送需用户许可；MCP 与 REST 共享认证、grant、状态机和审计逻辑。
@@ -42,7 +42,7 @@
 ### A6. 限流、审计、账号撤销与清理
 
 - 已实现：4 路读取并发、20 收件人限制、跨重启 SQLite 固定窗口、REST/MCP 120/key/min、30 prepare/key/hour、10 send/Connection/hour、50 send/Connection/day、原子小时/日预占、重放/无效/明确失败返还、unknown 保留占用、429 header/body retry 秒数、机器端及 control-plane mutation/OAuth transition 无内容审计，以及可配置保留期的启动/每小时清理。
-- 剩余缺口：并发撤销压力测试。
+- 本地实现与并发撤销压力测试已完成；剩余外部中断/Google 验收见 B0 与 B6。
 - 命令目标：`cargo test --test security_flows --all-features`。
 - 通过标准：429 含 retry seconds；日志/审计不包含地址、主题、正文、snippet、附件名、查询或任何 token。
 
@@ -88,7 +88,7 @@
 - 前置条件：GitHub Actions/GHCR 权限和版本 tag。
 - 方法：发布 `vX.Y.Z`，核对 `X.Y.Z`、`X.Y`、`latest`、commit SHA 标签；下载 SBOM，验证 provenance/attestation 和 keyless signature；在干净 amd64 主机按 digest 拉取。
 - 期望：产物与 commit/digest 一致，镜像不含 `.env`、OAuth secret、keyring 或测试凭据。
-- 当前原因：仓库 CI 只做验证/构建/扫描，release workflow 尚未实现。
+- 当前结果：已新增 tag-triggered GHCR workflow（先执行 locked fmt/check/clippy/test、cargo-audit/deny 和 amd64 镜像漏洞扫描，再进行固定 action SHA 的构建、SPDX SBOM、provenance/SBOM attestations、cosign keyless sign/verify）；尚未在真实 GitHub tag 上执行，因此下载产物、签名身份和干净主机 digest 拉取仍待外部验收。
 
 ### B6. Google Dev/Prod 与真实 Gmail smoke
 

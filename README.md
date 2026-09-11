@@ -1,8 +1,8 @@
 # AgentMail
 
-AgentMail 是一个面向 agent 的 Gmail 安全访问层。当前仓库已经实现 Rust/Axum 服务骨架、SQLite schema 与显式迁移、secret 文件加载、refresh token 信封加密、Access Key/grant 领域模型、OAuth/OIDC 的 state/nonce/PKCE 与 claims 语义核心、固定 callback 的 Google token exchange/refresh client、原子 Owner bootstrap、既有 active Owner/Member 的精确 Google `sub`+规范化 verified email 登录、hash-only web session/control-plane 应用服务、一次性邀请制与 Google 双 client 安全配置、SQLite repository、跨重启固定窗口限流、机器端无内容审计与自动保留期清理、共享 mailbox 读取服务、带响应上限和 MIME 安全处理的 Gmail HTTP client、REST 消息搜索 OpenAPI、最小 MCP JSON-RPC 搜索工具、managed draft、持久化两阶段发送状态机、稳定 Message-ID Sent 对账，以及带双重 25 MiB 限制的安全 MIME 构建层。
+AgentMail 是一个面向 agent 的 Gmail 安全访问层。当前仓库已经实现 Rust/Axum 服务骨架、SQLite schema 与显式迁移、secret 文件加载、refresh token 信封加密、Access Key/grant 领域模型、OAuth/OIDC 的 state/nonce/PKCE 与 claims 语义核心、固定 callback 的 Google token exchange/refresh client、原子 Owner bootstrap、既有 active Owner/Member 的精确 Google `sub`+规范化 verified email 登录、hash-only web session/control-plane 应用服务、一次性邀请制与 Google 双 client 安全配置、SQLite repository、跨重启固定窗口限流、机器端及控制面无内容审计与自动保留期清理、共享 mailbox 读取服务、带响应上限和 MIME 安全处理的 Gmail HTTP client、完整现有 REST 路由 OpenAPI、MCP JSON-RPC 读取与草稿全流程工具、managed draft、持久化两阶段发送状态机、稳定 Message-ID Sent 对账，以及带双重 25 MiB 限制的安全 MIME 构建层。
 
-重要：当前版本仍不是可投入生产的完整 v1。真实 OIDC/OAuth、加密 refresh token、REST 邮件读取、managed draft 和安全发送、Owner 邀请/成员管理、Member 连接与 Access Key 管理及账号删除已接入 `serve`。HTML 页面使用 `/control/...`，JSON 管理 API 使用 `/control/api/...`，避免路由冲突。邀请、session、Access Key 和发送确认明文均不进入数据库；create/rotate 只显示一次并 `no-store`。完整 MCP Streamable HTTP/rmcp、HTTP multipart 附件入口、发布供应链和真实 Google/浏览器 smoke 仍未完成，详见 [TESTING_GAPS.md](TESTING_GAPS.md)。在剩余安全验收完成前，不要把本仓库部署为真实邮件服务。
+重要：当前版本仍不是可投入生产的完整 v1。真实 OIDC/OAuth、加密 refresh token、REST 邮件读取、managed draft 和安全发送、Owner 邀请/成员管理、Member 连接与 Access Key 管理及账号删除已接入 `serve`。HTML 页面使用 `/control/...`，JSON 管理 API 使用 `/control/api/...`，避免路由冲突。邀请、session、Access Key 和发送确认明文均不进入数据库；create/rotate 只显示一次并 `no-store`。`/mcp` 保留兼容 JSON-RPC 全工具面；`/mcp-streamable` 已接入官方 rmcp 无状态 Streamable HTTP，当前全部工具通过受控兼容 bridge 复用认证、限流、领域状态机和元数据审计。发布供应链 workflow 已加入，并在推送前置验证 job 中执行 locked fmt/check/clippy/test、cargo-audit/deny 和 amd64 镜像漏洞扫描，但真实 GitHub tag、Google/浏览器 smoke 和完整 rmcp 原生迁移仍未完成；HTTP JSON/multipart 草稿附件入口与 MCP 4 MiB Base64 小附件已实现，详见 [TESTING_GAPS.md](TESTING_GAPS.md)。在剩余安全验收完成前，不要把本仓库部署为真实邮件服务。
 
 ## 本地验证
 
@@ -137,8 +137,9 @@ chmod 0755 scripts/backup.sh scripts/migrate.sh
 
 - `/`、`/privacy`、`/terms`、`/data-deletion`
 - `/api`、`/api/openapi.json`
-- `/api/v1/...` REST 路由骨架
-- `/mcp` JSON-RPC 骨架
+- `/api/v1/...` REST 路由与 `/api/openapi.json`
+- `/mcp` JSON-RPC 兼容面（消息/线程/附件读取与草稿全流程）
+- `/mcp-streamable` rmcp 无状态 Streamable HTTP（当前工具通过兼容 bridge）
 - `/health/live`、`/health/ready`
 
 机器接口只接受 `Authorization: Bearer amk_<public-id>.<secret>`，显式拒绝 query-string token；每次 Connection 操作都检查 owner、状态与 grant。所有响应生成 request ID，并设置 CSP、`nosniff`、`no-referrer`、`no-store` 等安全头。

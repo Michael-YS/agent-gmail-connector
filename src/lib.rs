@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 pub mod adapter;
 pub mod config;
 pub mod control_http;
@@ -16,6 +18,7 @@ pub mod http;
 pub mod invitations;
 pub mod live_gmail_adapter;
 pub mod mailbox_service;
+pub mod mcp_rmcp;
 pub mod mime;
 pub mod oauth;
 pub mod repository;

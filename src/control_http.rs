@@ -1129,11 +1129,31 @@ where
     V: OidcTokenVerifier,
     E: OAuthCodeExchanger,
 {
-    let Some(revocation) = state
-        .repository
-        .begin_connection_revoke(owner_id, connection_id)
-        .await?
-    else {
+    revoke_connection_account_with_mode(state, owner_id, connection_id, true).await
+}
+
+async fn revoke_connection_account_with_mode<V, E>(
+    state: &ControlHttpState<V, E>,
+    owner_id: UserId,
+    connection_id: ConnectionId,
+    claim_active: bool,
+) -> Result<Option<&'static str>, RepositoryError>
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let revocation = if claim_active {
+        state
+            .repository
+            .claim_connection_revoke(owner_id, connection_id)
+            .await?
+    } else {
+        state
+            .repository
+            .begin_connection_revoke(owner_id, connection_id)
+            .await?
+    };
+    let Some(revocation) = revocation else {
         return Ok(None);
     };
     let remote_status = match revocation.refresh_token_envelope {
@@ -1339,7 +1359,7 @@ where
         }
     }
     for (owner_id, connection_id) in state.repository.list_revoking_connections().await? {
-        if revoke_connection_account(state, owner_id, connection_id)
+        if revoke_connection_account_with_mode(state, owner_id, connection_id, false)
             .await?
             .is_some()
         {
@@ -1940,7 +1960,9 @@ mod tests {
         database::Database,
         domain::{
             access::AccessKey,
-            identity::{GMAIL_COMPOSE_SCOPE, GMAIL_READONLY_SCOPE, SessionId, User, UserRole},
+            identity::{
+                GMAIL_COMPOSE_SCOPE, GMAIL_READONLY_SCOPE, SessionId, User, UserRole, UserStatus,
+            },
         },
         repository::NewWebSession,
     };
@@ -2019,6 +2041,18 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
     }
 
+    /// A deterministic remote-revoke stand-in. It pauses after the local
+    /// barrier commits so authorization reads can be stressed before cleanup.
+    #[derive(Clone)]
+    struct BlockingRevokeExchanger {
+        repository: Repository,
+        user_id: Option<UserId>,
+        connection_ids: Vec<ConnectionId>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
     #[async_trait]
     impl OAuthCodeExchanger for RejectedRevoke {
         async fn exchange_code(
@@ -2082,6 +2116,291 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    #[async_trait]
+    impl OAuthCodeExchanger for BlockingRevokeExchanger {
+        async fn exchange_code(
+            &self,
+            _: &str,
+            _: &SecretString,
+        ) -> Result<TokenSet, GoogleTokenError> {
+            unreachable!()
+        }
+
+        async fn revoke(&self, _: &SecretString) -> Result<(), GoogleTokenError> {
+            if let Some(user_id) = self.user_id {
+                assert_eq!(
+                    self.repository
+                        .get_user(user_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    UserStatus::Revoking,
+                    "the account must be locally revoked before a remote call"
+                );
+            }
+            for connection_id in &self.connection_ids {
+                assert_eq!(
+                    self.repository
+                        .get_connection(*connection_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    ConnectionStatus::Revoking,
+                    "every affected connection must be locally revoked before a remote call"
+                );
+            }
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_connection_revoke_pressure_denies_local_access_before_remote_cleanup() {
+        let (_, repository, user, connection, _, _) = key_fixture(UserRole::Member).await;
+        let created = AccessKey::generate(user.id, "pressure-key", [connection.id]).unwrap();
+        let credential = created.credential.clone();
+        let key = repository.insert_access_key(&created).await.unwrap();
+        let config = test_config();
+        let envelope = EncryptedRefreshToken::from_envelope(
+            encrypt_refresh_token(
+                b"connection-pressure-refresh",
+                &user.id.to_string(),
+                &connection.id.to_string(),
+                &config.encryption_keyring,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        repository
+            .update_refresh_token_envelope(connection.id, Some(&envelope))
+            .await
+            .unwrap();
+        let exchanger = BlockingRevokeExchanger {
+            repository: repository.clone(),
+            user_id: None,
+            connection_ids: vec![connection.id],
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let state = ControlHttpState::new(
+            config,
+            repository.clone(),
+            UnusedVerifier,
+            exchanger.clone(),
+            exchanger.clone(),
+        )
+        .unwrap();
+
+        let entered = exchanger.entered.notified();
+        let state_for_revoke = state.clone();
+        let first = tokio::spawn(async move {
+            revoke_connection_account(&state_for_revoke, user.id, connection.id).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered)
+            .await
+            .expect("remote revoke should be reached");
+
+        let state_for_second_revoke = state.clone();
+        let second = tokio::spawn(async move {
+            revoke_connection_account(&state_for_second_revoke, user.id, connection.id).await
+        });
+
+        let mut pressure = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let repository = repository.clone();
+            let credential = credential.clone();
+            pressure.spawn(async move {
+                let key = repository
+                    .authenticate_access_key(&credential)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!key.allows(connection.id));
+                assert!(
+                    repository
+                        .list_active_connections_for_access_key(key.id, user.id)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            });
+        }
+        exchanger.release.notify_one();
+        while let Some(result) = pressure.join_next().await {
+            result.unwrap();
+        }
+        assert_eq!(first.await.unwrap().unwrap(), Some("revoked"));
+        assert_eq!(second.await.unwrap().unwrap(), None);
+        assert_eq!(exchanger.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            repository
+                .get_connection(connection.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository
+                .list_active_connections_for_access_key(key.id, user.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_account_revoke_pressure_invalidates_every_local_record_before_remote_cleanup()
+     {
+        let (_, repository, member, connection, session, _) = key_fixture(UserRole::Member).await;
+        let owner = User::new(
+            "pressure-owner",
+            "pressure-owner@example.com",
+            UserRole::Owner,
+            Utc::now(),
+        )
+        .unwrap();
+        repository.insert_user(&owner).await.unwrap();
+        let second_connection = GmailConnection::new(
+            member.id,
+            "pressure-second-gmail",
+            "second-pressure@example.com",
+            vec![GMAIL_READONLY_SCOPE.into(), GMAIL_COMPOSE_SCOPE.into()],
+        )
+        .unwrap();
+        repository
+            .insert_connection(&second_connection, None)
+            .await
+            .unwrap();
+        let created = AccessKey::generate(
+            member.id,
+            "account-pressure-key",
+            [connection.id, second_connection.id],
+        )
+        .unwrap();
+        let credential = created.credential.clone();
+        let key = repository.insert_access_key(&created).await.unwrap();
+        let config = test_config();
+        for connection_id in [connection.id, second_connection.id] {
+            let envelope = EncryptedRefreshToken::from_envelope(
+                encrypt_refresh_token(
+                    b"account-pressure-refresh",
+                    &member.id.to_string(),
+                    &connection_id.to_string(),
+                    &config.encryption_keyring,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            repository
+                .update_refresh_token_envelope(connection_id, Some(&envelope))
+                .await
+                .unwrap();
+        }
+        let exchanger = BlockingRevokeExchanger {
+            repository: repository.clone(),
+            user_id: Some(member.id),
+            connection_ids: vec![connection.id, second_connection.id],
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let state = ControlHttpState::new(
+            config,
+            repository.clone(),
+            UnusedVerifier,
+            exchanger.clone(),
+            exchanger.clone(),
+        )
+        .unwrap();
+
+        let entered = exchanger.entered.notified();
+        let state_for_revoke = state.clone();
+        let first = tokio::spawn(async move {
+            revoke_member_account(&state_for_revoke, owner.id, member.id).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered)
+            .await
+            .expect("remote revoke should be reached");
+
+        let state_for_second_revoke = state.clone();
+        let second = tokio::spawn(async move {
+            revoke_member_account(&state_for_second_revoke, owner.id, member.id).await
+        });
+
+        let mut pressure = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let repository = repository.clone();
+            let credential = credential.clone();
+            let session = session.clone();
+            pressure.spawn(async move {
+                assert!(
+                    repository
+                        .authenticate_access_key(&credential)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    repository
+                        .lookup_web_session(&hash_token(&session), Utc::now())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    repository
+                        .list_active_connections_for_access_key(key.id, member.id)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            });
+        }
+        exchanger.release.notify_one();
+        while let Some(result) = pressure.join_next().await {
+            result.unwrap();
+        }
+        let result = first.await.unwrap().unwrap().unwrap();
+        assert_eq!(second.await.unwrap().unwrap(), None);
+        assert_eq!(result.connections, 2);
+        assert_eq!(result.remote_revoked, 2);
+        assert_eq!(exchanger.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(repository.get_user(member.id).await.unwrap().is_none());
+        assert!(
+            repository
+                .get_connection(connection.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository
+                .get_connection(second_connection.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for table in [
+            "web_sessions",
+            "access_keys",
+            "access_key_grants",
+            "send_confirmations",
+            "oauth_transactions",
+        ] {
+            let remaining: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+            assert_eq!(remaining, 0, "{table} must not retain account-scoped state");
         }
     }
 

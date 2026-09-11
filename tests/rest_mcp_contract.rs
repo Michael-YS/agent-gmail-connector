@@ -232,6 +232,235 @@ async fn mcp_drafts_create_rejects_invalid_base64_attachment() {
 }
 
 #[tokio::test]
+async fn mcp_draft_writes_validate_arguments_and_charge_per_request() {
+    let (state, credential, connection) = AppState::test_fixture();
+    let created = build_router(state.clone())
+        .oneshot(
+            Request::post(format!("/api/v1/connections/{connection}/drafts"))
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"subject":"original","body":"body","to":["to@example.com"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = response_json(created).await;
+    let draft_id = created["managed_draft"]["id"].as_str().unwrap().to_owned();
+    let version = created["managed_draft"]["version"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let updated = build_router(state.clone())
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(mcp_request(
+                    "tools/call",
+                    11,
+                    json!({
+                        "name": "drafts.update",
+                        "arguments": {
+                            "connection_id": connection,
+                            "draft_id": draft_id,
+                            "expected_version": version,
+                            "subject": "updated",
+                            "body": "new body",
+                            "to": ["to@example.com"]
+                        }
+                    }),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated = response_json(updated).await;
+    assert_eq!(
+        updated["result"]["structuredContent"]["draft"]["subject"],
+        "updated"
+    );
+    let key = state.keys.read().await.values().next().unwrap().id;
+    assert_eq!(
+        state.rate_buckets.lock().await[&format!("api_per_minute:{key}")].request_count,
+        2
+    );
+
+    let invalid = build_router(state.clone())
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(mcp_request(
+                    "tools/call",
+                    12,
+                    json!({
+                        "name": "drafts.delete",
+                        "arguments": {"connection_id": connection, "draft_id": draft_id}
+                    }),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let invalid = response_json(invalid).await;
+    assert_eq!(invalid["error"]["code"], -32602);
+}
+
+#[tokio::test]
+async fn mcp_prepare_and_send_use_one_time_confirmation_token() {
+    let (state, credential, connection, _adapter) = AppState::test_fixture_with_adapter();
+    let created = build_router(state.clone())
+        .oneshot(
+            Request::post(format!("/api/v1/connections/{connection}/drafts"))
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"subject":"send me","body":"body","to":["to@example.com"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let created = response_json(created).await;
+    let draft_id = created["managed_draft"]["id"].as_str().unwrap().to_owned();
+
+    let prepared = build_router(state.clone())
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(mcp_request(
+                    "tools/call",
+                    13,
+                    json!({"name":"drafts.prepare_send","arguments":{"connection_id":connection,"draft_id":draft_id}}),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let prepared = response_json(prepared).await;
+    let token = prepared["result"]["structuredContent"]["confirmation_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(prepared["result"]["structuredContent"]["preview"].is_object());
+
+    let send = |id| {
+        let state = state.clone();
+        let credential = credential.clone();
+        let token = token.clone();
+        let draft_id = draft_id.clone();
+        async move {
+            response_json(
+                build_router(state)
+                .oneshot(
+                    Request::post("/mcp")
+                        .header("authorization", format!("Bearer {credential}"))
+                        .header("content-type", "application/json")
+                        .body(mcp_request(
+                            "tools/call",
+                            id,
+                            json!({"name":"drafts.send","arguments":{"connection_id":connection,"draft_id":draft_id,"confirmation_token":token}}),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await
+        }
+    };
+    let first = send(14).await;
+    assert!(first["result"]["structuredContent"].is_object());
+    let replay = send(15).await;
+    assert_eq!(replay["result"]["structuredContent"]["replayed"], true);
+}
+
+#[tokio::test]
+async fn rmcp_streamable_http_negotiates_and_lists_tools() {
+    let (state, credential, connection) = AppState::test_fixture();
+    let initialize = build_router(state.clone())
+        .oneshot(
+            Request::post("/mcp-streamable")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("host", "localhost")
+                .header("accept", "application/json, text/event-stream")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"contract-test","version":"1"}}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    if initialize.status() != StatusCode::OK {
+        let status = initialize.status();
+        let body = to_bytes(initialize.into_body(), 1024 * 1024).await.unwrap();
+        panic!(
+            "rmcp initialize failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    assert_eq!(
+        initialize.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    let initialized = response_json(initialize).await;
+    assert_eq!(initialized["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(initialized["result"]["capabilities"]["tools"], json!({}));
+
+    let tools = build_router(state.clone())
+        .oneshot(
+            Request::post("/mcp-streamable")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("host", "localhost")
+                .header("accept", "application/json, text/event-stream")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tools.status(), StatusCode::OK);
+    let tools = response_json(tools).await;
+    assert_eq!(tools["result"]["tools"][0]["name"], "messages.search");
+    assert!(tools["result"]["tools"][0]["inputSchema"].is_object());
+
+    let call = build_router(state)
+        .oneshot(
+            Request::post("/mcp-streamable")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("host", "localhost")
+                .header("accept", "application/json, text/event-stream")
+                .header("content-type", "application/json")
+                .body(mcp_request(
+                    "tools/call",
+                    3,
+                    json!({
+                        "name": "messages.search",
+                        "arguments": {"connection_id": connection}
+                    }),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(call.status(), StatusCode::OK);
+    let call = response_json(call).await;
+    assert_eq!(
+        call["result"]["structuredContent"]["connection_id"],
+        connection.to_string()
+    );
+}
+
+#[tokio::test]
 async fn mcp_thread_and_bounded_base64_attachment_reads_use_mailbox_service() {
     let (state, credential, connection, adapter) = AppState::test_fixture_with_adapter();
     let message = agentmail::adapter::MailMessage {
@@ -384,6 +613,78 @@ async fn openapi_describes_search_security_and_safe_contract() {
     assert!(document["components"]["securitySchemes"]["bearerAuth"].is_object());
     assert!(document["components"]["schemas"]["MessageSearchResult"].is_object());
     assert!(document["components"]["schemas"]["ErrorResponse"].is_object());
+}
+
+#[tokio::test]
+async fn openapi_describes_every_rest_route_and_write_contract() {
+    let response = build_router(AppState::empty())
+        .oneshot(
+            Request::get("/api/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let document = response_json(response).await;
+    let expected = [
+        ("/api/v1/connections", &["get"][..]),
+        ("/api/v1/connections/{connection_id}/messages", &["get"][..]),
+        (
+            "/api/v1/connections/{connection_id}/messages/{message_id}",
+            &["get"][..],
+        ),
+        (
+            "/api/v1/connections/{connection_id}/threads/{thread_id}",
+            &["get"][..],
+        ),
+        (
+            "/api/v1/connections/{connection_id}/messages/{message_id}/attachments/{attachment_id}",
+            &["get"][..],
+        ),
+        (
+            "/api/v1/connections/{connection_id}/drafts",
+            &["get", "post"][..],
+        ),
+        (
+            "/api/v1/connections/{connection_id}/drafts/{draft_id}",
+            &["get", "patch", "delete"][..],
+        ),
+        (
+            "/api/v1/connections/{connection_id}/drafts/{draft_id}/prepare-send",
+            &["post"][..],
+        ),
+        (
+            "/api/v1/connections/{connection_id}/drafts/{draft_id}/send",
+            &["post"][..],
+        ),
+    ];
+    for (route, methods) in expected {
+        let path = &document["paths"][route];
+        assert!(path.is_object(), "missing OpenAPI path {route}");
+        for method in methods {
+            let operation = &path[*method];
+            assert!(operation.is_object(), "missing {method} {route}");
+            assert_eq!(operation["security"][0]["bearerAuth"], json!([]));
+            assert!(operation["operationId"].is_string());
+            assert!(operation["responses"]["400"].is_object());
+            assert!(operation["responses"]["401"].is_object());
+        }
+    }
+    let create = &document["paths"]["/api/v1/connections/{connection_id}/drafts"]["post"];
+    assert!(create["requestBody"]["content"]["application/json"].is_object());
+    assert!(create["requestBody"]["content"]["multipart/form-data"].is_object());
+    let update =
+        &document["paths"]["/api/v1/connections/{connection_id}/drafts/{draft_id}"]["patch"];
+    assert!(update["requestBody"]["content"]["multipart/form-data"].is_object());
+    let send =
+        &document["paths"]["/api/v1/connections/{connection_id}/drafts/{draft_id}/send"]["post"];
+    assert_eq!(
+        send["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/SendRequest"
+    );
+    assert!(document["components"]["schemas"]["AttachmentInfo"].is_object());
+    assert!(document["components"]["schemas"]["PrepareSendResponse"].is_object());
+    assert!(document["components"]["responses"]["RateLimited"].is_object());
 }
 
 #[tokio::test]

@@ -889,7 +889,7 @@ impl Repository {
     ) -> Result<Option<UserRevocation>, RepositoryError> {
         let mut tx = self.pool.begin().await?;
         let allowed: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM users target WHERE target.id=? AND target.role='member' AND (target.id=? OR EXISTS(SELECT 1 FROM users actor WHERE actor.id=? AND actor.role='owner' AND actor.status='active')))",
+            "SELECT EXISTS(SELECT 1 FROM users target WHERE target.id=? AND target.role='member' AND target.status='active' AND (target.id=? OR EXISTS(SELECT 1 FROM users actor WHERE actor.id=? AND actor.role='owner' AND actor.status='active')))",
         )
         .bind(user_id.to_string())
         .bind(actor_id.to_string())
@@ -1087,13 +1087,43 @@ impl Repository {
         owner_id: UserId,
         id: ConnectionId,
     ) -> Result<Option<ConnectionRevocation>, RepositoryError> {
+        self.begin_connection_revoke_inner(owner_id, id, false)
+            .await
+    }
+
+    /// Claim an active connection for a new revoke request. A connection
+    /// already marked `revoking` belongs to an existing operation and cannot
+    /// be claimed again concurrently.
+    pub async fn claim_connection_revoke(
+        &self,
+        owner_id: UserId,
+        id: ConnectionId,
+    ) -> Result<Option<ConnectionRevocation>, RepositoryError> {
+        self.begin_connection_revoke_inner(owner_id, id, true).await
+    }
+
+    async fn begin_connection_revoke_inner(
+        &self,
+        owner_id: UserId,
+        id: ConnectionId,
+        active_only: bool,
+    ) -> Result<Option<ConnectionRevocation>, RepositoryError> {
         let mut tx = self.pool.begin().await?;
-        let changed = sqlx::query("UPDATE gmail_connections SET status='revoking',updated_at=? WHERE id=? AND owner_id=? AND EXISTS (SELECT 1 FROM users WHERE users.id=gmail_connections.owner_id AND users.status='active')")
-            .bind(encode_time(Utc::now()))
-            .bind(id.to_string())
-            .bind(owner_id.to_string())
-            .execute(&mut *tx)
-            .await?;
+        let changed = if active_only {
+            sqlx::query("UPDATE gmail_connections SET status='revoking',updated_at=? WHERE id=? AND owner_id=? AND status='active' AND EXISTS (SELECT 1 FROM users WHERE users.id=gmail_connections.owner_id AND users.status='active')")
+                .bind(encode_time(Utc::now()))
+                .bind(id.to_string())
+                .bind(owner_id.to_string())
+                .execute(&mut *tx)
+                .await?
+        } else {
+            sqlx::query("UPDATE gmail_connections SET status='revoking',updated_at=? WHERE id=? AND owner_id=? AND EXISTS (SELECT 1 FROM users WHERE users.id=gmail_connections.owner_id AND users.status='active')")
+                .bind(encode_time(Utc::now()))
+                .bind(id.to_string())
+                .bind(owner_id.to_string())
+                .execute(&mut *tx)
+                .await?
+        };
         if changed.rows_affected() != 1 {
             tx.rollback().await?;
             return Ok(None);

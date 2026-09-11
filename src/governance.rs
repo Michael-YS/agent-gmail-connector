@@ -186,6 +186,12 @@ pub enum AuditOperation {
     DraftsList,
     #[serde(rename = "drafts.get")]
     DraftsGet,
+    #[serde(rename = "drafts.create")]
+    DraftsCreate,
+    #[serde(rename = "drafts.update")]
+    DraftsUpdate,
+    #[serde(rename = "drafts.delete")]
+    DraftsDelete,
     #[serde(rename = "draft.prepare")]
     DraftPrepare,
     #[serde(rename = "draft.send")]
@@ -228,6 +234,9 @@ impl AuditOperation {
             Self::AttachmentsGet => "attachments.get",
             Self::DraftsList => "drafts.list",
             Self::DraftsGet => "drafts.get",
+            Self::DraftsCreate => "drafts.create",
+            Self::DraftsUpdate => "drafts.update",
+            Self::DraftsDelete => "drafts.delete",
             Self::DraftPrepare => "draft.prepare",
             Self::DraftSend => "draft.send",
             Self::ConnectionCreate => "connection.create",
@@ -359,6 +368,9 @@ impl TryFrom<&str> for AuditOperation {
             "attachments.get" => Ok(Self::AttachmentsGet),
             "drafts.list" => Ok(Self::DraftsList),
             "drafts.get" => Ok(Self::DraftsGet),
+            "drafts.create" => Ok(Self::DraftsCreate),
+            "drafts.update" => Ok(Self::DraftsUpdate),
+            "drafts.delete" => Ok(Self::DraftsDelete),
             "draft.prepare" => Ok(Self::DraftPrepare),
             "draft.send" => Ok(Self::DraftSend),
             "connection.create" => Ok(Self::ConnectionCreate),
