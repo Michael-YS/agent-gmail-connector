@@ -39,7 +39,7 @@
 27. `24b2e24 test: cover rmcp protocol boundaries`
 28. `a303a2d test(mcp): lock transport contract snapshots`
 29. `425f760 docs: clarify mcp endpoint migration`
-30. 当前工作区干净；剩余为 `/mcp` 端点迁移决策及外部验收门槛。
+30. 当前工作区：canonical `/mcp` 迁移与并发压力测试稳定性修复，待提交。
 
 ## 当前实现断点
 
@@ -54,7 +54,7 @@
 - 安全 MIME 构建层已使用 `mail-builder 0.5` 完成：稳定 Message-ID、reply References、reply-all 排除当前主地址、非 ASCII header、安全附件 filename/content-type、inline CID、原始附件与最终编码消息的 25 MiB 双重限制，以及有界 writer。
 - managed draft 已接入真实 Gmail create/update/delete：使用稳定 Message-ID 和安全 MIME，按草稿独立串行化，从 SQLite 恢复重启后的 managed record，保持 expected-version 乐观锁，并对 create 持久化失败做补偿删除、对 delete 404 做幂等成功。prepare/send/update/delete 会重读 Gmail 当前草稿并以完整结构化内容重算 version，网页端编辑会使旧确认失效；prepare 也返回真实收件人、主题、正文摘要和附件名。
 - `POST /api/v1/connections/{connection_id}/drafts` 已支持持久化 `Idempotency-Key`：只保存 key 与请求摘要的 SHA-256 和内部 managed draft ID；相同 key/摘要返回原草稿，不会再创建 Gmail draft，摘要不同时返回冲突。managed draft 与完成记录在同一 SQLite 事务写入。
-- MCP 兼容 JSON-RPC 已增加 `messages.get`、`threads.get`、`messages.get_attachment`、`drafts.list`、`drafts.get`、`drafts.create`、`drafts.update`、`drafts.delete`、`drafts.prepare_send` 与 `drafts.send`，与 REST 共用 Access Key/Connection grant、草稿状态机、确认 token 和审计边界；邮件和附件明确标为不可信。`drafts.create/update` 的 base64 附件总原始数据上限为 4 MiB，任何附件均不落盘。MCP 草稿创建会按 JSON-RPC 调用生成稳定的持久化幂等键，重试不会重复创建。新增 `/mcp-streamable` 使用官方 rmcp 的无状态 Streamable HTTP、Bearer 认证和当前全部工具 schema；当前所有工具通过受控兼容 bridge 复用认证、限流、领域状态机和元数据审计。MCP/OpenAPI schema 摘要、Host rebinding、内容协商、无状态协议边界及 rmcp 授权错误分类均有契约测试；原生 handler 迁移不是 v1 硬要求，仍待真实 MCP client 验收及 `/mcp` 兼容端点迁移决策。
+- MCP 兼容 JSON-RPC 已迁移到 `/mcp-compat`，增加 `messages.get`、`threads.get`、`messages.get_attachment`、`drafts.list`、`drafts.get`、`drafts.create`、`drafts.update`、`drafts.delete`、`drafts.prepare_send` 与 `drafts.send`，与 REST 共用 Access Key/Connection grant、草稿状态机、确认 token 和审计边界；邮件和附件明确标为不可信。`drafts.create/update` 的 base64 附件总原始数据上限为 4 MiB，任何附件均不落盘。MCP 草稿创建会按 JSON-RPC 调用生成稳定的持久化幂等键，重试不会重复创建。`/mcp` 现在使用官方 rmcp 的无状态 Streamable HTTP，`/mcp-streamable` 保留临时别名；当前所有工具通过受控兼容 bridge 复用认证、限流、领域状态机和元数据审计。MCP/OpenAPI schema 摘要、Host rebinding、内容协商、无状态协议边界及 rmcp 授权错误分类均有契约测试；原生 handler 迁移不是 v1 硬要求，仍待真实 MCP client 验收。
 - REST create draft 已支持 `new`、`reply`、`reply_all`、`forward` 意图。reply/reply_all 使用源邮件 thread、`In-Reply-To` 和 `References`；reply_all 排除当前主地址。forward 默认复制同一已授权源邮件的附件与内嵌 CID 数据，并经过 MIME 原始/编码双重大小限制。
 - confirmation token 只以 SHA-256 hash 入库；prepare 先持久化再返回明文一次；claim/outcome 与 managed draft 状态分别在 SQLite 事务中原子更新。相同 token 重放首次结果，不再次发送。
 - production send 已启用单次 Gmail `drafts.send`。Timeout、5xx/Unavailable、429 和 claim 后进程重启均只按系统生成的 `@agentmail.invalid` Message-ID 查询 Sent；要求精确 Message-ID header 与 `SENT` 标签，无法确认则持久化 `send_state_unknown`，绝不盲目重发。

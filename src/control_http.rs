@@ -2214,8 +2214,11 @@ mod tests {
             revoke_connection_account(&state_for_second_revoke, user.id, connection.id).await
         });
 
+        // The in-memory fixture deliberately uses one SQLite connection; keep
+        // the pressure queue bounded so the test exercises overlap without
+        // turning pool contention into a 30-second acquire timeout.
         let mut pressure = tokio::task::JoinSet::new();
-        for _ in 0..32 {
+        for _ in 0..8 {
             let repository = repository.clone();
             let credential = credential.clone();
             pressure.spawn(async move {
@@ -2336,8 +2339,11 @@ mod tests {
             revoke_member_account(&state_for_second_revoke, owner.id, member.id).await
         });
 
+        // The in-memory fixture deliberately uses one SQLite connection; keep
+        // the pressure queue bounded so the test exercises overlap without
+        // turning pool contention into a 30-second acquire timeout.
         let mut pressure = tokio::task::JoinSet::new();
-        for _ in 0..32 {
+        for _ in 0..8 {
             let repository = repository.clone();
             let credential = credential.clone();
             let session = session.clone();

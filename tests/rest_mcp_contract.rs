@@ -43,7 +43,7 @@ async fn rest_and_mcp_search_use_the_same_fixture_and_service() {
 
     let mcp = build_router(state)
         .oneshot(
-            Request::post("/mcp")
+            Request::post("/mcp-compat")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(mcp_request(
@@ -104,7 +104,7 @@ async fn rest_and_mcp_draft_reads_share_auth_and_adapter() {
 
     let mcp_list = build_router(state.clone())
         .oneshot(
-            Request::post("/mcp")
+            Request::post("/mcp-compat")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(mcp_request(
@@ -139,7 +139,7 @@ async fn rest_and_mcp_draft_reads_share_auth_and_adapter() {
 
     let mcp_get = build_router(state)
         .oneshot(
-            Request::post("/mcp")
+            Request::post("/mcp-compat")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(mcp_request(
@@ -166,7 +166,7 @@ async fn mcp_drafts_create_accepts_bounded_base64_attachment() {
     let (state, credential, connection) = AppState::test_fixture();
     let response = build_router(state)
         .oneshot(
-            Request::post("/mcp")
+            Request::post("/mcp-compat")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(mcp_request(
@@ -204,7 +204,7 @@ async fn mcp_drafts_create_rejects_invalid_base64_attachment() {
     let (state, credential, connection) = AppState::test_fixture();
     let response = build_router(state)
         .oneshot(
-            Request::post("/mcp")
+            Request::post("/mcp-compat")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(mcp_request(
@@ -257,7 +257,7 @@ async fn mcp_draft_writes_validate_arguments_and_charge_per_request() {
 
     let updated = build_router(state.clone())
         .oneshot(
-            Request::post("/mcp")
+            Request::post("/mcp-compat")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(mcp_request(
@@ -293,7 +293,7 @@ async fn mcp_draft_writes_validate_arguments_and_charge_per_request() {
 
     let invalid = build_router(state.clone())
         .oneshot(
-            Request::post("/mcp")
+            Request::post("/mcp-compat")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(mcp_request(
@@ -332,7 +332,7 @@ async fn mcp_prepare_and_send_use_one_time_confirmation_token() {
 
     let prepared = build_router(state.clone())
         .oneshot(
-            Request::post("/mcp")
+            Request::post("/mcp-compat")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(mcp_request(
@@ -360,7 +360,7 @@ async fn mcp_prepare_and_send_use_one_time_confirmation_token() {
             response_json(
                 build_router(state)
                 .oneshot(
-                    Request::post("/mcp")
+                    Request::post("/mcp-compat")
                         .header("authorization", format!("Bearer {credential}"))
                         .header("content-type", "application/json")
                         .body(mcp_request(
@@ -387,7 +387,7 @@ async fn rmcp_streamable_http_negotiates_and_lists_tools() {
     let (state, credential, connection) = AppState::test_fixture();
     let initialize = build_router(state.clone())
         .oneshot(
-            Request::post("/mcp-streamable")
+            Request::post("/mcp")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("host", "localhost")
                 .header("accept", "application/json, text/event-stream")
@@ -417,7 +417,7 @@ async fn rmcp_streamable_http_negotiates_and_lists_tools() {
 
     let tools = build_router(state.clone())
         .oneshot(
-            Request::post("/mcp-streamable")
+            Request::post("/mcp")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("host", "localhost")
                 .header("accept", "application/json, text/event-stream")
@@ -470,7 +470,7 @@ async fn rmcp_streamable_http_negotiates_and_lists_tools() {
 
     let call = build_router(state)
         .oneshot(
-            Request::post("/mcp-streamable")
+            Request::post("/mcp")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("host", "localhost")
                 .header("accept", "application/json, text/event-stream")
@@ -572,7 +572,7 @@ async fn mcp_thread_and_bounded_base64_attachment_reads_use_mailbox_service() {
 
     let thread = build_router(state.clone())
         .oneshot(
-            Request::post("/mcp")
+            Request::post("/mcp-compat")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(mcp_request(
@@ -596,7 +596,7 @@ async fn mcp_thread_and_bounded_base64_attachment_reads_use_mailbox_service() {
 
     let attachment = build_router(state.clone())
         .oneshot(
-            Request::post("/mcp")
+            Request::post("/mcp-compat")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(mcp_request(
@@ -637,7 +637,7 @@ async fn mcp_thread_and_bounded_base64_attachment_reads_use_mailbox_service() {
         .await;
     let too_large = build_router(state)
         .oneshot(
-            Request::post("/mcp")
+            Request::post("/mcp-compat")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(mcp_request(
@@ -702,7 +702,7 @@ async fn openapi_describes_every_rest_route_and_write_contract() {
     ));
     assert_eq!(
         openapi_digest,
-        "31f7f77b26fbc346af53c40dbf22f4cb18c2d17c1aa2fd049a3920cf1d817f33"
+        "3aef9a061147245c77c098706f1e3e340d26090f990856b6489453dae5ee3909"
     );
     let expected = [
         ("/api/v1/connections", &["get"][..]),
@@ -770,7 +770,7 @@ async fn mcp_tools_list_exposes_search_schema_and_compatibility_note() {
     let (state, credential, _connection) = AppState::test_fixture();
     let response = build_router(state)
         .oneshot(
-            Request::post("/mcp")
+            Request::post("/mcp-compat")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(mcp_request("tools/list", 2, json!({})))
@@ -829,7 +829,7 @@ async fn mcp_tools_schema_snapshot_is_stable() {
     let (state, credential, _connection) = AppState::test_fixture();
     let response = build_router(state)
         .oneshot(
-            Request::post("/mcp")
+            Request::post("/mcp-compat")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(mcp_request("tools/list", 99, json!({})))
@@ -854,7 +854,7 @@ async fn mcp_returns_jsonrpc_parse_and_invalid_request_errors() {
     let (state, credential, _connection) = AppState::test_fixture();
     let parse_error = build_router(state.clone())
         .oneshot(
-            Request::post("/mcp")
+            Request::post("/mcp-compat")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(Body::from("{"))
@@ -869,7 +869,7 @@ async fn mcp_returns_jsonrpc_parse_and_invalid_request_errors() {
 
     let invalid_request = build_router(state)
         .oneshot(
-            Request::post("/mcp")
+            Request::post("/mcp-compat")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"jsonrpc":"2.0","id":5}"#))
@@ -925,7 +925,7 @@ async fn rest_and_mcp_reject_query_tokens_and_cross_connection_ids() {
 
     let mcp_idor = build_router(state)
         .oneshot(
-            Request::post("/mcp")
+            Request::post("/mcp-compat")
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(mcp_request(

@@ -1,11 +1,12 @@
 //! rmcp Streamable HTTP surface.
 //!
 //! The existing hand-written JSON-RPC endpoint remains the compatibility
-//! surface at `/mcp`; this module exposes the same tool schema through an
-//! official stateless rmcp endpoint at `/mcp-streamable`. All currently
+//! surface at `/mcp-compat`; this module exposes the same tool schema through
+//! the canonical stateless rmcp endpoint at `/mcp` (and a temporary
+//! `/mcp-streamable` alias). All currently
 //! exposed tools use a controlled bridge into the compatibility dispatcher so
 //! authentication, grants, rate limits, domain state machines, and
-//! metadata-only audit remain shared while native rmcp handlers are migrated.
+//! metadata-only audit remain shared in the v1 implementation.
 
 use axum::{
     Router,
@@ -44,8 +45,8 @@ async fn authenticate(
     next.run(request).await
 }
 
-/// Build an isolated Streamable HTTP router. The caller may nest this router
-/// without changing the existing `/mcp` compatibility endpoint.
+/// Build an isolated Streamable HTTP router. `/mcp` is the canonical endpoint;
+/// `/mcp-streamable` remains as a compatibility alias during migration.
 pub fn streamable_router(state: AppState) -> Router<AppState> {
     let service_state = state.clone();
     let service = StreamableHttpService::new(
@@ -60,6 +61,7 @@ pub fn streamable_router(state: AppState) -> Router<AppState> {
             .with_json_response(true),
     );
     Router::new()
+        .nest_service("/mcp", service.clone())
         .nest_service("/mcp-streamable", service)
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
 }
@@ -169,7 +171,7 @@ mod tests {
         let (state, _, _) = AppState::test_fixture();
         let response = crate::http::build_router(state)
             .oneshot(
-                Request::post("/mcp-streamable")
+                Request::post("/mcp")
                     .header("accept", "application/json, text/event-stream")
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -188,7 +190,7 @@ mod tests {
         let request_body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
         let missing_event_stream = crate::http::build_router(state.clone())
             .oneshot(
-                Request::post("/mcp-streamable")
+                Request::post("/mcp")
                     .header("authorization", format!("Bearer {credential}"))
                     .header("host", "localhost")
                     .header("accept", "application/json")
@@ -202,7 +204,7 @@ mod tests {
 
         let missing_json = crate::http::build_router(state)
             .oneshot(
-                Request::post("/mcp-streamable")
+                Request::post("/mcp")
                     .header("authorization", format!("Bearer {credential}"))
                     .header("host", "localhost")
                     .header("accept", "application/json, text/event-stream")
@@ -220,7 +222,7 @@ mod tests {
         let (state, credential, _) = AppState::test_fixture();
         let get = crate::http::build_router(state.clone())
             .oneshot(
-                Request::get("/mcp-streamable")
+                Request::get("/mcp")
                     .header("authorization", format!("Bearer {credential}"))
                     .header("host", "localhost")
                     .header("accept", "text/event-stream")
@@ -234,7 +236,7 @@ mod tests {
 
         let delete = crate::http::build_router(state.clone())
             .oneshot(
-                Request::delete("/mcp-streamable")
+                Request::delete("/mcp")
                     .header("authorization", format!("Bearer {credential}"))
                     .header("host", "localhost")
                     .header("mcp-session-id", "legacy-session")
@@ -248,7 +250,7 @@ mod tests {
 
         let unknown_protocol = crate::http::build_router(state)
             .oneshot(
-                Request::post("/mcp-streamable")
+                Request::post("/mcp")
                     .header("authorization", format!("Bearer {credential}"))
                     .header("host", "localhost")
                     .header("accept", "application/json, text/event-stream")
@@ -269,7 +271,7 @@ mod tests {
         let (state, credential, _) = AppState::test_fixture();
         let response = crate::http::build_router(state)
             .oneshot(
-                Request::post("/mcp-streamable")
+                Request::post("/mcp")
                     .header("authorization", format!("Bearer {credential}"))
                     .header("host", "attacker.example")
                     .header("accept", "application/json, text/event-stream")

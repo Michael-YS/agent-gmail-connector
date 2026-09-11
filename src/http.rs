@@ -2837,7 +2837,7 @@ async fn openapi() -> impl IntoResponse {
         "Uuid":{"type":"string","format":"uuid"},"Email":{"type":"string","format":"email"},"Connection":{"type":"object","required":["connection_id","email","status","granted_scopes"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"email":{"$ref":"#/components/schemas/Email"},"status":{"type":"string"},"granted_scopes":{"type":"array","items":{"type":"string"}}}},"ConnectionsResponse":{"type":"object","required":["connections"],"properties":{"connections":{"type":"array","items":{"$ref":"#/components/schemas/Connection"}}}},
         "AttachmentInfo":{"type":"object","required":["id","filename","content_type","size_bytes","inline"],"properties":{"id":{"type":"string"},"filename":{"type":"string"},"content_type":{"type":"string"},"size_bytes":{"type":"integer","minimum":0},"inline":{"type":"boolean"}}},"MessageMetadata":{"type":"object","required":["id","to","cc","subject","snippet","attachments"],"properties":{"id":{"type":"string"},"thread_id":{"type":["string","null"]},"sent_at":{"type":["string","null"]},"from":{"anyOf":[{"$ref":"#/components/schemas/Email"},{"type":"null"}]},"to":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"cc":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"subject":{"type":"string"},"snippet":{"type":"string"},"attachments":{"type":"array","items":{"$ref":"#/components/schemas/AttachmentInfo"}}}},"MessageSearchResult":{"type":"object","required":["connection_id","messages","next_cursor"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"messages":{"type":"array","items":{"$ref":"#/components/schemas/MessageMetadata"}},"next_cursor":{"type":["string","null"]}}},"MessageResponse":{"type":"object","required":["connection_id","message","untrusted_email_content"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"message":{"type":"object"},"untrusted_email_content":{"const":true}}},"ThreadResponse":{"type":"object","required":["connection_id","thread_id","messages","untrusted_email_content"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"thread_id":{"type":"string"},"messages":{"type":"array","items":{"type":"object"}},"untrusted_email_content":{"const":true}}},
         "MailDraft":{"type":"object","required":["id","stable_message_id","subject","body","to","cc","bcc","attachments"],"properties":{"id":{"type":"string"},"stable_message_id":{"type":"string"},"thread_id":{"type":["string","null"]},"subject":{"type":"string"},"body":{"type":"string"},"to":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"cc":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"bcc":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"attachments":{"type":"array","items":{"$ref":"#/components/schemas/AttachmentInfo"}},"html_body":{"type":["string","null"]}}},"ManagedDraft":{"type":"object","required":["id","connection_id","gmail_draft_id","message_id","version","state"],"properties":{"id":{"$ref":"#/components/schemas/Uuid"},"connection_id":{"$ref":"#/components/schemas/Uuid"},"gmail_draft_id":{"type":"string"},"message_id":{"type":"string"},"version":{"type":"string"},"state":{"type":"string"}}},"DraftRequest":{"type":"object","properties":{"kind":{"type":"string","enum":["new","reply","reply_all","forward"],"default":"new"},"source_message_id":{"type":["string","null"]},"subject":{"type":"string"},"body":{"type":"string"},"to":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"cc":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"bcc":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"thread_id":{"type":["string","null"]},"expected_version":{"type":["string","null"]},"include_attachments":{"type":"boolean","default":true}}},"DraftMultipartRequest":{"type":"object","required":["metadata"],"properties":{"metadata":{"$ref":"#/components/schemas/DraftRequest"},"attachments":{"type":"array","items":{"type":"string","format":"binary"}}}},"DraftResponse":{"type":"object","required":["connection_id","draft","managed_by_agentmail","version"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"draft":{"$ref":"#/components/schemas/MailDraft"},"managed_by_agentmail":{"type":"boolean"},"version":{"type":["string","null"]}}},"DraftsResponse":{"type":"object","required":["connection_id","drafts"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"drafts":{"type":"array","items":{"$ref":"#/components/schemas/DraftResponse"}}}},"DraftMutationResponse":{"allOf":[{"$ref":"#/components/schemas/DraftResponse"},{"type":"object","properties":{"managed_draft":{"$ref":"#/components/schemas/ManagedDraft"}}}]},"DeletedResponse":{"type":"object","required":["connection_id","deleted"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"deleted":{"const":true}}},"SendRequest":{"type":"object","required":["confirmation_token"],"properties":{"confirmation_token":{"type":"string"}}},"PrepareSendResponse":{"type":"object","required":["connection_id","draft_id","confirmation_token","expires_at","preview"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"draft_id":{"$ref":"#/components/schemas/Uuid"},"confirmation_token":{"type":"string","writeOnly":true},"expires_at":{"type":"string","format":"date-time"},"preview":{"type":"object"}}},"SendResponse":{"type":"object"},"ErrorResponse":{"type":"object","required":["error"],"properties":{"error":{"type":"object","required":["code","message","request_id","retryable"],"properties":{"code":{"type":"string"},"message":{"type":"string"},"request_id":{"type":"string"},"retryable":{"type":"boolean"},"retry_after_seconds":{"type":["integer","null"]}}}}}
-    }},"x-agentmail-mcp":"The current /mcp endpoint exposes a minimal JSON-RPC compatibility surface, not full Streamable HTTP."}),
+    }},"x-agentmail-mcp":"The canonical /mcp endpoint uses stateless Streamable HTTP; /mcp-compat is the legacy JSON-RPC compatibility surface."}),
     )
 }
 async fn get_thread(
@@ -3248,7 +3248,7 @@ pub(crate) fn mcp_tools() -> Value {
     })
 }
 
-pub(crate) async fn mcp(
+pub(crate) async fn mcp_compat(
     state: State<AppState>,
     headers: HeaderMap,
     uri: axum::http::Uri,
@@ -3890,7 +3890,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/openapi.json", get(openapi))
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
-        .route("/mcp", post(mcp))
+        .route("/mcp-compat", post(mcp_compat))
         .merge(streamable_router)
         .route("/api/v1/connections", get(list_connections))
         .route(
@@ -4391,7 +4391,7 @@ mod tests {
             async move {
                 let response = app
                     .oneshot(
-                        Request::post("/mcp")
+                        Request::post("/mcp-compat")
                             .header("authorization", format!("Bearer {credential}"))
                             .header("content-type", "application/json")
                             .body(Body::from(request.to_string()))
@@ -4435,7 +4435,7 @@ mod tests {
         let wrong_version = if current_version == "0" { "1" } else { "0" };
         let response = app
             .oneshot(
-                Request::post("/mcp")
+                Request::post("/mcp-compat")
                     .header("authorization", format!("Bearer {credential}"))
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -4484,7 +4484,7 @@ mod tests {
             async move {
                 let response = app
                     .oneshot(
-                        Request::post("/mcp-streamable")
+                        Request::post("/mcp")
                             .header("authorization", format!("Bearer {credential}"))
                             .header("host", "localhost")
                             .header("accept", "application/json, text/event-stream")
@@ -4816,7 +4816,7 @@ mod tests {
         let app = router(state.clone());
         let response = app
             .oneshot(
-                Request::post("/mcp")
+                Request::post("/mcp-compat")
                     .header("authorization", format!("Bearer {credential}"))
                     .header("content-type", "application/json")
                     .body(Body::from(

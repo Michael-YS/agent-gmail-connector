@@ -34,7 +34,7 @@
 
 ### A5. MCP Streamable HTTP 与 rmcp schema
 
-- OpenAPI 已覆盖全部现有 REST 路由、参数、JSON/multipart 请求体、二进制附件响应、统一错误响应和 bearer 安全；OpenAPI 与 MCP tools schema 均有稳定 SHA-256 snapshot 契约。兼容 JSON-RPC 已实现当前全部草稿读写工具；`/mcp-streamable` 已接入官方 rmcp 无状态 Streamable HTTP，并暴露同一工具 schema，当前所有工具通过受控兼容 bridge，草稿创建按 JSON-RPC 调用生成稳定的持久化幂等键。审计包装已覆盖已知 `tools/call` 操作且不读取邮件内容；内容协商、Host rebinding、未知协议版本、stateless session 边界和 rmcp 授权错误分类已有负向契约。原生 handler 迁移不是 v1 硬要求；剩余是运行真实 MCP client，以及决定是否把兼容端点迁移到计划约定的 `/mcp` 路径。
+- OpenAPI 已覆盖全部现有 REST 路由、参数、JSON/multipart 请求体、二进制附件响应、统一错误响应和 bearer 安全；OpenAPI 与 MCP tools schema 均有稳定 SHA-256 snapshot 契约。兼容 JSON-RPC 已迁移到 `/mcp-compat` 并实现当前全部草稿读写工具；计划约定的 `/mcp` 已接入官方 rmcp 无状态 Streamable HTTP，`/mcp-streamable` 为临时别名，并暴露同一工具 schema，当前所有工具通过受控兼容 bridge，草稿创建按 JSON-RPC 调用生成稳定的持久化幂等键。审计包装已覆盖已知 `tools/call` 操作且不读取邮件内容；内容协商、Host rebinding、未知协议版本、stateless session 边界和 rmcp 授权错误分类已有负向契约。原生 handler 迁移不是 v1 硬要求；剩余是运行真实 MCP client。
 - 实现后测试：导出 OpenAPI/MCP schema，运行 snapshot 与真实 MCP client；比较 HTTP/MCP 的领域字段和错误码。
 - 命令目标：`cargo test --test transport_contract --all-features`，`cargo test --test mcp_schema --all-features`。
 - 通过标准：tools 标明邮件内容不可信和发送需用户许可；MCP 与 REST 共享认证、grant、状态机和审计逻辑。
