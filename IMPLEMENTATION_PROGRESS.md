@@ -38,7 +38,8 @@
 26. `df0ab81 test: cover rmcp draft idempotency`
 27. `24b2e24 test: cover rmcp protocol boundaries`
 28. `a303a2d test(mcp): lock transport contract snapshots`
-29. 当前工作区干净；剩余为 `/mcp` 端点迁移决策及外部验收门槛。
+29. `425f760 docs: clarify mcp endpoint migration`
+30. 当前工作区干净；剩余为 `/mcp` 端点迁移决策及外部验收门槛。
 
 ## 当前实现断点
 
