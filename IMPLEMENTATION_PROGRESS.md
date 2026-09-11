@@ -29,6 +29,7 @@
 17. `646f91e feat(governance): persist limits and audits`
 18. `7b86676 feat(mail): add live reads`
 19. `3cc5516 feat(draft): add reply intents`
+20. 工作区：multipart 草稿附件入口。
 
 ## 当前实现断点
 
@@ -58,7 +59,7 @@
 ### 1. MIME 与附件入口
 
 - MIME 构建层已完成并提交；后续不得回退为手写 MIME。
-- new/reply/reply-all/forward 已接入；剩余：HTTP multipart 上传和 MCP 小附件输入。
+- new/reply/reply-all/forward 已接入；HTTP JSON 和 `multipart/form-data`（`metadata` + `attachments[]`）创建/更新草稿均已接入。附件字段分块读取，原始总量限制 25 MiB，metadata 限制 1 MiB，任何附件均不落盘。剩余：MCP 小附件输入。
 - 已有 Gmail 附件/内嵌图片转发与下载已接入；附件下载受 Gmail JSON/base64url API 限制，在内存中有界解码后转发，不会落盘。
 - 已有稳定 Message-ID、In-Reply-To/References、header injection 防护、非 ASCII header、filename/content type 校验、双重 25 MiB 限制和有界 writer 测试。
 

@@ -1,8 +1,8 @@
 //! HTTP transport and command entrypoints.
 use axum::{
     Json, Router,
-    body::Bytes,
-    extract::{Path, Query, State},
+    body::{Bytes, to_bytes},
+    extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, State},
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -31,7 +31,10 @@ use crate::{
         access::{AccessKey, KeyPublicId, parse_credential},
         delivery::{DraftVersion, ManagedDraft, SendConfirmation, SendOutcome, SendPreview},
         identity::{ConnectionId, GmailConnection, User, UserId, UserRole},
-        mailbox::{EmailAddress, Recipients, sanitize_filename},
+        mailbox::{
+            AttachmentInfo, EmailAddress, MAX_HTTP_ATTACHMENT_BYTES, Recipients, sanitize_filename,
+            validate_filename,
+        },
     },
     gmail_credentials::GmailCredentialProvider,
     google_gmail::GoogleGmailClient,
@@ -846,6 +849,131 @@ struct DraftRequest {
     #[serde(default = "default_include_attachments")]
     include_attachments: bool,
 }
+struct DraftInput {
+    request: DraftRequest,
+    attachments: Vec<crate::adapter::MailAttachment>,
+}
+
+impl<S> FromRequest<S> for DraftInput
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(
+        request: axum::extract::Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let content_type = request
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if content_type.starts_with("application/json") {
+            let bytes = to_bytes(request.into_body(), 1024 * 1024)
+                .await
+                .map_err(|_| draft_input_error("invalid request body"))?;
+            let request = serde_json::from_slice(&bytes)
+                .map_err(|_| draft_input_error("invalid draft metadata"))?;
+            return Ok(Self {
+                request,
+                attachments: vec![],
+            });
+        }
+        if !content_type.starts_with("multipart/form-data") {
+            return Err(draft_input_error(
+                "content type must be JSON or multipart/form-data",
+            ));
+        }
+        let mut multipart = Multipart::from_request(request, state)
+            .await
+            .map_err(|_| draft_input_error("invalid multipart body"))?;
+        let mut metadata = None;
+        let mut attachments = Vec::new();
+        let mut total = 0_usize;
+        while let Some(mut field) = multipart
+            .next_field()
+            .await
+            .map_err(|_| draft_input_error("invalid multipart body"))?
+        {
+            let name = field.name().unwrap_or_default().to_owned();
+            if name == "metadata" {
+                if metadata.is_some() {
+                    return Err(draft_input_error("metadata must appear once"));
+                }
+                let mut bytes = Vec::new();
+                while let Some(chunk) = field
+                    .chunk()
+                    .await
+                    .map_err(|_| draft_input_error("invalid multipart metadata"))?
+                {
+                    if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
+                        return Err(draft_input_error("metadata is too large"));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                metadata = Some(
+                    serde_json::from_slice(&bytes)
+                        .map_err(|_| draft_input_error("invalid draft metadata"))?,
+                );
+            } else if name == "attachments" {
+                let filename = sanitize_filename(field.file_name().unwrap_or("attachment"));
+                validate_filename(&filename)
+                    .map_err(|_| draft_input_error("invalid attachment filename"))?;
+                let content_type = field
+                    .content_type()
+                    .unwrap_or("application/octet-stream")
+                    .to_owned();
+                if content_type.len() > 256
+                    || content_type.bytes().any(|byte| byte.is_ascii_control())
+                {
+                    return Err(draft_input_error("invalid attachment content type"));
+                }
+                let mut data = Vec::new();
+                while let Some(chunk) = field
+                    .chunk()
+                    .await
+                    .map_err(|_| draft_input_error("invalid attachment"))?
+                {
+                    if total.saturating_add(data.len()).saturating_add(chunk.len())
+                        > MAX_HTTP_ATTACHMENT_BYTES
+                    {
+                        return Err(draft_input_error("attachments exceed 25 MiB"));
+                    }
+                    data.extend_from_slice(&chunk);
+                }
+                total += data.len();
+                let info = AttachmentInfo {
+                    id: Uuid::now_v7().to_string(),
+                    filename,
+                    content_type,
+                    size_bytes: data.len() as u64,
+                    inline: false,
+                };
+                attachments.push(crate::adapter::MailAttachment {
+                    info,
+                    data,
+                    inline_content_id: None,
+                });
+            } else {
+                return Err(draft_input_error("unexpected multipart field"));
+            }
+        }
+        Ok(Self {
+            request: metadata.ok_or_else(|| draft_input_error("metadata is required"))?,
+            attachments,
+        })
+    }
+}
+
+fn draft_input_error(message: &'static str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error":{"code":"invalid_request","message":message}})),
+    )
+        .into_response()
+}
 fn default_include_attachments() -> bool {
     true
 }
@@ -1075,8 +1203,12 @@ async fn create_draft(
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: axum::http::Uri,
-    Json(req): Json<DraftRequest>,
+    input: DraftInput,
 ) -> Response {
+    let DraftInput {
+        request: req,
+        attachments,
+    } = input;
     let cid = ConnectionId::from_uuid(cid);
     if authorize(&headers, uri.query(), &state, cid).await.is_err() {
         return error_response(
@@ -1221,6 +1353,21 @@ async fn create_draft(
             }
         }
     };
+    if !attachments.is_empty() {
+        if !matches!(req.kind, DraftKind::New) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "multipart attachments are supported only for new drafts",
+                &headers,
+            );
+        }
+        draft.attachments = attachments
+            .iter()
+            .map(|attachment| attachment.info.clone())
+            .collect();
+        draft.attachment_data = attachments;
+    }
     match state.adapter.create_draft(cid, draft).await {
         Ok(v) => {
             let managed = match ManagedDraft::new(
@@ -1269,8 +1416,12 @@ async fn update_draft(
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: axum::http::Uri,
-    Json(req): Json<DraftRequest>,
+    input: DraftInput,
 ) -> Response {
+    let DraftInput {
+        request: req,
+        attachments,
+    } = input;
     let cid = ConnectionId::from_uuid(cid);
     if authorize(&headers, uri.query(), &state, cid).await.is_err() {
         return error_response(
@@ -1352,10 +1503,13 @@ async fn update_draft(
         to: recipients.to.clone(),
         cc: recipients.cc.clone(),
         bcc: recipients.bcc.clone(),
-        attachments: vec![],
+        attachments: attachments
+            .iter()
+            .map(|attachment| attachment.info.clone())
+            .collect(),
         html_body: None,
         reply_headers: None,
-        attachment_data: vec![],
+        attachment_data: attachments,
     };
     let content = draft_fingerprint_content(&candidate);
     let mut changed = current.clone();
@@ -2633,6 +2787,9 @@ pub fn router(state: AppState) -> Router {
             post(send_draft),
         )
         .with_state(state)
+        .layer(DefaultBodyLimit::max(
+            MAX_HTTP_ATTACHMENT_BYTES + 1024 * 1024,
+        ))
         .layer(middleware::from_fn(request_context))
 }
 pub fn build_router(state: AppState) -> Router {
@@ -2971,6 +3128,43 @@ mod tests {
         assert_eq!(response["draft"]["to"], json!(["sender@example.com"]));
         assert_eq!(response["draft"]["cc"], json!(["copy@example.com"]));
         assert_eq!(response["managed_draft"]["state"], "active");
+    }
+
+    #[tokio::test]
+    async fn multipart_new_draft_keeps_bounded_attachment_data() {
+        let (state, credential, connection, adapter) = AppState::test_fixture_with_adapter();
+        let boundary = "agentmail-test-boundary";
+        let metadata = r#"{"subject":"report","body":"see attachment","to":["to@example.com"]}"#;
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"metadata\"\r\nContent-Type: application/json\r\n\r\n{metadata}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"attachments\"; filename=\"report.txt\"\r\nContent-Type: text/plain\r\n\r\nhello attachment\r\n--{boundary}--\r\n"
+        );
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/connections/{connection}/drafts"))
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["draft"]["attachments"][0]["filename"], "report.txt");
+        let draft = adapter
+            .get_draft(connection, value["draft"]["id"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(draft.attachment_data.len(), 1);
+        assert_eq!(draft.attachment_data[0].data, b"hello attachment");
     }
 
     #[tokio::test]
