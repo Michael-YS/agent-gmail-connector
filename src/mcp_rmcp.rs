@@ -181,4 +181,86 @@ mod tests {
             .expect("response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+
+    #[tokio::test]
+    async fn streamable_route_rejects_invalid_content_negotiation() {
+        let (state, credential, _) = AppState::test_fixture();
+        let request_body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let missing_event_stream = crate::http::build_router(state.clone())
+            .oneshot(
+                Request::post("/mcp-streamable")
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("host", "localhost")
+                    .header("accept", "application/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(missing_event_stream.status(), StatusCode::NOT_ACCEPTABLE);
+
+        let missing_json = crate::http::build_router(state)
+            .oneshot(
+                Request::post("/mcp-streamable")
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("host", "localhost")
+                    .header("accept", "application/json, text/event-stream")
+                    .header("content-type", "text/plain")
+                    .body(Body::from(request_body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(missing_json.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn streamable_route_rejects_stateless_session_methods_and_unknown_protocol() {
+        let (state, credential, _) = AppState::test_fixture();
+        let get = crate::http::build_router(state.clone())
+            .oneshot(
+                Request::get("/mcp-streamable")
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("host", "localhost")
+                    .header("accept", "text/event-stream")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(get.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(get.headers().get("allow").unwrap(), "POST");
+
+        let delete = crate::http::build_router(state.clone())
+            .oneshot(
+                Request::delete("/mcp-streamable")
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("host", "localhost")
+                    .header("mcp-session-id", "legacy-session")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(delete.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(delete.headers().get("allow").unwrap(), "POST");
+
+        let unknown_protocol = crate::http::build_router(state)
+            .oneshot(
+                Request::post("/mcp-streamable")
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("host", "localhost")
+                    .header("accept", "application/json, text/event-stream")
+                    .header("content-type", "application/json")
+                    .header("mcp-protocol-version", "2099-01-01")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(unknown_protocol.status(), StatusCode::BAD_REQUEST);
+    }
 }
