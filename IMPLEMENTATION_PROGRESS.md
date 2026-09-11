@@ -36,7 +36,8 @@
 24. `8b1a20c feat: extend mcp transport and release checks`
 25. `ec7546b fix: harden mcp idempotency and audit`
 26. `df0ab81 test: cover rmcp draft idempotency`
-27. 当前工作区：rmcp session/协议负向契约测试与文档同步。
+27. `24b2e24 test: cover rmcp protocol boundaries`
+28. 当前工作区：补齐 MCP/OpenAPI schema snapshot、Host rebinding 与 rmcp 错误分类契约。
 
 ## 当前实现断点
 
@@ -51,7 +52,7 @@
 - 安全 MIME 构建层已使用 `mail-builder 0.5` 完成：稳定 Message-ID、reply References、reply-all 排除当前主地址、非 ASCII header、安全附件 filename/content-type、inline CID、原始附件与最终编码消息的 25 MiB 双重限制，以及有界 writer。
 - managed draft 已接入真实 Gmail create/update/delete：使用稳定 Message-ID 和安全 MIME，按草稿独立串行化，从 SQLite 恢复重启后的 managed record，保持 expected-version 乐观锁，并对 create 持久化失败做补偿删除、对 delete 404 做幂等成功。prepare/send/update/delete 会重读 Gmail 当前草稿并以完整结构化内容重算 version，网页端编辑会使旧确认失效；prepare 也返回真实收件人、主题、正文摘要和附件名。
 - `POST /api/v1/connections/{connection_id}/drafts` 已支持持久化 `Idempotency-Key`：只保存 key 与请求摘要的 SHA-256 和内部 managed draft ID；相同 key/摘要返回原草稿，不会再创建 Gmail draft，摘要不同时返回冲突。managed draft 与完成记录在同一 SQLite 事务写入。
-- MCP 兼容 JSON-RPC 已增加 `messages.get`、`threads.get`、`messages.get_attachment`、`drafts.list`、`drafts.get`、`drafts.create`、`drafts.update`、`drafts.delete`、`drafts.prepare_send` 与 `drafts.send`，与 REST 共用 Access Key/Connection grant、草稿状态机、确认 token 和审计边界；邮件和附件明确标为不可信。`drafts.create/update` 的 base64 附件总原始数据上限为 4 MiB，任何附件均不落盘。MCP 草稿创建会按 JSON-RPC 调用生成稳定的持久化幂等键，重试不会重复创建。新增 `/mcp-streamable` 使用官方 rmcp 的无状态 Streamable HTTP、Bearer 认证和当前全部工具 schema；当前所有工具通过受控兼容 bridge 复用认证、限流、领域状态机和元数据审计，原生 rmcp handler、schema snapshot 与协议负向测试仍在后续范围。
+- MCP 兼容 JSON-RPC 已增加 `messages.get`、`threads.get`、`messages.get_attachment`、`drafts.list`、`drafts.get`、`drafts.create`、`drafts.update`、`drafts.delete`、`drafts.prepare_send` 与 `drafts.send`，与 REST 共用 Access Key/Connection grant、草稿状态机、确认 token 和审计边界；邮件和附件明确标为不可信。`drafts.create/update` 的 base64 附件总原始数据上限为 4 MiB，任何附件均不落盘。MCP 草稿创建会按 JSON-RPC 调用生成稳定的持久化幂等键，重试不会重复创建。新增 `/mcp-streamable` 使用官方 rmcp 的无状态 Streamable HTTP、Bearer 认证和当前全部工具 schema；当前所有工具通过受控兼容 bridge 复用认证、限流、领域状态机和元数据审计。MCP/OpenAPI schema 摘要、Host rebinding、内容协商、无状态协议边界及 rmcp 授权错误分类均有契约测试；原生 handler 迁移不是 v1 硬要求，仍待真实 MCP client 验收及 `/mcp` 兼容端点迁移决策。
 - REST create draft 已支持 `new`、`reply`、`reply_all`、`forward` 意图。reply/reply_all 使用源邮件 thread、`In-Reply-To` 和 `References`；reply_all 排除当前主地址。forward 默认复制同一已授权源邮件的附件与内嵌 CID 数据，并经过 MIME 原始/编码双重大小限制。
 - confirmation token 只以 SHA-256 hash 入库；prepare 先持久化再返回明文一次；claim/outcome 与 managed draft 状态分别在 SQLite 事务中原子更新。相同 token 重放首次结果，不再次发送。
 - production send 已启用单次 Gmail `drafts.send`。Timeout、5xx/Unavailable、429 和 claim 后进程重启均只按系统生成的 `@agentmail.invalid` Message-ID 查询 Sent；要求精确 Message-ID header 与 `SENT` 标签，无法确认则持久化 `send_state_unknown`，绝不盲目重发。
@@ -61,7 +62,7 @@
 - 邀请接受以 POST body 中的一次性 token 启动 Login OAuth；token 仅以 SHA-256 hash 绑定到 OAuth transaction，callback 仅以已验证、规范化 email 和精确 Google `sub` 原子接受邀请、创建 Member 与 session。重放、错误 email、过期或撤销邀请均不创建 session。
 - 常规 Google Login 会以精确 Google `sub` 与规范化 verified email 登录既有 active Owner 或 Member；没有既有用户时才保留首次 Owner bootstrap 规则。
 - Owner JSON API 已接入：`GET/POST /control/api/invitations`、`POST /control/api/invitations/{id}/revoke`、`POST /control/api/invitations/{id}/regenerate`；HTML 保留 `/control/invitations...`。mutation 要求 Owner session+CSRF，列表不返回 hash，create/regenerate token 只返回一次并 `Cache-Control: no-store`。
-- 最新本地完整验证：187 个 library tests、4 个 HTTP tests、13 个 REST/MCP tests，共 204 项；`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo test --all-targets --all-features --locked` 已通过。未执行部署、真实 Google 或浏览器 smoke。
+- 最新本地完整验证：188 个 library tests、4 个 HTTP tests、15 个 REST/MCP tests，共 207 项；`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo test --all-targets --all-features --locked` 已通过。未执行部署、真实 Google 或浏览器 smoke。
 
 ## 剩余实现里程碑
 

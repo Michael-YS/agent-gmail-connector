@@ -263,4 +263,27 @@ mod tests {
             .expect("response");
         assert_eq!(unknown_protocol.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn streamable_route_rejects_untrusted_host_before_dispatch() {
+        let (state, credential, _) = AppState::test_fixture();
+        let response = crate::http::build_router(state)
+            .oneshot(
+                Request::post("/mcp-streamable")
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("host", "attacker.example")
+                    .header("accept", "application/json, text/event-stream")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let body = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(body.contains("Host header is not allowed"), "{body}");
+    }
 }

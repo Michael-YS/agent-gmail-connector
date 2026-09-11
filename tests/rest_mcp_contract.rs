@@ -4,6 +4,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -459,6 +460,13 @@ async fn rmcp_streamable_http_negotiates_and_lists_tools() {
             .iter()
             .all(|tool| tool["inputSchema"].is_object() && tool["annotations"].is_object())
     );
+    let streamable_digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(&tools["result"]["tools"]).expect("tools schema serializes"),
+    ));
+    assert_eq!(
+        streamable_digest,
+        "4d085848720023737060922ca308b761f9e69452cb850c22e9b2931c4350b8bf"
+    );
 
     let call = build_router(state)
         .oneshot(
@@ -484,6 +492,42 @@ async fn rmcp_streamable_http_negotiates_and_lists_tools() {
     assert_eq!(
         call["result"]["structuredContent"]["connection_id"],
         connection.to_string()
+    );
+}
+
+#[tokio::test]
+async fn rmcp_streamable_errors_preserve_safe_authorization_category() {
+    let (state, credential, _) = AppState::test_fixture();
+    let denied_connection = Uuid::new_v4();
+    let response = build_router(state)
+        .oneshot(
+            Request::post("/mcp-streamable")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("host", "localhost")
+                .header("accept", "application/json, text/event-stream")
+                .header("content-type", "application/json")
+                .body(mcp_request(
+                    "tools/call",
+                    17,
+                    json!({
+                        "name": "messages.search",
+                        "arguments": {"connection_id": denied_connection}
+                    }),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response_json(response).await;
+    assert_eq!(value["result"]["isError"], true);
+    assert_eq!(
+        value["result"]["structuredContent"]["error"]["code"],
+        "forbidden"
+    );
+    assert_eq!(
+        value["result"]["structuredContent"]["error"]["message"],
+        "access denied"
     );
 }
 
@@ -653,6 +697,13 @@ async fn openapi_describes_every_rest_route_and_write_contract() {
         .await
         .unwrap();
     let document = response_json(response).await;
+    let openapi_digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(&document).expect("OpenAPI document serializes"),
+    ));
+    assert_eq!(
+        openapi_digest,
+        "31f7f77b26fbc346af53c40dbf22f4cb18c2d17c1aa2fd049a3920cf1d817f33"
+    );
     let expected = [
         ("/api/v1/connections", &["get"][..]),
         ("/api/v1/connections/{connection_id}/messages", &["get"][..]),
@@ -770,6 +821,31 @@ async fn mcp_tools_list_exposes_search_schema_and_compatibility_note() {
     assert_eq!(
         value["result"]["compatibility"],
         "minimal_json_rpc_not_full_streamable_http"
+    );
+}
+
+#[tokio::test]
+async fn mcp_tools_schema_snapshot_is_stable() {
+    let (state, credential, _connection) = AppState::test_fixture();
+    let response = build_router(state)
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(mcp_request("tools/list", 99, json!({})))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response_json(response).await;
+    let tools = value["result"]["tools"].clone();
+    let digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(&tools).expect("tools schema serializes"),
+    ));
+    assert_eq!(
+        digest,
+        "4d085848720023737060922ca308b761f9e69452cb850c22e9b2931c4350b8bf"
     );
 }
 
