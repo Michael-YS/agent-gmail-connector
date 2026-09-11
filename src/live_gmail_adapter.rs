@@ -16,7 +16,7 @@ use crate::{
     gmail_credentials::{CredentialError, GmailCredentialProvider},
     google_gmail::{GmailMessage, GoogleGmailClient, GoogleGmailError, MessageFormat},
     google_token::GoogleTokenClient,
-    mime::{MimeMessage, build_mime},
+    mime::{MimeAttachment, MimeMessage, build_mime},
     repository::Repository,
 };
 use async_trait::async_trait;
@@ -241,7 +241,11 @@ impl GmailAdapter for LiveGmailAdapter {
         if data.len() as u64 != info.size_bytes {
             return Err(AdapterError::Unavailable);
         }
-        Ok(MailAttachment { info, data })
+        Ok(MailAttachment {
+            info,
+            data,
+            inline_content_id: part.content_id.clone(),
+        })
     }
 
     async fn list_drafts(&self, connection: ConnectionId) -> Result<Vec<MailDraft>, AdapterError> {
@@ -381,7 +385,13 @@ fn build_draft_mime(
     connection: &GmailConnection,
     draft: &MailDraft,
 ) -> Result<Vec<u8>, AdapterError> {
-    if !draft.attachments.is_empty() {
+    if draft.attachments.len() != draft.attachment_data.len()
+        || draft
+            .attachments
+            .iter()
+            .zip(&draft.attachment_data)
+            .any(|(metadata, data)| metadata != &data.info)
+    {
         return Err(AdapterError::InvalidInput);
     }
     let from = EmailAddress::new(&connection.email).map_err(|_| AdapterError::InvalidInput)?;
@@ -392,10 +402,19 @@ fn build_draft_mime(
         recipients,
         subject: draft.subject.clone(),
         text_body: Some(draft.body.clone()),
-        html_body: None,
+        html_body: draft.html_body.clone(),
         stable_message_id: draft.stable_message_id.clone(),
-        reply_headers: None,
-        attachments: Vec::new(),
+        reply_headers: draft.reply_headers.clone(),
+        attachments: draft
+            .attachment_data
+            .iter()
+            .map(|attachment| MimeAttachment {
+                filename: attachment.info.filename.clone(),
+                content_type: attachment.info.content_type.clone(),
+                data: attachment.data.clone(),
+                inline_content_id: attachment.inline_content_id.clone(),
+            })
+            .collect(),
     })
     .map_err(|_| AdapterError::InvalidInput)
 }
@@ -499,6 +518,9 @@ fn to_mail_draft(id: String, message: GmailMessage) -> MailDraft {
         cc: mapped.metadata.cc,
         bcc,
         attachments: mapped.metadata.attachments,
+        html_body: mapped.html_body,
+        reply_headers: None,
+        attachment_data: vec![],
     }
 }
 

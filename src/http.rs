@@ -43,6 +43,7 @@ use crate::{
     },
     live_gmail_adapter::LiveGmailAdapter,
     mailbox_service::{MailboxReadError, MailboxReadService, MessageSearchResult},
+    mime::{ReplyHeaders, ReplyKind, reply_recipients},
     repository::{DurableRateCharge, DurableSendClaim, RateChargeError, Repository},
 };
 
@@ -106,6 +107,10 @@ impl AppState {
         Self::new(None, Arc::new(FakeGmailAdapter::new()))
     }
     pub fn test_fixture() -> (Self, String, ConnectionId) {
+        let (state, credential, connection, _) = Self::test_fixture_with_adapter();
+        (state, credential, connection)
+    }
+    fn test_fixture_with_adapter() -> (Self, String, ConnectionId, Arc<FakeGmailAdapter>) {
         let user = User::new("test-sub", "test@example.com", UserRole::Owner, Utc::now())
             .expect("fixture");
         let uid = user.id;
@@ -127,7 +132,7 @@ impl AppState {
             database: None,
             repository: None,
             adapter: adapter.clone(),
-            mailbox_service: MailboxReadService::new(adapter),
+            mailbox_service: MailboxReadService::new(adapter.clone()),
             users: Arc::new(RwLock::new(HashMap::from([(uid, user)]))),
             connections: Arc::new(RwLock::new(HashMap::from([(cid, conn)]))),
             keys: Arc::new(RwLock::new(HashMap::from([(
@@ -140,7 +145,7 @@ impl AppState {
             pending_tokens: Arc::new(RwLock::new(HashMap::new())),
             rate_buckets: Arc::new(Mutex::new(HashMap::new())),
         };
-        (state, credential, cid)
+        (state, credential, cid, adapter)
     }
 }
 #[derive(Clone, Copy)]
@@ -772,7 +777,18 @@ async fn list_drafts(
         );
     }
     match state.adapter.list_drafts(cid).await {
-        Ok(v) => ok_json(json!({"connection_id":cid,"drafts":v}), &headers),
+        Ok(v) => {
+            let mut views = Vec::with_capacity(v.len());
+            for draft in v {
+                let managed = managed_draft_for_gmail(&state, cid, &draft.id).await;
+                views.push(json!({
+                    "draft": draft,
+                    "managed_by_agentmail": managed.is_some(),
+                    "version": managed.map(|managed| managed.version),
+                }));
+            }
+            ok_json(json!({"connection_id":cid,"drafts":views}), &headers)
+        }
         Err(e) => adapter_response(e, &headers),
     }
 }
@@ -792,14 +808,32 @@ async fn get_draft(
         );
     }
     match state.adapter.get_draft(cid, &did).await {
-        Ok(v) => ok_json(json!({"connection_id":cid,"draft":v}), &headers),
+        Ok(v) => {
+            let managed = managed_draft_for_gmail(&state, cid, &v.id).await;
+            ok_json(
+                json!({
+                    "connection_id":cid,
+                    "draft":v,
+                    "managed_by_agentmail":managed.is_some(),
+                    "version":managed.map(|managed| managed.version),
+                }),
+                &headers,
+            )
+        }
         Err(e) => adapter_response(e, &headers),
     }
 }
 #[derive(Deserialize, Default)]
 struct DraftRequest {
+    #[serde(default)]
+    kind: DraftKind,
+    #[serde(default)]
+    source_message_id: Option<String>,
+    #[serde(default)]
     subject: String,
+    #[serde(default)]
     body: String,
+    #[serde(default)]
     to: Vec<String>,
     #[serde(default)]
     cc: Vec<String>,
@@ -809,6 +843,20 @@ struct DraftRequest {
     thread_id: Option<String>,
     #[serde(default)]
     expected_version: Option<String>,
+    #[serde(default = "default_include_attachments")]
+    include_attachments: bool,
+}
+fn default_include_attachments() -> bool {
+    true
+}
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DraftKind {
+    #[default]
+    New,
+    Reply,
+    ReplyAll,
+    Forward,
 }
 #[derive(Deserialize, Default)]
 struct ExpectedVersionQuery {
@@ -822,6 +870,64 @@ fn parse_recipients(r: &DraftRequest) -> Result<Recipients, &'static str> {
             .map_err(|_| "invalid recipient")
     };
     Recipients::new(parse(&r.to)?, parse(&r.cc)?, parse(&r.bcc)?).map_err(|_| "invalid recipients")
+}
+async fn connection_primary_address(
+    state: &AppState,
+    connection: ConnectionId,
+) -> Result<EmailAddress, AdapterError> {
+    if let Some(value) = state.connections.read().await.get(&connection) {
+        return EmailAddress::new(&value.email).map_err(|_| AdapterError::Unavailable);
+    }
+    let repository = state.repository.as_ref().ok_or(AdapterError::NotFound)?;
+    let record = repository
+        .get_connection(connection)
+        .await
+        .map_err(|_| AdapterError::Unavailable)?
+        .ok_or(AdapterError::NotFound)?;
+    EmailAddress::new(record.email).map_err(|_| AdapterError::Unavailable)
+}
+
+fn reply_headers_for(message: &crate::adapter::MailMessage) -> Result<ReplyHeaders, AdapterError> {
+    let value = |name: &str| {
+        message
+            .headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case(name))
+            .map(|header| header.value.as_str())
+    };
+    let parent = value("message-id").ok_or(AdapterError::InvalidInput)?;
+    let references = value("references")
+        .into_iter()
+        .flat_map(|value| value.split_ascii_whitespace())
+        .map(str::to_owned)
+        .chain(
+            value("in-reply-to")
+                .into_iter()
+                .flat_map(|value| value.split_ascii_whitespace())
+                .map(str::to_owned),
+        )
+        .collect();
+    ReplyHeaders::new(parent, references).map_err(|_| AdapterError::InvalidInput)
+}
+
+fn reply_subject(subject: &str) -> String {
+    if subject.trim_start().to_ascii_lowercase().starts_with("re:") {
+        subject.to_owned()
+    } else {
+        format!("Re: {subject}")
+    }
+}
+
+fn forward_subject(subject: &str) -> String {
+    if subject
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("fwd:")
+    {
+        subject.to_owned()
+    } else {
+        format!("Fwd: {subject}")
+    }
 }
 fn draft_fingerprint_content(draft: &MailDraft) -> Vec<u8> {
     // This is deliberately a canonical structured representation instead of
@@ -941,6 +1047,29 @@ fn draft_for_connection(
         )))
     }
 }
+async fn managed_draft_for_gmail(
+    state: &AppState,
+    connection: ConnectionId,
+    gmail_draft_id: &str,
+) -> Option<ManagedDraft> {
+    if let Some(draft) = state
+        .drafts
+        .read()
+        .await
+        .values()
+        .find(|draft| draft.connection_id == connection && draft.gmail_draft_id == gmail_draft_id)
+        .cloned()
+    {
+        return Some(draft);
+    }
+    state
+        .repository
+        .as_ref()?
+        .find_draft_by_gmail_id(connection, gmail_draft_id)
+        .await
+        .ok()
+        .flatten()
+}
 async fn create_draft(
     Path(cid): Path<Uuid>,
     State(state): State<AppState>,
@@ -957,21 +1086,140 @@ async fn create_draft(
             &headers,
         );
     }
-    if let Err(msg) = parse_recipients(&req) {
-        return error_response(StatusCode::BAD_REQUEST, "invalid_request", msg, &headers);
-    }
     let stable_message_id = format!("<{}@agentmail.invalid>", Uuid::now_v7());
-    let recipients = parse_recipients(&req).expect("validated above");
-    let draft = MailDraft {
+    let mut draft = MailDraft {
         id: Uuid::now_v7().to_string(),
         stable_message_id,
-        thread_id: req.thread_id,
-        subject: req.subject,
-        body: req.body,
-        to: recipients.to,
-        cc: recipients.cc,
-        bcc: recipients.bcc,
+        thread_id: req.thread_id.clone(),
+        subject: req.subject.clone(),
+        body: req.body.clone(),
+        to: vec![],
+        cc: vec![],
+        bcc: vec![],
         attachments: vec![],
+        html_body: None,
+        reply_headers: None,
+        attachment_data: vec![],
+    };
+    match req.kind {
+        DraftKind::New => match parse_recipients(&req) {
+            Ok(recipients) => {
+                draft.to = recipients.to;
+                draft.cc = recipients.cc;
+                draft.bcc = recipients.bcc;
+            }
+            Err(message) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    message,
+                    &headers,
+                );
+            }
+        },
+        DraftKind::Reply | DraftKind::ReplyAll | DraftKind::Forward => {
+            let Some(source_id) = req.source_message_id.as_deref() else {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "source_message_id is required",
+                    &headers,
+                );
+            };
+            let source = match state.adapter.get_message(cid, source_id).await {
+                Ok(message) => message,
+                Err(error) => return adapter_response(error, &headers),
+            };
+            let primary = match connection_primary_address(&state, cid).await {
+                Ok(address) => address,
+                Err(error) => return adapter_response(error, &headers),
+            };
+            match req.kind {
+                DraftKind::Reply | DraftKind::ReplyAll => {
+                    let Some(from) = source.metadata.from.as_ref() else {
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request",
+                            "source has no reply address",
+                            &headers,
+                        );
+                    };
+                    let kind = if matches!(req.kind, DraftKind::ReplyAll) {
+                        ReplyKind::ReplyAll
+                    } else {
+                        ReplyKind::Reply
+                    };
+                    let recipients = match reply_recipients(
+                        kind,
+                        &primary,
+                        from,
+                        &source.metadata.to,
+                        &source.metadata.cc,
+                    ) {
+                        Ok(recipients) => recipients,
+                        Err(_) => {
+                            return error_response(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_request",
+                                "source has no reply recipients",
+                                &headers,
+                            );
+                        }
+                    };
+                    draft.thread_id = source.metadata.thread_id.clone();
+                    draft.subject = reply_subject(&source.metadata.subject);
+                    draft.to = recipients.to;
+                    draft.cc = recipients.cc;
+                    draft.bcc = recipients.bcc;
+                    draft.reply_headers = match reply_headers_for(&source) {
+                        Ok(headers) => Some(headers),
+                        Err(error) => return adapter_response(error, &headers),
+                    };
+                }
+                DraftKind::Forward => {
+                    let recipients = match parse_recipients(&req) {
+                        Ok(recipients) => recipients,
+                        Err(message) => {
+                            return error_response(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_request",
+                                message,
+                                &headers,
+                            );
+                        }
+                    };
+                    draft.subject = forward_subject(&source.metadata.subject);
+                    draft.to = recipients.to;
+                    draft.cc = recipients.cc;
+                    draft.bcc = recipients.bcc;
+                    let source_from = source
+                        .metadata
+                        .from
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default();
+                    draft.body = format!(
+                        "{}\n\n---------- Forwarded message ----------\nFrom: {source_from}\nSubject: {}\n\n{}",
+                        req.body, source.metadata.subject, source.body
+                    );
+                    if req.include_attachments {
+                        for attachment in &source.metadata.attachments {
+                            let data = match state
+                                .adapter
+                                .get_attachment(cid, source_id, &attachment.id)
+                                .await
+                            {
+                                Ok(data) => data,
+                                Err(error) => return adapter_response(error, &headers),
+                            };
+                            draft.attachments.push(data.info.clone());
+                            draft.attachment_data.push(data);
+                        }
+                    }
+                }
+                DraftKind::New => unreachable!(),
+            }
+        }
     };
     match state.adapter.create_draft(cid, draft).await {
         Ok(v) => {
@@ -1105,6 +1353,9 @@ async fn update_draft(
         cc: recipients.cc.clone(),
         bcc: recipients.bcc.clone(),
         attachments: vec![],
+        html_body: None,
+        reply_headers: None,
+        attachment_data: vec![],
     };
     let content = draft_fingerprint_content(&candidate);
     let mut changed = current.clone();
@@ -2617,7 +2868,13 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap())
+        let json = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "response status {status}, JSON error {error}, body {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        (status, json)
     }
 
     async fn persisted_state() -> (AppState, String, ConnectionId, ConnectionId) {
@@ -2670,6 +2927,50 @@ mod tests {
         assert_eq!(connections.len(), 1);
         assert_eq!(connections[0]["connection_id"], json!(first));
         assert_ne!(connections[0]["connection_id"], json!(second));
+    }
+
+    #[tokio::test]
+    async fn reply_all_creates_managed_threaded_draft() {
+        let (state, credential, connection, adapter) = AppState::test_fixture_with_adapter();
+        adapter
+            .insert_message(
+                connection,
+                crate::adapter::MailMessage {
+                    metadata: crate::domain::mailbox::MessageMetadata {
+                        id: "source-1".into(),
+                        thread_id: Some("thread-1".into()),
+                        sent_at: None,
+                        from: Some(EmailAddress::new("sender@example.com").unwrap()),
+                        to: vec![EmailAddress::new("gmail@example.com").unwrap()],
+                        cc: vec![EmailAddress::new("copy@example.com").unwrap()],
+                        subject: "Topic".into(),
+                        snippet: "snippet".into(),
+                        attachments: vec![],
+                    },
+                    body: "original".into(),
+                    body_is_html: false,
+                    html_body: None,
+                    headers: vec![crate::adapter::MailHeader {
+                        name: "Message-ID".into(),
+                        value: "<parent@example.com>".into(),
+                    }],
+                },
+            )
+            .await;
+        let (status, response) = json_request(
+            &router(state),
+            Method::POST,
+            format!("/api/v1/connections/{connection}/drafts"),
+            &credential,
+            json!({"kind":"reply_all","source_message_id":"source-1","body":"answer"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["draft"]["thread_id"], "thread-1");
+        assert_eq!(response["draft"]["subject"], "Re: Topic");
+        assert_eq!(response["draft"]["to"], json!(["sender@example.com"]));
+        assert_eq!(response["draft"]["cc"], json!(["copy@example.com"]));
+        assert_eq!(response["managed_draft"]["state"], "active");
     }
 
     #[tokio::test]

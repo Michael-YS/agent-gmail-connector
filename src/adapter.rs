@@ -4,6 +4,7 @@ use crate::domain::{
     identity::ConnectionId,
     mailbox::{AttachmentInfo, EmailAddress, MessageMetadata},
 };
+use crate::mime::ReplyHeaders;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt, sync::Arc};
@@ -25,6 +26,7 @@ pub struct MailHeader {
 pub struct MailAttachment {
     pub info: AttachmentInfo,
     pub data: Vec<u8>,
+    pub inline_content_id: Option<String>,
 }
 
 type AttachmentStore = HashMap<(ConnectionId, String, String), MailAttachment>;
@@ -51,6 +53,12 @@ pub struct MailDraft {
     pub cc: Vec<EmailAddress>,
     pub bcc: Vec<EmailAddress>,
     pub attachments: Vec<AttachmentInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_body: Option<String>,
+    #[serde(skip)]
+    pub reply_headers: Option<ReplyHeaders>,
+    #[serde(skip)]
+    pub attachment_data: Vec<MailAttachment>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
