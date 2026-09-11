@@ -21,7 +21,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use secrecy::SecretString;
-use std::{fmt, sync::Arc, time::Duration};
+use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
 use uuid::Uuid;
 
 const LIST_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
@@ -250,12 +250,28 @@ impl GmailAdapter for LiveGmailAdapter {
 
     async fn list_drafts(&self, connection: ConnectionId) -> Result<Vec<MailDraft>, AdapterError> {
         let token = self.access_token(connection).await?;
-        let result = self.gmail.list_drafts(&token, None, Some(100), None).await;
-        let list = self.map_gmail_result(connection, result).await?;
-        let mut drafts = Vec::with_capacity(list.drafts.len());
-        for draft in list.drafts {
+        let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+        let mut draft_ids = Vec::new();
+        loop {
+            let result = self
+                .gmail
+                .list_drafts(&token, None, Some(500), cursor.as_deref())
+                .await;
+            let list = self.map_gmail_result(connection, result).await?;
+            draft_ids.extend(list.drafts.into_iter().map(|draft| draft.id));
+            let Some(next) = list.next_page_token else {
+                break;
+            };
+            if !seen_cursors.insert(next.clone()) {
+                return Err(AdapterError::Unavailable);
+            }
+            cursor = Some(next);
+        }
+        let mut drafts = Vec::with_capacity(draft_ids.len());
+        for draft_id in draft_ids {
             let detail = self
-                .map_gmail_result(connection, self.gmail.get_draft(&token, &draft.id).await)
+                .map_gmail_result(connection, self.gmail.get_draft(&token, &draft_id).await)
                 .await?;
             drafts.push(to_mail_draft(detail.id, detail.message));
         }
