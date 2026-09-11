@@ -1573,6 +1573,17 @@ impl Repository {
         Ok(v != 0)
     }
 
+    /// Grant existence independent of the connection lifecycle status, so the
+    /// machine API can distinguish `reauth_required` from plain denial.
+    pub async fn access_key_grant_exists(
+        &self,
+        key: AccessKeyId,
+        connection: ConnectionId,
+    ) -> Result<bool, RepositoryError> {
+        let v:i64=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM access_keys k JOIN users u ON u.id=k.owner_id JOIN access_key_grants g ON g.access_key_id=k.id JOIN gmail_connections c ON c.id=g.connection_id WHERE k.id=? AND g.connection_id=? AND k.owner_id=c.owner_id AND k.owner_id=u.id AND k.status='active' AND u.status='active')").bind(key.to_string()).bind(connection.to_string()).fetch_one(&self.pool).await?;
+        Ok(v != 0)
+    }
+
     pub async fn insert_draft(&self, d: &ManagedDraft) -> Result<(), RepositoryError> {
         let now = encode_time(Utc::now());
         sqlx::query("INSERT INTO managed_drafts (id,connection_id,gmail_draft_id,stable_message_id,current_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").bind(d.id.to_string()).bind(d.connection_id.to_string()).bind(&d.gmail_draft_id).bind(&d.message_id).bind(d.version.as_str()).bind(draft_status(d.state)).bind(&now).bind(now.clone()).execute(&self.pool).await?;

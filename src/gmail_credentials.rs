@@ -282,8 +282,8 @@ where
         Err(CredentialError::ReauthRequired)
     }
 
-    /// Clear a token after the Gmail API rejects it.  The adapter should then
-    /// call `mark_reauth_required` through its store if the rejection is 401.
+    /// Clear a token after the Gmail API rejects it.  The adapter persists
+    /// `mark_reauth_required` through the repository when the rejection is 401.
     pub async fn invalidate(&self, connection_id: ConnectionId) {
         if let Some(entry) = self.entries.lock().await.get(&connection_id).cloned() {
             let _gate = entry.refresh_gate.lock().await;

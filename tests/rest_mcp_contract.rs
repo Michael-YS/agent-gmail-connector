@@ -1,3 +1,4 @@
+use agentmail::domain::identity::ConnectionStatus;
 use agentmail::http::{AppState, build_router};
 use axum::{
     body::{Body, to_bytes},
@@ -528,6 +529,44 @@ async fn rmcp_streamable_errors_preserve_safe_authorization_category() {
     assert_eq!(
         value["result"]["structuredContent"]["error"]["message"],
         "access denied"
+    );
+}
+
+#[tokio::test]
+async fn rmcp_streamable_surfaces_reauth_required_category() {
+    let (state, credential, connection) = AppState::test_fixture();
+    state
+        .connections
+        .write()
+        .await
+        .get_mut(&connection)
+        .expect("fixture connection exists")
+        .status = ConnectionStatus::ReauthRequired;
+    let response = build_router(state)
+        .oneshot(
+            Request::post("/mcp-streamable")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("host", "localhost")
+                .header("accept", "application/json, text/event-stream")
+                .header("content-type", "application/json")
+                .body(mcp_request(
+                    "tools/call",
+                    18,
+                    json!({
+                        "name": "messages.search",
+                        "arguments": {"connection_id": connection}
+                    }),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response_json(response).await;
+    assert_eq!(value["result"]["isError"], true);
+    assert_eq!(
+        value["result"]["structuredContent"]["error"]["code"],
+        "reauth_required"
     );
 }
 

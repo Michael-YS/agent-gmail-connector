@@ -155,6 +155,22 @@ impl GoogleTokenClient {
         })
     }
 
+    /// Test-only constructor bound to a local fake token endpoint.
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        token_endpoint: Url,
+        client_id: impl Into<String>,
+        client_secret: SecretString,
+        redirect_uri: Url,
+    ) -> Result<Self, GoogleTokenError> {
+        let http = Client::builder()
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| GoogleTokenError::Upstream)?;
+        Self::with_endpoint(http, token_endpoint, client_id, client_secret, redirect_uri)
+    }
+
     /// Exchange a one-time authorization code with PKCE proof.
     pub async fn exchange_code(
         &self,

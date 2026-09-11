@@ -66,6 +66,7 @@ pub enum AdapterError {
     InvalidInput,
     NotFound,
     RateLimited { retry_after_seconds: u64 },
+    ReauthRequired,
     Unavailable,
     Timeout,
 }
@@ -75,6 +76,7 @@ impl fmt::Display for AdapterError {
             Self::InvalidInput => f.write_str("invalid input"),
             Self::NotFound => f.write_str("not found"),
             Self::RateLimited { .. } => f.write_str("rate limited"),
+            Self::ReauthRequired => f.write_str("reauthorization required"),
             Self::Unavailable => f.write_str("upstream unavailable"),
             Self::Timeout => f.write_str("upstream timeout"),
         }

@@ -191,6 +191,17 @@ impl GoogleGmailClient {
         Self::with_base(http, base_url)
     }
 
+    /// Test-only constructor bound to a local fake Gmail API endpoint.
+    #[cfg(test)]
+    pub(crate) fn for_tests(base_url: Url) -> Result<Self, GoogleGmailError> {
+        let http = Client::builder()
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("test reqwest client must build");
+        Self::with_base(http, base_url)
+    }
+
     fn with_base(http: Client, base_url: Url) -> Result<Self, GoogleGmailError> {
         let path_ok = base_url.path() == "/gmail/v1/";
         let production = base_url.scheme() == "https"

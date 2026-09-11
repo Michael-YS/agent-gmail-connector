@@ -170,6 +170,7 @@ enum RateReservation {
     Memory(Vec<(String, ChargeReceipt)>),
 }
 use crate::domain::access::AccessKeyId;
+use crate::domain::identity::ConnectionStatus;
 
 fn request_id(headers: &HeaderMap) -> String {
     headers
@@ -369,7 +370,7 @@ fn mcp_audit_result(status: StatusCode, body: &[u8]) -> AuditResult {
         -32004 => AuditResult::NotFound,
         -32009 => AuditResult::Conflict,
         -32029 => AuditResult::RateLimited,
-        -32003 => AuditResult::Unavailable,
+        -32003 | -32005 => AuditResult::Unavailable,
         _ => AuditResult::Error,
     }
 }
@@ -589,19 +590,25 @@ pub(crate) async fn authorize_context(
                 headers,
             ));
         };
-        if connection_record.owner_id != ctx.user
-            || !connection_record.status.accepts_requests()
-            || !repository
-                .access_key_allows(ctx.key, connection)
-                .await
-                .map_err(|_| {
-                    error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "service_unavailable",
-                        "service temporarily unavailable",
-                        headers,
-                    )
-                })?
+        if connection_record.owner_id != ctx.user {
+            return Err(error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "access denied",
+                headers,
+            ));
+        }
+        if !repository
+            .access_key_grant_exists(ctx.key, connection)
+            .await
+            .map_err(|_| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service_unavailable",
+                    "service temporarily unavailable",
+                    headers,
+                )
+            })?
         {
             return Err(error_response(
                 StatusCode::FORBIDDEN,
@@ -609,6 +616,20 @@ pub(crate) async fn authorize_context(
                 "access denied",
                 headers,
             ));
+        }
+        if !connection_record.status.accepts_requests() {
+            return Err(
+                if connection_record.status == ConnectionStatus::ReauthRequired {
+                    error_response(
+                        StatusCode::FORBIDDEN,
+                        "reauth_required",
+                        "gmail connection requires reauthorization by its owner",
+                        headers,
+                    )
+                } else {
+                    error_response(StatusCode::FORBIDDEN, "forbidden", "access denied", headers)
+                },
+            );
         }
         return Ok(ctx);
     }
@@ -628,13 +649,25 @@ pub(crate) async fn authorize_context(
     let conn = conns.get(&connection).ok_or_else(|| {
         error_response(StatusCode::FORBIDDEN, "forbidden", "access denied", headers)
     })?;
-    if conn.owner_id != ctx.user || !conn.status.accepts_requests() {
+    if conn.owner_id != ctx.user {
         return Err(error_response(
             StatusCode::FORBIDDEN,
             "forbidden",
             "access denied",
             headers,
         ));
+    }
+    if !conn.status.accepts_requests() {
+        return Err(if conn.status == ConnectionStatus::ReauthRequired {
+            error_response(
+                StatusCode::FORBIDDEN,
+                "reauth_required",
+                "gmail connection requires reauthorization by its owner",
+                headers,
+            )
+        } else {
+            error_response(StatusCode::FORBIDDEN, "forbidden", "access denied", headers)
+        });
     }
     drop(conns);
     let keys = state.keys.read().await;
@@ -2296,6 +2329,9 @@ async fn send_draft_authorized(
         Err(AdapterError::Unavailable) => SendOutcome::Failed {
             code: "upstream_unavailable".to_owned(),
         },
+        Err(AdapterError::ReauthRequired) => SendOutcome::Failed {
+            code: "reauth_required".to_owned(),
+        },
     };
     if matches!(&outcome, SendOutcome::Failed { .. })
         && let Err(response) = refund_limits(
@@ -2564,6 +2600,7 @@ fn failed_send_outcome(error: AdapterError) -> SendOutcome {
         code: match error {
             AdapterError::NotFound => "upstream_not_found",
             AdapterError::InvalidInput => "invalid_draft",
+            AdapterError::ReauthRequired => "reauth_required",
             AdapterError::RateLimited { .. }
             | AdapterError::Unavailable
             | AdapterError::Timeout => "send_state_unknown",
@@ -2597,6 +2634,12 @@ fn adapter_response(e: AdapterError, h: &HeaderMap) -> Response {
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
             "rate limit exceeded",
+            h,
+        ),
+        AdapterError::ReauthRequired => error_response(
+            StatusCode::FORBIDDEN,
+            "reauth_required",
+            "gmail connection requires reauthorization by its owner",
             h,
         ),
         _ => error_response(
@@ -3167,6 +3210,7 @@ async fn mcp_http_response(id: Value, response: Response, headers: &HeaderMap) -
         "invalid_confirmation" => -32001,
         "not_found" => -32004,
         "service_unavailable" => -32003,
+        "reauth_required" => -32005,
         "upstream_rate_limited" | "rate_limited" => -32029,
         "draft_changed" | "invalid_state" => -32009,
         "idempotency_key_conflict" | "idempotency_in_progress" => -32009,
@@ -3435,6 +3479,12 @@ async fn mcp_dispatch(
                     Err(MailboxReadError::Adapter(AdapterError::RateLimited { .. })) => {
                         mcp_error(request.id, -32029, "upstream rate limit exceeded", &headers)
                     }
+                    Err(MailboxReadError::Adapter(AdapterError::ReauthRequired)) => mcp_error(
+                        request.id,
+                        -32005,
+                        "gmail connection requires reauthorization by its owner",
+                        &headers,
+                    ),
                     Err(MailboxReadError::Adapter(
                         AdapterError::Unavailable | AdapterError::Timeout,
                     )) => mcp_error(request.id, -32003, "upstream service unavailable", &headers),
@@ -3486,6 +3536,12 @@ async fn mcp_dispatch(
                     Err(MailboxReadError::Adapter(AdapterError::RateLimited { .. })) => {
                         mcp_error(request.id, -32029, "upstream rate limit exceeded", &headers)
                     }
+                    Err(MailboxReadError::Adapter(AdapterError::ReauthRequired)) => mcp_error(
+                        request.id,
+                        -32005,
+                        "gmail connection requires reauthorization by its owner",
+                        &headers,
+                    ),
                     Err(MailboxReadError::Adapter(
                         AdapterError::Unavailable | AdapterError::Timeout,
                     )) => mcp_error(request.id, -32003, "upstream service unavailable", &headers),
@@ -3540,6 +3596,12 @@ async fn mcp_dispatch(
                     Err(MailboxReadError::Adapter(AdapterError::RateLimited { .. })) => {
                         mcp_error(request.id, -32029, "upstream rate limit exceeded", &headers)
                     }
+                    Err(MailboxReadError::Adapter(AdapterError::ReauthRequired)) => mcp_error(
+                        request.id,
+                        -32005,
+                        "gmail connection requires reauthorization by its owner",
+                        &headers,
+                    ),
                     Err(MailboxReadError::Adapter(
                         AdapterError::Unavailable | AdapterError::Timeout,
                     )) => mcp_error(request.id, -32003, "upstream service unavailable", &headers),
@@ -3625,6 +3687,12 @@ async fn mcp_dispatch(
                     Err(AdapterError::RateLimited { .. }) => {
                         mcp_error(request.id, -32029, "upstream rate limit exceeded", &headers)
                     }
+                    Err(AdapterError::ReauthRequired) => mcp_error(
+                        request.id,
+                        -32005,
+                        "gmail connection requires reauthorization by its owner",
+                        &headers,
+                    ),
                     Err(AdapterError::Unavailable | AdapterError::Timeout) => {
                         mcp_error(request.id, -32003, "upstream service unavailable", &headers)
                     }
@@ -3659,6 +3727,12 @@ async fn mcp_dispatch(
                     Err(AdapterError::RateLimited { .. }) => {
                         mcp_error(request.id, -32029, "upstream rate limit exceeded", &headers)
                     }
+                    Err(AdapterError::ReauthRequired) => mcp_error(
+                        request.id,
+                        -32005,
+                        "gmail connection requires reauthorization by its owner",
+                        &headers,
+                    ),
                     Err(AdapterError::Unavailable | AdapterError::Timeout) => {
                         mcp_error(request.id, -32003, "upstream service unavailable", &headers)
                     }
@@ -3842,6 +3916,12 @@ async fn mcp_dispatch(
                 Err(MailboxReadError::Adapter(AdapterError::InvalidInput)) => {
                     mcp_error(request.id, -32602, "invalid upstream request", &headers)
                 }
+                Err(MailboxReadError::Adapter(AdapterError::ReauthRequired)) => mcp_error(
+                    request.id,
+                    -32005,
+                    "gmail connection requires reauthorization by its owner",
+                    &headers,
+                ),
                 Err(MailboxReadError::Adapter(
                     AdapterError::Unavailable | AdapterError::Timeout,
                 )) => mcp_error(request.id, -32003, "upstream service unavailable", &headers),
@@ -4251,6 +4331,76 @@ mod tests {
         assert_eq!(connections.len(), 1);
         assert_eq!(connections[0]["connection_id"], json!(first));
         assert_ne!(connections[0]["connection_id"], json!(second));
+    }
+
+    #[tokio::test]
+    async fn reauth_required_connection_is_distinct_from_denied_access() {
+        let (state, credential, first, second) = persisted_state().await;
+        let repository = state.repository.as_ref().unwrap();
+        let mut record = repository.get_connection(first).await.unwrap().unwrap();
+        record.status = ConnectionStatus::ReauthRequired;
+        repository.update_connection(&record).await.unwrap();
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/connections/{first}/messages"))
+                    .header("authorization", format!("Bearer {credential}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "reauth_required");
+
+        let mcp = app
+            .clone()
+            .oneshot(
+                Request::post("/mcp-compat")
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{
+                            "name":"messages.search",
+                            "arguments":{"connection_id":first.to_string()}
+                        }})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mcp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(mcp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "reauth_required");
+
+        // A key without a grant for the connection still reports plain denial.
+        let denied = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/connections/{second}/messages"))
+                    .header("authorization", format!("Bearer {credential}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(denied.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "forbidden");
     }
 
     #[tokio::test]

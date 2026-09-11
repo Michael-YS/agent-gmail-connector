@@ -13,7 +13,7 @@ use crate::{
         identity::{ConnectionId, GmailConnection},
         mailbox::{AttachmentInfo, EmailAddress, MessageMetadata, Recipients, sanitize_filename},
     },
-    gmail_credentials::{CredentialError, GmailCredentialProvider},
+    gmail_credentials::{CredentialError, GmailCredentialProvider, GmailCredentialStore},
     google_gmail::{GmailMessage, GoogleGmailClient, GoogleGmailError, MessageFormat},
     google_token::GoogleTokenClient,
     mime::{MimeAttachment, MimeMessage, build_mime},
@@ -71,10 +71,7 @@ impl LiveGmailAdapter {
             .await
         {
             Ok(token) => Ok((connection, token)),
-            Err(CredentialError::ReauthRequired) => {
-                self.credentials.invalidate(connection_id).await;
-                Err(AdapterError::Unavailable)
-            }
+            Err(CredentialError::ReauthRequired) => Err(AdapterError::ReauthRequired),
             Err(error) => Err(map_credential_error(error)),
         }
     }
@@ -138,7 +135,13 @@ impl LiveGmailAdapter {
             Ok(value) => Ok(value),
             Err(GoogleGmailError::ReauthRequired) => {
                 self.credentials.invalidate(connection_id).await;
-                Err(AdapterError::Unavailable)
+                // Persist the reauth state even though this adapter instance
+                // only holds an in-memory cache: a Gmail 401 means the stored
+                // grant is no longer acceptable to Google.
+                if let Err(error) = self.repository.mark_reauth_required(connection_id).await {
+                    tracing::warn!(connection_id = ?connection_id, error = ?error, "failed to persist reauth_required after Gmail 401");
+                }
+                Err(AdapterError::ReauthRequired)
             }
             Err(error) => Err(map_gmail_error(error)),
         }
@@ -590,8 +593,8 @@ fn map_credential_error(error: CredentialError) -> AdapterError {
             retry_after_seconds: retry_after_seconds.unwrap_or(60).max(1),
         },
         CredentialError::Timeout => AdapterError::Timeout,
+        CredentialError::ReauthRequired => AdapterError::ReauthRequired,
         CredentialError::AccessDenied
-        | CredentialError::ReauthRequired
         | CredentialError::InvalidCredential
         | CredentialError::StoreUnavailable
         | CredentialError::Upstream
@@ -623,7 +626,152 @@ fn map_gmail_error(error: GoogleGmailError) -> AdapterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::{Keyring, encrypt_refresh_token};
+    use crate::database::Database;
+    use crate::domain::identity::{
+        ConnectionStatus, GMAIL_COMPOSE_SCOPE, GMAIL_READONLY_SCOPE, GmailConnection, User,
+        UserRole,
+    };
     use crate::google_gmail::MessageHeader;
+    use crate::repository::EncryptedRefreshToken;
+    use chrono::Utc;
+    use std::collections::BTreeMap;
+    use url::Url;
+
+    fn keyring() -> Keyring {
+        Keyring::new(1, BTreeMap::from([(1, [7; 32])])).unwrap()
+    }
+
+    /// Serves one canned HTTP response to whatever request arrives, then closes.
+    async fn canned_server(
+        path: &'static str,
+        status: u16,
+        body: &'static str,
+    ) -> (Url, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            let mut content_length = 0usize;
+            let mut header_end = None;
+            loop {
+                stream.readable().await.unwrap();
+                match stream.try_read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        request.extend_from_slice(&buffer[..n]);
+                        if header_end.is_none()
+                            && let Some(position) =
+                                request.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            header_end = Some(position + 4);
+                            let headers =
+                                String::from_utf8_lossy(&request[..position]).to_ascii_lowercase();
+                            content_length = headers
+                                .lines()
+                                .find_map(|line| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse().ok())
+                                .unwrap_or(0);
+                        }
+                        if let Some(position) = header_end
+                            && request.len() >= position + content_length
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(_) => break,
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.try_write(response.as_bytes());
+        });
+        (
+            Url::parse(&format!("http://127.0.0.1:{port}{path}")).unwrap(),
+            handle,
+        )
+    }
+
+    async fn seeded_connection(repository: &Repository) -> GmailConnection {
+        let user = User::new(
+            "owner-sub",
+            "Owner@Example.com",
+            UserRole::Owner,
+            Utc::now(),
+        )
+        .unwrap();
+        repository.insert_user(&user).await.unwrap();
+        let connection = GmailConnection::new(
+            user.id,
+            "gmail-sub",
+            "Mail@Example.com",
+            vec![GMAIL_READONLY_SCOPE.into(), GMAIL_COMPOSE_SCOPE.into()],
+        )
+        .unwrap();
+        let envelope = encrypt_refresh_token(
+            "refresh-secret",
+            &user.id.to_string(),
+            &connection.id.to_string(),
+            &keyring(),
+        )
+        .unwrap();
+        let envelope = EncryptedRefreshToken::from_envelope(envelope).unwrap();
+        repository
+            .insert_connection(&connection, Some(&envelope))
+            .await
+            .unwrap();
+        connection
+    }
+
+    #[tokio::test]
+    async fn gmail_401_marks_connection_reauth_required_and_maps_the_error() {
+        let (token_endpoint, token_server) = canned_server(
+            "/token",
+            200,
+            r#"{"access_token":"access","token_type":"Bearer","expires_in":3600}"#,
+        )
+        .await;
+        let (gmail_endpoint, gmail_server) =
+            canned_server("/gmail/v1/", 401, r#"{"error":"unauthorized"}"#).await;
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.migrate().await.unwrap();
+        let repository = Repository::new(&db);
+        let connection = seeded_connection(&repository).await;
+
+        let refresher = GoogleTokenClient::for_tests(
+            token_endpoint,
+            "client-id",
+            SecretString::from("client-secret"),
+            Url::parse("https://agentmail.example/callback").unwrap(),
+        )
+        .unwrap();
+        let credentials = Arc::new(GmailCredentialProvider::new(
+            Arc::new(repository.clone()),
+            Arc::new(refresher),
+            keyring(),
+        ));
+        let gmail = GoogleGmailClient::for_tests(gmail_endpoint).unwrap();
+        let adapter = LiveGmailAdapter::new(repository.clone(), credentials, gmail);
+
+        let error = adapter.get_message(connection.id, "m1").await.unwrap_err();
+        assert_eq!(error, AdapterError::ReauthRequired);
+
+        let record = repository
+            .get_connection(connection.id)
+            .await
+            .unwrap()
+            .expect("connection still exists");
+        assert_eq!(record.status, ConnectionStatus::ReauthRequired);
+
+        token_server.await.unwrap();
+        gmail_server.await.unwrap();
+    }
 
     #[test]
     fn sent_reconciliation_accepts_only_system_message_ids() {
@@ -720,6 +868,10 @@ mod tests {
         assert_eq!(
             map_credential_error(CredentialError::InvalidCredential),
             AdapterError::Unavailable
+        );
+        assert_eq!(
+            map_credential_error(CredentialError::ReauthRequired),
+            AdapterError::ReauthRequired
         );
     }
 }
