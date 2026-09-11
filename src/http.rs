@@ -732,15 +732,12 @@ async fn get_message(
     uri: axum::http::Uri,
     Query(query): Query<MessageReadQuery>,
 ) -> Response {
+    let started = Instant::now();
     let cid = ConnectionId::from_uuid(cid);
-    if authorize(&headers, uri.query(), &state, cid).await.is_err() {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "access denied",
-            &headers,
-        );
-    }
+    let context = match authorize(&headers, uri.query(), &state, cid).await {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
     let html = match wants_html(&query) {
         Ok(value) => value,
         Err(message) => {
@@ -752,7 +749,7 @@ async fn get_message(
             );
         }
     };
-    match state
+    let response = match state
         .mailbox_service
         .get_message(cid, &mid, html, query.cursor.as_deref(), query.chunk_bytes)
         .await
@@ -768,7 +765,17 @@ async fn get_message(
             "cursor is invalid",
             &headers,
         ),
-    }
+    };
+    audit_response(
+        &state,
+        &headers,
+        context,
+        Some(cid),
+        AuditOperation::MessagesGet,
+        started,
+        response,
+    )
+    .await
 }
 async fn list_drafts(
     Path(cid): Path<Uuid>,

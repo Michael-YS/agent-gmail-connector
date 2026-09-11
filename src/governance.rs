@@ -174,6 +174,12 @@ pub enum AuditOperation {
     AuthGmail,
     #[serde(rename = "messages.search")]
     MessagesSearch,
+    #[serde(rename = "messages.get")]
+    MessagesGet,
+    #[serde(rename = "threads.get")]
+    ThreadsGet,
+    #[serde(rename = "attachments.get")]
+    AttachmentsGet,
     #[serde(rename = "draft.prepare")]
     DraftPrepare,
     #[serde(rename = "draft.send")]
@@ -202,6 +208,9 @@ impl AuditOperation {
             Self::AuthLogin => "auth.login",
             Self::AuthGmail => "auth.gmail",
             Self::MessagesSearch => "messages.search",
+            Self::MessagesGet => "messages.get",
+            Self::ThreadsGet => "threads.get",
+            Self::AttachmentsGet => "attachments.get",
             Self::DraftPrepare => "draft.prepare",
             Self::DraftSend => "draft.send",
             Self::ConnectionCreate => "connection.create",
@@ -323,6 +332,9 @@ impl TryFrom<&str> for AuditOperation {
             "auth.login" => Ok(Self::AuthLogin),
             "auth.gmail" => Ok(Self::AuthGmail),
             "messages.search" => Ok(Self::MessagesSearch),
+            "messages.get" => Ok(Self::MessagesGet),
+            "threads.get" => Ok(Self::ThreadsGet),
+            "attachments.get" => Ok(Self::AttachmentsGet),
             "draft.prepare" => Ok(Self::DraftPrepare),
             "draft.send" => Ok(Self::DraftSend),
             "connection.create" => Ok(Self::ConnectionCreate),
