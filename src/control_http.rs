@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
-    middleware::Next,
+    middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
@@ -34,6 +34,7 @@ use crate::{
     },
     google_oidc::{GoogleJwksVerifier, GoogleOidcError},
     google_token::{GoogleTokenClient, GoogleTokenError, TokenSet},
+    governance::{AuditContext, AuditEvent, AuditOperation, AuditResult, RequestId},
     invitations::InviteService,
     oauth::{
         GMAIL_CALLBACK_PATH, GOOGLE_ISSUER, GmailFlow, LOGIN_CALLBACK_PATH, LoginFlow, OAuthError,
@@ -263,7 +264,185 @@ where
             "/control/api/access-keys/{key_id}/connections/{connection_id}",
             axum::routing::put(grant_access_key::<V, E>).delete(remove_access_key_grant::<V, E>),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            control_audit_middleware::<V, E>,
+        ))
         .with_state(state)
+}
+
+/// Records the outcome of control-plane mutations and OAuth transitions without
+/// inspecting request bodies, query strings, response bodies, or credentials.
+/// A best-effort session lookup supplies an actor ID when the request already
+/// has one; failed authentication and login callbacks intentionally remain
+/// actorless.
+pub(crate) async fn control_audit_middleware<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let operation = control_audit_operation(request.method(), request.uri().path());
+    let context = if operation.is_some() {
+        control_audit_context(&state, request.headers()).await
+    } else {
+        AuditContext::default()
+    };
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    if let Some(operation) = operation {
+        let event = AuditEvent::metadata(
+            context,
+            operation,
+            control_audit_result(response.status()),
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            RequestId::try_from(Uuid::now_v7().to_string()).expect("UUID is a valid request id"),
+            Utc::now(),
+        );
+        if let Err(error) = state.repository.record_audit_event(&event).await {
+            tracing::warn!(error = %error, operation = operation.as_str(), "control audit write failed");
+        }
+    }
+    response
+}
+
+fn control_audit_operation(method: &axum::http::Method, path: &str) -> Option<AuditOperation> {
+    use axum::http::Method;
+
+    match (method, path) {
+        (&Method::GET, "/auth/google/login") => Some(AuditOperation::AuthLogin),
+        (&Method::POST, "/auth/invitations/accept") => Some(AuditOperation::InvitationAccept),
+        (&Method::GET, LOGIN_CALLBACK_PATH) => Some(AuditOperation::AuthLogin),
+        (&Method::GET, GMAIL_CALLBACK_PATH) | (&Method::POST, "/auth/google/gmail") => {
+            Some(AuditOperation::AuthGmail)
+        }
+        (&Method::POST, "/auth/logout") => Some(AuditOperation::AuthLogout),
+        (&Method::POST, "/control/api/account/delete") => Some(AuditOperation::AccountRevoke),
+        (&Method::POST, "/control/account/delete") => Some(AuditOperation::AccountRevoke),
+        (&Method::POST, "/control/api/invitations") => Some(AuditOperation::InvitationCreate),
+        (&Method::POST, "/control/invitations") => Some(AuditOperation::InvitationCreate),
+        (&Method::POST, path)
+            if path.starts_with("/control/api/invitations/") && path.ends_with("/revoke") =>
+        {
+            Some(AuditOperation::InvitationRevoke)
+        }
+        (&Method::POST, path)
+            if path.starts_with("/control/invitations/") && path.ends_with("/revoke") =>
+        {
+            Some(AuditOperation::InvitationRevoke)
+        }
+        (&Method::POST, path)
+            if path.starts_with("/control/api/invitations/") && path.ends_with("/regenerate") =>
+        {
+            Some(AuditOperation::InvitationRegenerate)
+        }
+        (&Method::POST, path)
+            if path.starts_with("/control/invitations/") && path.ends_with("/regenerate") =>
+        {
+            Some(AuditOperation::InvitationRegenerate)
+        }
+        (&Method::POST, "/control/api/access-keys") => Some(AuditOperation::AccessKeyCreate),
+        (&Method::POST, "/control/account/access-keys") => Some(AuditOperation::AccessKeyCreate),
+        (&Method::POST, path)
+            if path.starts_with("/control/api/access-keys/") && path.ends_with("/rotate") =>
+        {
+            Some(AuditOperation::AccessKeyRotate)
+        }
+        (&Method::POST, path)
+            if path.starts_with("/control/account/access-keys/") && path.ends_with("/rotate") =>
+        {
+            Some(AuditOperation::AccessKeyRotate)
+        }
+        (&Method::POST, path)
+            if path.starts_with("/control/api/access-keys/") && path.ends_with("/revoke") =>
+        {
+            Some(AuditOperation::AccessKeyRevoke)
+        }
+        (&Method::POST, path)
+            if path.starts_with("/control/account/access-keys/") && path.ends_with("/revoke") =>
+        {
+            Some(AuditOperation::AccessKeyRevoke)
+        }
+        (&Method::PUT, path) | (&Method::DELETE, path)
+            if path.starts_with("/control/api/access-keys/") && path.contains("/connections/") =>
+        {
+            Some(AuditOperation::AccessKeyGrant)
+        }
+        (&Method::POST, path)
+            if path.starts_with("/control/account/access-keys/") && path.ends_with("/grants") =>
+        {
+            Some(AuditOperation::AccessKeyGrant)
+        }
+        (&Method::POST, path)
+            if path.starts_with("/control/api/connections/") && path.ends_with("/revoke") =>
+        {
+            Some(AuditOperation::ConnectionRevoke)
+        }
+        (&Method::POST, "/control/account/connections/new") => Some(AuditOperation::AuthGmail),
+        (&Method::POST, path)
+            if path.starts_with("/control/account/connections/")
+                && path.ends_with("/reauthorize") =>
+        {
+            Some(AuditOperation::AuthGmail)
+        }
+        (&Method::POST, path)
+            if path.starts_with("/control/account/connections/") && path.ends_with("/revoke") =>
+        {
+            Some(AuditOperation::ConnectionRevoke)
+        }
+        (&Method::POST, path)
+            if path.starts_with("/control/api/members/") && path.ends_with("/revoke") =>
+        {
+            Some(AuditOperation::AccountRevoke)
+        }
+        (&Method::POST, path)
+            if path.starts_with("/control/members/") && path.ends_with("/revoke") =>
+        {
+            Some(AuditOperation::AccountRevoke)
+        }
+        _ => None,
+    }
+}
+
+async fn control_audit_context<V, E>(
+    state: &ControlHttpState<V, E>,
+    headers: &HeaderMap,
+) -> AuditContext
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let Some(token_hash) = session_token_hash(headers).ok() else {
+        return AuditContext::default();
+    };
+    match state
+        .control_plane
+        .authenticate_session(&token_hash, Utc::now())
+        .await
+    {
+        Ok(session) => AuditContext {
+            user_id: Some(session.user_id),
+            access_key_id: None,
+            connection_id: None,
+        },
+        Err(_) => AuditContext::default(),
+    }
+}
+
+fn control_audit_result(status: StatusCode) -> AuditResult {
+    match status {
+        StatusCode::UNAUTHORIZED => AuditResult::Unauthorized,
+        StatusCode::FORBIDDEN => AuditResult::Forbidden,
+        StatusCode::NOT_FOUND => AuditResult::NotFound,
+        StatusCode::CONFLICT => AuditResult::Conflict,
+        StatusCode::TOO_MANY_REQUESTS => AuditResult::RateLimited,
+        StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT => AuditResult::Unavailable,
+        status if status.is_success() || status.is_redirection() => AuditResult::Ok,
+        _ => AuditResult::Error,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2647,6 +2826,77 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(!listed.to_string().contains(rotated_credential));
+    }
+
+    #[tokio::test]
+    async fn control_mutations_audit_only_actor_outcome_and_request_metadata() {
+        let (app, repository, user, _connection, session, csrf) =
+            key_fixture(UserRole::Owner).await;
+        let private_name = "must-not-enter-audit";
+        let (status, _, created) = control_json(
+            &app,
+            Method::POST,
+            "/control/api/access-keys".to_owned(),
+            Some(&session),
+            Some(&csrf),
+            json!({"name": private_name, "connection_ids": []}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let credential = created["credential"].as_str().unwrap();
+
+        let operation: String = sqlx::query_scalar(
+            "SELECT operation FROM audit_events ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_one(repository.pool())
+        .await
+        .unwrap();
+        let result: String = sqlx::query_scalar(
+            "SELECT result_category FROM audit_events ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_one(repository.pool())
+        .await
+        .unwrap();
+        let actor: String =
+            sqlx::query_scalar("SELECT user_id FROM audit_events ORDER BY created_at DESC LIMIT 1")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        let serialized: String = sqlx::query_scalar(
+            "SELECT operation || ':' || result_category || ':' || request_id FROM audit_events ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_one(repository.pool())
+        .await
+        .unwrap();
+        assert_eq!(operation, "access_key.create");
+        assert_eq!(result, "ok");
+        assert_eq!(actor, user.id.to_string());
+        assert!(!serialized.contains(private_name));
+        assert!(!serialized.contains(credential));
+    }
+
+    #[test]
+    fn control_audit_route_mapping_covers_mutations_and_oauth_callbacks() {
+        assert_eq!(
+            control_audit_operation(&Method::GET, LOGIN_CALLBACK_PATH),
+            Some(AuditOperation::AuthLogin)
+        );
+        assert_eq!(
+            control_audit_operation(&Method::GET, GMAIL_CALLBACK_PATH),
+            Some(AuditOperation::AuthGmail)
+        );
+        assert_eq!(
+            control_audit_operation(&Method::DELETE, "/control/api/access-keys/a/connections/b"),
+            Some(AuditOperation::AccessKeyGrant)
+        );
+        assert_eq!(
+            control_audit_operation(&Method::POST, "/control/api/members/a/revoke"),
+            Some(AuditOperation::AccountRevoke)
+        );
+        assert_eq!(
+            control_audit_operation(&Method::GET, "/control/api/access-keys"),
+            None
+        );
     }
 
     #[tokio::test]

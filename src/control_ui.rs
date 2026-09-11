@@ -20,6 +20,7 @@ use axum::{
     Router,
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware,
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
@@ -281,6 +282,10 @@ where
             "/control/account/access-keys/{id}/grants",
             post(replace_own_access_key_grants::<V, E>),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::control_http::control_audit_middleware::<V, E>,
+        ))
         .with_state(state)
 }
 

@@ -172,6 +172,8 @@ pub enum AuditOperation {
     AuthLogin,
     #[serde(rename = "auth.gmail")]
     AuthGmail,
+    #[serde(rename = "auth.logout")]
+    AuthLogout,
     #[serde(rename = "messages.search")]
     MessagesSearch,
     #[serde(rename = "messages.get")]
@@ -192,6 +194,8 @@ pub enum AuditOperation {
     ConnectionCreate,
     #[serde(rename = "connection.revoke")]
     ConnectionRevoke,
+    #[serde(rename = "account.revoke")]
+    AccountRevoke,
     #[serde(rename = "access_key.create")]
     AccessKeyCreate,
     #[serde(rename = "access_key.rotate")]
@@ -202,6 +206,12 @@ pub enum AuditOperation {
     InvitationCreate,
     #[serde(rename = "invitation.accept")]
     InvitationAccept,
+    #[serde(rename = "invitation.revoke")]
+    InvitationRevoke,
+    #[serde(rename = "invitation.regenerate")]
+    InvitationRegenerate,
+    #[serde(rename = "access_key.grant")]
+    AccessKeyGrant,
     #[serde(rename = "health")]
     Health,
 }
@@ -211,6 +221,7 @@ impl AuditOperation {
         match self {
             Self::AuthLogin => "auth.login",
             Self::AuthGmail => "auth.gmail",
+            Self::AuthLogout => "auth.logout",
             Self::MessagesSearch => "messages.search",
             Self::MessagesGet => "messages.get",
             Self::ThreadsGet => "threads.get",
@@ -221,11 +232,15 @@ impl AuditOperation {
             Self::DraftSend => "draft.send",
             Self::ConnectionCreate => "connection.create",
             Self::ConnectionRevoke => "connection.revoke",
+            Self::AccountRevoke => "account.revoke",
             Self::AccessKeyCreate => "access_key.create",
             Self::AccessKeyRotate => "access_key.rotate",
             Self::AccessKeyRevoke => "access_key.revoke",
             Self::InvitationCreate => "invitation.create",
             Self::InvitationAccept => "invitation.accept",
+            Self::InvitationRevoke => "invitation.revoke",
+            Self::InvitationRegenerate => "invitation.regenerate",
+            Self::AccessKeyGrant => "access_key.grant",
             Self::Health => "health",
         }
     }
@@ -337,6 +352,7 @@ impl TryFrom<&str> for AuditOperation {
         match value {
             "auth.login" => Ok(Self::AuthLogin),
             "auth.gmail" => Ok(Self::AuthGmail),
+            "auth.logout" => Ok(Self::AuthLogout),
             "messages.search" => Ok(Self::MessagesSearch),
             "messages.get" => Ok(Self::MessagesGet),
             "threads.get" => Ok(Self::ThreadsGet),
@@ -347,11 +363,15 @@ impl TryFrom<&str> for AuditOperation {
             "draft.send" => Ok(Self::DraftSend),
             "connection.create" => Ok(Self::ConnectionCreate),
             "connection.revoke" => Ok(Self::ConnectionRevoke),
+            "account.revoke" => Ok(Self::AccountRevoke),
             "access_key.create" => Ok(Self::AccessKeyCreate),
             "access_key.rotate" => Ok(Self::AccessKeyRotate),
             "access_key.revoke" => Ok(Self::AccessKeyRevoke),
             "invitation.create" => Ok(Self::InvitationCreate),
             "invitation.accept" => Ok(Self::InvitationAccept),
+            "invitation.revoke" => Ok(Self::InvitationRevoke),
+            "invitation.regenerate" => Ok(Self::InvitationRegenerate),
+            "access_key.grant" => Ok(Self::AccessKeyGrant),
             "health" => Ok(Self::Health),
             _ => Err(AuditMetadataError),
         }
