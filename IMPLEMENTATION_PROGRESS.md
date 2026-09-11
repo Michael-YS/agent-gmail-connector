@@ -30,6 +30,12 @@
 18. `7b86676 feat(mail): add live reads`
 19. `3cc5516 feat(draft): add reply intents`
 20. 工作区：multipart 草稿附件入口。
+21. `dd77595 feat(audit): record control outcomes`
+22. `bf1e459 feat(mcp): add draft attachments`
+23. `e661498 docs: sync implementation progress`
+24. `8b1a20c feat: extend mcp transport and release checks`
+25. `ec7546b fix: harden mcp idempotency and audit`
+26. `df0ab81 test: cover rmcp draft idempotency`
 
 ## 当前实现断点
 
