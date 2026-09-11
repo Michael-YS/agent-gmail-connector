@@ -1,6 +1,6 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：175 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端无内容审计和保留期清理、Gmail thread/attachment/draft read、reply-all 与 multipart 草稿附件）、4 项 HTTP 安全与 managed-draft 契约测试、5 项 REST/MCP 契约测试，共 184 项；并已运行 `cargo fmt --check`、`cargo check --all-targets --all-features --locked`、`cargo clippy --all-targets --all-features -- -D warnings`。未执行部署、真实 Google 或浏览器 smoke。
+本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：176 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端无内容审计和保留期清理、Gmail thread/attachment/draft read、reply-all、multipart 草稿附件与持久化创建幂等性）、4 项 HTTP 安全与 managed-draft 契约测试、7 项 REST/MCP 契约测试，共 187 项；并已运行 `cargo fmt --check`、`cargo check --all-targets --all-features --locked`、`cargo clippy --all-targets --all-features -- -D warnings`。未执行部署、真实 Google 或浏览器 smoke。
 
 ## A. 尚未实现，因此目前无法执行的测试
 
