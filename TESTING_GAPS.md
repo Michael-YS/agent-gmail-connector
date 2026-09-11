@@ -1,6 +1,6 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：176 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端无内容审计和保留期清理、Gmail thread/attachment/draft read、reply-all、multipart 草稿附件与持久化创建幂等性）、4 项 HTTP 安全与 managed-draft 契约测试、7 项 REST/MCP 契约测试，共 187 项；并已运行 `cargo fmt --check`、`cargo check --all-targets --all-features --locked`、`cargo clippy --all-targets --all-features -- -D warnings`。未执行部署、真实 Google 或浏览器 smoke。
+本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：178 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端及控制面/OAuth 无内容审计和保留期清理、Gmail thread/attachment/draft read、reply-all、HTTP multipart 与 MCP base64 草稿附件、持久化创建幂等性）、4 项 HTTP 安全与 managed-draft 契约测试、9 项 REST/MCP 契约测试，共 191 项；并已运行 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets`。未执行部署、真实 Google 或浏览器 smoke。
 
 ## A. 尚未实现，因此目前无法执行的测试
 
@@ -27,22 +27,22 @@
 
 ### A4. MIME、附件与完整 managed draft
 
-- 已实现：mail-builder MIME、稳定 Message-ID、reply References、reply-all 排除当前主地址、非 ASCII header 编码、header/filename/content-type 注入防护、原始附件与最终编码消息的 25 MiB 双重限制、Gmail draft create/update/delete/send、hash-only confirmation、原子 outcome 持久化、重启恢复和 Sent Message-ID 对账，以及 REST new/reply/reply-all/forward、同 Connection 源附件转发/下载、HTTP multipart 上传和持久化 HTTP create idempotency。缺口：MCP base64 小附件。
+- 已实现：mail-builder MIME、稳定 Message-ID、reply References、reply-all 排除当前主地址、非 ASCII header 编码、header/filename/content-type 注入防护、原始附件与最终编码消息的 25 MiB 双重限制、Gmail draft create/update/delete/send、hash-only confirmation、原子 outcome 持久化、重启恢复和 Sent Message-ID 对账，以及 REST new/reply/reply-all/forward、同 Connection 源附件转发/下载、HTTP multipart 上传、MCP `drafts.create` 的 4 MiB base64 小附件和持久化 HTTP create idempotency。
 - 实现后测试：非 ASCII headers、header injection、reply references、reply-all 排除当前地址、forward 内嵌图、恶意文件名、MCP 4 MiB、HTTP 25 MiB、超限和响应丢失。
 - 命令目标：`cargo test --test mime_and_drafts --all-features`。
 - 通过标准：非 managed draft 只能读取；版本变化返回 `409 draft_changed`；超时不自动重发，无法对账进入 `send_state_unknown`。
 
 ### A5. 完整 REST OpenAPI 与 rmcp schema
 
-- 缺口：OpenAPI 已描述消息搜索且 REST/MCP 复用认证、grant 与 `MailboxReadService`，最小 JSON-RPC 已实现 `messages.search`、`messages.get`、`threads.get`、有 4 MiB 上限的 `messages.get_attachment`、`drafts.list` 和 `drafts.get`；其余 REST paths/tools、rmcp Streamable HTTP、session lifecycle 与 schema snapshot 尚未实现。
+- 缺口：OpenAPI 已描述消息搜索且 REST/MCP 复用认证、grant 与 `MailboxReadService`，最小 JSON-RPC 已实现 `messages.search`、`messages.get`、`threads.get`、有 4 MiB 上限的 `messages.get_attachment`、`drafts.list`、`drafts.get` 和带 4 MiB base64 小附件的 `drafts.create`；其余 REST paths/tools、rmcp Streamable HTTP、session lifecycle 与 schema snapshot 尚未实现。
 - 实现后测试：导出 OpenAPI/MCP schema，运行 snapshot 与真实 MCP client；比较 HTTP/MCP 的领域字段和错误码。
 - 命令目标：`cargo test --test transport_contract --all-features`，`cargo test --test mcp_schema --all-features`。
 - 通过标准：tools 标明邮件内容不可信和发送需用户许可；MCP 与 REST 共享认证、grant、状态机和审计逻辑。
 
 ### A6. 限流、审计、账号撤销与清理
 
-- 已实现：4 路读取并发、20 收件人限制、跨重启 SQLite 固定窗口、REST/MCP 120/key/min、30 prepare/key/hour、10 send/Connection/hour、50 send/Connection/day、原子小时/日预占、重放/无效/明确失败返还、unknown 保留占用、429 header/body retry 秒数、机器端 search/prepare/send 无内容审计，以及可配置保留期的启动/每小时清理。
-- 剩余缺口：control-plane mutation/OAuth 审计接线及并发撤销压力测试。
+- 已实现：4 路读取并发、20 收件人限制、跨重启 SQLite 固定窗口、REST/MCP 120/key/min、30 prepare/key/hour、10 send/Connection/hour、50 send/Connection/day、原子小时/日预占、重放/无效/明确失败返还、unknown 保留占用、429 header/body retry 秒数、机器端及 control-plane mutation/OAuth transition 无内容审计，以及可配置保留期的启动/每小时清理。
+- 剩余缺口：并发撤销压力测试。
 - 命令目标：`cargo test --test security_flows --all-features`。
 - 通过标准：429 含 retry seconds；日志/审计不包含地址、主题、正文、snippet、附件名、查询或任何 token。
 

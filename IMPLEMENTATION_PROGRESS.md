@@ -44,24 +44,24 @@
 - 安全 MIME 构建层已使用 `mail-builder 0.5` 完成：稳定 Message-ID、reply References、reply-all 排除当前主地址、非 ASCII header、安全附件 filename/content-type、inline CID、原始附件与最终编码消息的 25 MiB 双重限制，以及有界 writer。
 - managed draft 已接入真实 Gmail create/update/delete：使用稳定 Message-ID 和安全 MIME，按草稿独立串行化，从 SQLite 恢复重启后的 managed record，保持 expected-version 乐观锁，并对 create 持久化失败做补偿删除、对 delete 404 做幂等成功。prepare/send/update/delete 会重读 Gmail 当前草稿并以完整结构化内容重算 version，网页端编辑会使旧确认失效；prepare 也返回真实收件人、主题、正文摘要和附件名。
 - `POST /api/v1/connections/{connection_id}/drafts` 已支持持久化 `Idempotency-Key`：只保存 key 与请求摘要的 SHA-256 和内部 managed draft ID；相同 key/摘要返回原草稿，不会再创建 Gmail draft，摘要不同时返回冲突。managed draft 与完成记录在同一 SQLite 事务写入。
-- MCP 最小 JSON-RPC 已增加 `messages.get`、`threads.get`、`messages.get_attachment`、`drafts.list`、`drafts.get`，与 REST 共用 Access Key/Connection grant 和草稿视图；邮件和附件明确标为不可信，MCP 附件仅在原始数据不超过 4 MiB 时以 base64 返回。完整 Streamable HTTP 和写入工具仍在后续范围。
+- MCP 最小 JSON-RPC 已增加 `messages.get`、`threads.get`、`messages.get_attachment`、`drafts.list`、`drafts.get` 与 `drafts.create`，与 REST 共用 Access Key/Connection grant、草稿创建状态机和草稿视图；邮件和附件明确标为不可信。`drafts.create` 的 base64 附件总原始数据上限为 4 MiB，任何附件均不落盘。完整 Streamable HTTP 及其余写入工具仍在后续范围。
 - REST create draft 已支持 `new`、`reply`、`reply_all`、`forward` 意图。reply/reply_all 使用源邮件 thread、`In-Reply-To` 和 `References`；reply_all 排除当前主地址。forward 默认复制同一已授权源邮件的附件与内嵌 CID 数据，并经过 MIME 原始/编码双重大小限制。
 - confirmation token 只以 SHA-256 hash 入库；prepare 先持久化再返回明文一次；claim/outcome 与 managed draft 状态分别在 SQLite 事务中原子更新。相同 token 重放首次结果，不再次发送。
 - production send 已启用单次 Gmail `drafts.send`。Timeout、5xx/Unavailable、429 和 claim 后进程重启均只按系统生成的 `@agentmail.invalid` Message-ID 查询 Sent；要求精确 Message-ID header 与 `SENT` 标签，无法确认则持久化 `send_state_unknown`，绝不盲目重发。
-- 限流已接入 REST/MCP 共用认证和发送链路：每把 Access Key 120 次 API/MCP 调用/分钟、30 次 prepare/小时；每个 Connection 10 次发送/小时、50 次/天。小时/日额度在同一 SQLite 事务内预占，确认重放、无效确认和明确失败会原子返还，`send_state_unknown` 保留占用；429 返回 header/body retry 秒数。机器端 search、message/thread/attachment/draft read、prepare/send 审计只写 ID、操作、结果、延迟、request ID 和时间。
+- 限流已接入 REST/MCP 共用认证和发送链路：每把 Access Key 120 次 API/MCP 调用/分钟、30 次 prepare/小时；每个 Connection 10 次发送/小时、50 次/天。小时/日额度在同一 SQLite 事务内预占，确认重放、无效确认和明确失败会原子返还，`send_state_unknown` 保留占用；429 返回 header/body retry 秒数。机器端 search、message/thread/attachment/draft read、prepare/send，以及 control-plane mutation/OAuth transition 的审计只写 ID、操作、结果、延迟、request ID 和时间；审计中间件不读取请求体、查询参数或响应体。
 - `AUDIT_RETENTION_DAYS` 默认 30（范围 1–3650）；`serve` 启动时及每小时清理到期审计和已越过最长窗口的限流桶。
 - Access Key 管理 JSON API 位于 `/control/api/access-keys...`，Owner/Member 都只能管理自己的 key；所有 mutation 要求 session+CSRF，跨用户 IDOR 被拒绝。HTML 管理位于 `/control/account`。初始及替换 grants 在 repository 事务内验证 active same-owner Connection；create/rotate credential 只显示一次并 `Cache-Control: no-store`，SQLite 只存 Argon2 hash。
 - 邀请接受以 POST body 中的一次性 token 启动 Login OAuth；token 仅以 SHA-256 hash 绑定到 OAuth transaction，callback 仅以已验证、规范化 email 和精确 Google `sub` 原子接受邀请、创建 Member 与 session。重放、错误 email、过期或撤销邀请均不创建 session。
 - 常规 Google Login 会以精确 Google `sub` 与规范化 verified email 登录既有 active Owner 或 Member；没有既有用户时才保留首次 Owner bootstrap 规则。
 - Owner JSON API 已接入：`GET/POST /control/api/invitations`、`POST /control/api/invitations/{id}/revoke`、`POST /control/api/invitations/{id}/regenerate`；HTML 保留 `/control/invitations...`。mutation 要求 Owner session+CSRF，列表不返回 hash，create/regenerate token 只返回一次并 `Cache-Control: no-store`。
-- 最新本地完整验证：176 个 library tests、4 个 HTTP tests、7 个 REST/MCP tests，共 187 项；`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo check --all-targets --all-features --locked` 已通过。未执行部署、真实 Google 或浏览器 smoke。
+- 最新本地完整验证：178 个 library tests、4 个 HTTP tests、9 个 REST/MCP tests，共 191 项；`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo test --all-targets` 已通过。未执行部署、真实 Google 或浏览器 smoke。
 
 ## 剩余实现里程碑
 
 ### 1. MIME 与附件入口
 
 - MIME 构建层已完成并提交；后续不得回退为手写 MIME。
-- new/reply/reply-all/forward 已接入；HTTP JSON 和 `multipart/form-data`（`metadata` + `attachments[]`）创建/更新草稿均已接入。附件字段分块读取，原始总量限制 25 MiB，metadata 限制 1 MiB，任何附件均不落盘。剩余：MCP 小附件输入。
+- new/reply/reply-all/forward 已接入；HTTP JSON 和 `multipart/form-data`（`metadata` + `attachments[]`）创建/更新草稿均已接入。附件字段分块读取，原始总量限制 25 MiB，metadata 限制 1 MiB，任何附件均不落盘。MCP `drafts.create` 已接受总计不超过 4 MiB 原始数据的 base64 小附件。
 - 已有 Gmail 附件/内嵌图片转发与下载已接入；附件下载受 Gmail JSON/base64url API 限制，在内存中有界解码后转发，不会落盘。
 - 已有稳定 Message-ID、In-Reply-To/References、header injection 防护、非 ASCII header、filename/content type 校验、双重 25 MiB 限制和有界 writer 测试。
 
