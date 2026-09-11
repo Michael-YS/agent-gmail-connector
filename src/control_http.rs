@@ -237,6 +237,10 @@ where
             post(revoke_connection::<V, E>),
         )
         .route(
+            "/control/api/connections/{connection_id}/reauthorize",
+            post(reauthorize_connection::<V, E>),
+        )
+        .route(
             "/control/api/invitations",
             get(list_invitations::<V, E>).post(create_invitation::<V, E>),
         )
@@ -380,6 +384,11 @@ fn control_audit_operation(method: &axum::http::Method, path: &str) -> Option<Au
             if path.starts_with("/control/api/connections/") && path.ends_with("/revoke") =>
         {
             Some(AuditOperation::ConnectionRevoke)
+        }
+        (&Method::POST, path)
+            if path.starts_with("/control/api/connections/") && path.ends_with("/reauthorize") =>
+        {
+            Some(AuditOperation::ConnectionReauthorize)
         }
         (&Method::POST, "/control/account/connections/new") => Some(AuditOperation::AuthGmail),
         (&Method::POST, path)
@@ -1118,6 +1127,104 @@ where
         )
             .into_response(),
     }
+}
+
+/// Start a Gmail reauthorization flow for an existing managed connection.
+/// Missing and foreign connections both return 404 so the endpoint cannot be
+/// used to enumerate other users' connections.
+async fn reauthorize_connection<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    Path(connection_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let token_hash = match session_token_hash(&headers) {
+        Ok(hash) => hash,
+        Err(error) => return error_response(error),
+    };
+    let session = match state
+        .control_plane
+        .authenticate_session(&token_hash, Utc::now())
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => return error_response(error.into()),
+    };
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|value| value.to_str().ok());
+    if !csrf.is_some_and(|csrf| {
+        state
+            .control_plane
+            .verify_csrf(&session.csrf_token_hash, csrf)
+    }) {
+        return error_response(ControlHttpError::InvalidRequest);
+    }
+    let connection_id = ConnectionId::from_uuid(connection_id);
+    let connection = match state.repository.get_connection(connection_id).await {
+        Ok(Some(connection)) if connection.owner_id == session.user_id => connection,
+        Ok(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"connection_not_found"})),
+            )
+                .into_response();
+        }
+        Err(error) => return error_response(error.into()),
+    };
+    if connection.status == ConnectionStatus::Revoking {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error":"connection_revoking"})),
+        )
+            .into_response();
+    }
+    let flow = match GmailFlow::with_context(
+        &state.config.public_base_url,
+        state.config.google_gmail_client_id.clone(),
+        Some(session.user_id.to_string()),
+        Some(connection_id.to_string()),
+        Utc::now(),
+        Duration::minutes(10),
+    ) {
+        Ok(flow) => flow,
+        Err(error) => return error_response(error.into()),
+    };
+    let transaction_id = Uuid::now_v7();
+    let envelope = match flow.transaction().encrypted_pkce_verifier(
+        &transaction_id.to_string(),
+        &state.config.encryption_keyring,
+    ) {
+        Ok(envelope) => envelope,
+        Err(error) => return error_response(error.into()),
+    };
+    if let Err(error) =
+        persist_oauth_transaction(&state.repository, transaction_id, &flow, envelope).await
+    {
+        return error_response(error);
+    }
+    let authorize_url = flow.authorize_url().as_str().to_owned();
+    let mut response = (
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "connection_id": connection_id.to_string(),
+            "authorize_url": authorize_url,
+        })),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&oauth_transaction_cookie(
+            GMAIL_TRANSACTION_COOKIE,
+            transaction_id,
+        ))
+        .expect("cookie value"),
+    );
+    response
 }
 
 pub(crate) async fn revoke_connection_account<V, E>(
@@ -2481,6 +2588,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_reauthorize_authentication_csrf_and_ownership_are_required() {
+        let (app, repository, _user, connection, session, csrf) =
+            key_fixture(UserRole::Member).await;
+        let uri = format!("/control/api/connections/{}/reauthorize", connection.id);
+        for (session, csrf, expected) in [
+            (None, Some(csrf.as_str()), StatusCode::UNAUTHORIZED),
+            (Some(session.as_str()), None, StatusCode::BAD_REQUEST),
+            (
+                Some(session.as_str()),
+                Some("wrong"),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            assert_eq!(
+                control_json(&app, Method::POST, uri.clone(), session, csrf, json!({}))
+                    .await
+                    .0,
+                expected
+            );
+        }
+        let foreign = User::new(
+            "foreign",
+            "foreign@example.com",
+            UserRole::Member,
+            Utc::now(),
+        )
+        .unwrap();
+        repository.insert_user(&foreign).await.unwrap();
+        let foreign_connection = GmailConnection::new(
+            foreign.id,
+            "foreign-gmail",
+            "foreign@example.com",
+            vec![GMAIL_READONLY_SCOPE.into(), GMAIL_COMPOSE_SCOPE.into()],
+        )
+        .unwrap();
+        repository
+            .insert_connection(&foreign_connection, None)
+            .await
+            .unwrap();
+        let (status, _, body) = control_json(
+            &app,
+            Method::POST,
+            format!(
+                "/control/api/connections/{}/reauthorize",
+                foreign_connection.id
+            ),
+            Some(&session),
+            Some(&csrf),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "connection_not_found");
+        let (status, _, body) = control_json(
+            &app,
+            Method::POST,
+            format!("/control/api/connections/{}/reauthorize", Uuid::now_v7()),
+            Some(&session),
+            Some(&csrf),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "connection_not_found");
+        assert_eq!(
+            repository
+                .get_connection(connection.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ConnectionStatus::Active
+        );
+        assert!(
+            repository
+                .get_connection(foreign_connection.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_reauthorize_starts_gmail_flow_with_transaction_cookie() {
+        let (app, repository, _user, connection, session, csrf) =
+            key_fixture(UserRole::Member).await;
+        let (status, headers, body) = control_json(
+            &app,
+            Method::POST,
+            format!("/control/api/connections/{}/reauthorize", connection.id),
+            Some(&session),
+            Some(&csrf),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(body["connection_id"], connection.id.to_string());
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        assert!(authorize_url.starts_with("https://accounts.google.com/"));
+        assert!(authorize_url.contains("response_type=code"));
+        let cookies = headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+        assert!(
+            cookies
+                .iter()
+                .any(|value| value.starts_with("__Host-agentmail_gmail_tx=")),
+            "the Gmail transaction cookie must be set for the callback"
+        );
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_transactions")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(stored, 1);
+        // An active connection stays untouched by starting reauthorization.
+        assert_eq!(
+            repository
+                .get_connection(connection.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ConnectionStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_reauthorize_rejects_revoking_connection() {
+        let (app, repository, user, connection, session, csrf) =
+            key_fixture(UserRole::Member).await;
+        // Leave the connection in the revoking state without finishing the
+        // revoke so the endpoint must refuse a new reauthorization flow.
+        repository
+            .begin_connection_revoke(user.id, connection.id)
+            .await
+            .unwrap()
+            .expect("active connection must be claimable for revocation");
+        assert_eq!(
+            repository
+                .get_connection(connection.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ConnectionStatus::Revoking
+        );
+        let (status, _, body) = control_json(
+            &app,
+            Method::POST,
+            format!("/control/api/connections/{}/reauthorize", connection.id),
+            Some(&session),
+            Some(&csrf),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "connection_revoking");
+    }
+
+    #[tokio::test]
     async fn connection_revoke_cuts_access_before_google_and_cleans_up_on_failure() {
         for failure in [false, true] {
             let (_, repository, user, connection, session, csrf) =
@@ -3217,6 +3492,14 @@ mod tests {
         assert_eq!(
             control_audit_operation(&Method::POST, "/control/api/members/a/revoke"),
             Some(AuditOperation::AccountRevoke)
+        );
+        assert_eq!(
+            control_audit_operation(&Method::POST, "/control/api/connections/a/reauthorize"),
+            Some(AuditOperation::ConnectionReauthorize)
+        );
+        assert_eq!(
+            control_audit_operation(&Method::POST, "/control/api/connections/a/revoke"),
+            Some(AuditOperation::ConnectionRevoke)
         );
         assert_eq!(
             control_audit_operation(&Method::GET, "/control/api/access-keys"),
