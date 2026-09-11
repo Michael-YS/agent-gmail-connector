@@ -37,7 +37,8 @@
 25. `ec7546b fix: harden mcp idempotency and audit`
 26. `df0ab81 test: cover rmcp draft idempotency`
 27. `24b2e24 test: cover rmcp protocol boundaries`
-28. 当前工作区：补齐 MCP/OpenAPI schema snapshot、Host rebinding 与 rmcp 错误分类契约。
+28. `a303a2d test(mcp): lock transport contract snapshots`
+29. 当前工作区干净；剩余为 `/mcp` 端点迁移决策及外部验收门槛。
 
 ## 当前实现断点
 
