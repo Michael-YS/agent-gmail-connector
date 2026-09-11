@@ -4,7 +4,7 @@
 //! or persists a refresh token.  It returns only a small, safe DTO instead of
 //! exposing Gmail's discovery surface or accepting arbitrary request paths.
 
-use crate::domain::mailbox::strip_html_active_content;
+use crate::domain::mailbox::{MAX_HTTP_ATTACHMENT_BYTES, strip_html_active_content};
 use base64::Engine as _;
 use reqwest::{Client, StatusCode, Url};
 use secrecy::{ExposeSecret, SecretString};
@@ -14,6 +14,7 @@ use std::{fmt, time::Duration};
 pub const GMAIL_API_BASE: &str = "https://gmail.googleapis.com/gmail/v1/";
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 pub const MAX_JSON_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ATTACHMENT_JSON_BYTES: usize = MAX_HTTP_ATTACHMENT_BYTES.div_ceil(3) * 4 + 4096;
 
 #[derive(Debug, thiserror::Error, Clone, Eq, PartialEq)]
 pub enum GoogleGmailError {
@@ -23,6 +24,10 @@ pub enum GoogleGmailError {
     InvalidMessageId,
     #[error("draft id is invalid")]
     InvalidDraftId,
+    #[error("thread id is invalid")]
+    InvalidThreadId,
+    #[error("attachment id is invalid")]
+    InvalidAttachmentId,
     #[error("page size must be between 1 and 500")]
     InvalidPageSize,
     #[error("Gmail authorization must be renewed")]
@@ -64,7 +69,65 @@ pub struct GmailMessage {
     pub headers: Vec<MessageHeader>,
     pub body: Option<String>,
     pub body_is_html: bool,
+    pub html_body: Option<String>,
+    pub attachments: Vec<GmailAttachment>,
     pub untrusted_email_content: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GmailThread {
+    pub id: String,
+    pub messages: Vec<GmailMessage>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DraftList {
+    pub drafts: Vec<GmailDraft>,
+    pub next_page_token: Option<String>,
+    pub result_size_estimate: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GmailDraftDetail {
+    pub id: String,
+    pub message: GmailMessage,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct GmailAttachment {
+    pub attachment_id: Option<String>,
+    pub part_id: Option<String>,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub inline: bool,
+    pub content_id: Option<String>,
+    /// Embedded MIME part data; absent when Gmail requires attachments.get.
+    pub data: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for GmailAttachment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GmailAttachment")
+            .field("size", &self.size)
+            .field("content", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct GmailAttachmentData {
+    pub size: u64,
+    pub data: Vec<u8>,
+}
+
+impl fmt::Debug for GmailAttachmentData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GmailAttachmentData")
+            .field("size", &self.size)
+            .field("data", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -224,21 +287,132 @@ impl GoogleGmailClient {
             .authorized(self.http.get(url), access_token)?
             .query(&[("format", format.as_str())]);
         let raw: RawMessage = self.send(request).await?;
-        let (headers, body, body_is_html) = match raw.payload {
-            Some(payload) => flatten_payload(payload)?,
-            None => (Vec::new(), None, false),
-        };
-        Ok(GmailMessage {
+        raw.try_into()
+    }
+
+    pub async fn get_thread(
+        &self,
+        access_token: &SecretString,
+        thread_id: &str,
+        format: MessageFormat,
+    ) -> Result<GmailThread, GoogleGmailError> {
+        validate_access_token(access_token)?;
+        validate_resource_id(thread_id, GoogleGmailError::InvalidThreadId)?;
+        let url = self
+            .base_url
+            .join(&format!("users/me/threads/{thread_id}"))
+            .map_err(|_| GoogleGmailError::InvalidResponse)?;
+        let request = self
+            .authorized(self.http.get(url), access_token)?
+            .query(&[("format", format.as_str())]);
+        let raw: RawThread = self.send(request).await?;
+        validate_resource_id(&raw.id, GoogleGmailError::InvalidResponse)?;
+        Ok(GmailThread {
             id: raw.id,
-            thread_id: raw.thread_id,
-            label_ids: raw.label_ids.unwrap_or_default(),
-            snippet: raw.snippet,
-            internal_date: raw.internal_date,
-            headers,
-            body,
-            body_is_html,
-            untrusted_email_content: true,
+            messages: raw
+                .messages
+                .unwrap_or_default()
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
         })
+    }
+
+    pub async fn list_drafts(
+        &self,
+        access_token: &SecretString,
+        query: Option<&str>,
+        max_results: Option<u32>,
+        page_token: Option<&str>,
+    ) -> Result<DraftList, GoogleGmailError> {
+        validate_access_token(access_token)?;
+        if max_results.is_some_and(|value| !(1..=500).contains(&value)) {
+            return Err(GoogleGmailError::InvalidPageSize);
+        }
+        let url = self
+            .base_url
+            .join("users/me/drafts")
+            .map_err(|_| GoogleGmailError::InvalidResponse)?;
+        let mut params = Vec::new();
+        if let Some(value) = query {
+            params.push(("q", value.to_owned()));
+        }
+        if let Some(value) = max_results {
+            params.push(("maxResults", value.to_string()));
+        }
+        if let Some(value) = page_token {
+            params.push(("pageToken", value.to_owned()));
+        }
+        let request = self
+            .authorized(self.http.get(url), access_token)?
+            .query(&params);
+        let raw: RawDraftList = self.send(request).await?;
+        Ok(DraftList {
+            drafts: raw
+                .drafts
+                .unwrap_or_default()
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            next_page_token: raw.next_page_token,
+            result_size_estimate: raw.result_size_estimate,
+        })
+    }
+
+    pub async fn get_draft(
+        &self,
+        access_token: &SecretString,
+        draft_id: &str,
+    ) -> Result<GmailDraftDetail, GoogleGmailError> {
+        validate_access_token(access_token)?;
+        validate_resource_id(draft_id, GoogleGmailError::InvalidDraftId)?;
+        let url = self
+            .base_url
+            .join(&format!("users/me/drafts/{draft_id}"))
+            .map_err(|_| GoogleGmailError::InvalidResponse)?;
+        let request = self
+            .authorized(self.http.get(url), access_token)?
+            .query(&[("format", "full")]);
+        let raw: RawDraftDetail = self.send(request).await?;
+        validate_resource_id(&raw.id, GoogleGmailError::InvalidResponse)?;
+        Ok(GmailDraftDetail {
+            id: raw.id,
+            message: raw.message.try_into()?,
+        })
+    }
+
+    pub async fn get_attachment(
+        &self,
+        access_token: &SecretString,
+        message_id: &str,
+        attachment_id: &str,
+    ) -> Result<GmailAttachmentData, GoogleGmailError> {
+        validate_access_token(access_token)?;
+        validate_resource_id(message_id, GoogleGmailError::InvalidMessageId)?;
+        validate_resource_id(attachment_id, GoogleGmailError::InvalidAttachmentId)?;
+        let url = self
+            .base_url
+            .join(&format!(
+                "users/me/messages/{message_id}/attachments/{attachment_id}"
+            ))
+            .map_err(|_| GoogleGmailError::InvalidResponse)?;
+        let request = self.authorized(self.http.get(url), access_token)?;
+        let raw: RawBody = self
+            .send_bounded(request, MAX_ATTACHMENT_JSON_BYTES)
+            .await?;
+        let size = raw.size.ok_or(GoogleGmailError::InvalidResponse)?;
+        if size > MAX_HTTP_ATTACHMENT_BYTES as u64 {
+            return Err(GoogleGmailError::InvalidResponse);
+        }
+        let data = decode_body_data(
+            raw.data
+                .as_deref()
+                .ok_or(GoogleGmailError::InvalidResponse)?,
+        )?;
+        if data.len() as u64 != size || data.len() > MAX_HTTP_ATTACHMENT_BYTES {
+            return Err(GoogleGmailError::InvalidResponse);
+        }
+        Ok(GmailAttachmentData { size, data })
     }
 
     pub async fn create_draft(
@@ -347,17 +521,25 @@ impl GoogleGmailClient {
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<T, GoogleGmailError> {
+        self.send_bounded(request, MAX_JSON_RESPONSE_BYTES).await
+    }
+
+    async fn send_bounded<T: for<'de> Deserialize<'de>>(
+        &self,
+        request: reqwest::RequestBuilder,
+        max_bytes: usize,
+    ) -> Result<T, GoogleGmailError> {
         let mut response = request.send().await.map_err(classify_transport_error)?;
         ensure_success(&response)?;
         if response
             .content_length()
-            .is_some_and(|length| length > MAX_JSON_RESPONSE_BYTES as u64)
+            .is_some_and(|length| length > max_bytes as u64)
         {
             return Err(GoogleGmailError::InvalidResponse);
         }
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(classify_transport_error)? {
-            if body.len().saturating_add(chunk.len()) > MAX_JSON_RESPONSE_BYTES {
+            if body.len().saturating_add(chunk.len()) > max_bytes {
                 return Err(GoogleGmailError::InvalidResponse);
             }
             body.extend_from_slice(&chunk);
@@ -449,6 +631,26 @@ struct RawDraftMessage {
     thread_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawDraftList {
+    drafts: Option<Vec<RawDraft>>,
+    next_page_token: Option<String>,
+    result_size_estimate: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDraftDetail {
+    id: String,
+    message: RawMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawThread {
+    id: String,
+    messages: Option<Vec<RawMessage>>,
+}
+
 impl TryFrom<RawDraft> for GmailDraft {
     type Error = GoogleGmailError;
 
@@ -500,8 +702,11 @@ struct RawMessage {
     payload: Option<RawPayload>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct RawPayload {
+    #[serde(rename = "partId")]
+    part_id: Option<String>,
+    filename: Option<String>,
     #[serde(rename = "mimeType")]
     mime_type: Option<String>,
     headers: Option<Vec<RawHeader>>,
@@ -515,74 +720,166 @@ struct RawHeader {
     value: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct RawBody {
     data: Option<String>,
+    size: Option<u64>,
+    #[serde(rename = "attachmentId")]
+    attachment_id: Option<String>,
 }
 
-fn flatten_payload(
-    payload: RawPayload,
-) -> Result<(Vec<MessageHeader>, Option<String>, bool), GoogleGmailError> {
-    let headers = payload
-        .headers
-        .unwrap_or_default()
-        .into_iter()
-        .map(|header| MessageHeader {
-            name: header.name,
-            value: header.value,
-        })
-        .collect::<Vec<_>>();
-    let own_body = if matches!(
-        payload.mime_type.as_deref(),
-        Some("text/plain" | "text/html")
-    ) {
-        payload
-            .body
-            .and_then(|body| body.data)
-            .map(|data| {
-                base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(data)
-                    .map_err(|_| GoogleGmailError::InvalidResponse)
-                    .and_then(|bytes| {
-                        String::from_utf8(bytes).map_err(|_| GoogleGmailError::InvalidResponse)
-                    })
-            })
+impl TryFrom<RawMessage> for GmailMessage {
+    type Error = GoogleGmailError;
+
+    fn try_from(raw: RawMessage) -> Result<Self, Self::Error> {
+        validate_resource_id(&raw.id, GoogleGmailError::InvalidResponse)?;
+        let payload = raw
+            .payload
+            .map(flatten_payload)
             .transpose()?
-    } else {
-        None
-    };
-    if let Some(body) = own_body {
-        match payload.mime_type.as_deref() {
-            Some("text/plain") => return Ok((headers, Some(body), false)),
-            Some("text/html") => {
-                return Ok((headers, Some(strip_html_active_content(&body)), true));
-            }
-            _ => {}
-        }
+            .unwrap_or_default();
+        let body_is_html = payload.plain.is_none() && payload.html.is_some();
+        let body = payload.plain.or_else(|| payload.html.clone());
+        Ok(Self {
+            id: raw.id,
+            thread_id: raw.thread_id,
+            label_ids: raw.label_ids.unwrap_or_default(),
+            snippet: raw.snippet,
+            internal_date: raw.internal_date,
+            headers: payload.headers,
+            body,
+            body_is_html,
+            html_body: payload.html,
+            attachments: payload.attachments,
+            untrusted_email_content: true,
+        })
     }
-    let mut html_fallback = None;
-    for part in payload.parts.unwrap_or_default() {
-        let (part_headers, part_body, part_is_html) = flatten_payload(part)?;
-        if part_body.is_some() && !part_is_html {
-            return Ok((
-                headers.into_iter().chain(part_headers).collect(),
-                part_body,
-                false,
-            ));
-        }
-        if html_fallback.is_none() && part_body.is_some() {
-            html_fallback = Some((part_headers, part_body));
-        }
-    }
-    if let Some((part_headers, part_body)) = html_fallback {
-        return Ok((
-            headers.into_iter().chain(part_headers).collect(),
-            part_body,
-            true,
-        ));
-    }
-    Ok((headers, None, false))
 }
+
+#[derive(Default)]
+struct ParsedPayload {
+    headers: Vec<MessageHeader>,
+    plain: Option<String>,
+    html: Option<String>,
+    attachments: Vec<GmailAttachment>,
+}
+
+fn flatten_payload(mut payload: RawPayload) -> Result<ParsedPayload, GoogleGmailError> {
+    let mut parsed = ParsedPayload {
+        headers: payload
+            .headers
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .map(|header| MessageHeader {
+                name: header.name.clone(),
+                value: header.value.clone(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    collect_parts(&mut payload, &mut parsed)?;
+    Ok(parsed)
+}
+
+fn collect_parts(
+    payload: &mut RawPayload,
+    parsed: &mut ParsedPayload,
+) -> Result<(), GoogleGmailError> {
+    let header = |name: &str| {
+        payload
+            .headers
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .find(|header| header.name.eq_ignore_ascii_case(name))
+            .map(|header| header.value.clone())
+    };
+    let disposition = header("Content-Disposition").unwrap_or_default();
+    let disposition = disposition.split(';').next().unwrap_or_default().trim();
+    let content_id = header("Content-ID")
+        .map(|value| {
+            value
+                .trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_owned()
+        })
+        .filter(|value| !value.is_empty());
+    let mime_type = payload
+        .mime_type
+        .as_deref()
+        .unwrap_or("application/octet-stream");
+    let text_plain = mime_type.eq_ignore_ascii_case("text/plain");
+    let text_html = mime_type.eq_ignore_ascii_case("text/html");
+    let filename = payload.filename.take().unwrap_or_default();
+    let body = payload.body.take().unwrap_or_default();
+    let attachment = !filename.is_empty()
+        || disposition.eq_ignore_ascii_case("attachment")
+        || body.attachment_id.is_some()
+        || content_id.is_some()
+        || (!text_plain
+            && !text_html
+            && !mime_type.starts_with("multipart/")
+            && body.data.is_some());
+    if attachment {
+        if let Some(id) = &body.attachment_id {
+            validate_resource_id(id, GoogleGmailError::InvalidResponse)?;
+        }
+        let data = body.data.as_deref().map(decode_body_data).transpose()?;
+        if body
+            .size
+            .is_some_and(|size| size > MAX_HTTP_ATTACHMENT_BYTES as u64)
+            || data
+                .as_ref()
+                .is_some_and(|data| data.len() > MAX_HTTP_ATTACHMENT_BYTES)
+        {
+            return Err(GoogleGmailError::InvalidResponse);
+        }
+        if let (Some(size), Some(data)) = (body.size, &data)
+            && size != data.len() as u64
+        {
+            return Err(GoogleGmailError::InvalidResponse);
+        }
+        parsed.attachments.push(GmailAttachment {
+            attachment_id: body.attachment_id,
+            part_id: payload.part_id.take(),
+            filename,
+            mime_type: mime_type.to_owned(),
+            size: body
+                .size
+                .unwrap_or_else(|| data.as_ref().map_or(0, |data| data.len() as u64)),
+            inline: disposition.eq_ignore_ascii_case("inline") || content_id.is_some(),
+            content_id,
+            data,
+        });
+        // Do not promote a nested attached message's contents into this message.
+        return Ok(());
+    }
+    if (text_plain || text_html)
+        && let Some(data) = body.data
+    {
+        let text = String::from_utf8(decode_body_data(&data)?)
+            .map_err(|_| GoogleGmailError::InvalidResponse)?;
+        if text_plain && parsed.plain.is_none() {
+            parsed.plain = Some(text);
+        } else if text_html && parsed.html.is_none() {
+            parsed.html = Some(strip_html_active_content(&text));
+        }
+    }
+    for part in payload.parts.as_mut().into_iter().flatten() {
+        collect_parts(part, parsed)?;
+    }
+    Ok(())
+}
+
+fn decode_body_data(data: &str) -> Result<Vec<u8>, GoogleGmailError> {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(data)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(data))
+        .map_err(|_| GoogleGmailError::InvalidResponse)
+}
+
 fn classify_transport_error(error: reqwest::Error) -> GoogleGmailError {
     if error.is_timeout() {
         GoogleGmailError::Timeout
@@ -888,45 +1185,174 @@ mod tests {
     #[test]
     fn plain_text_is_preferred_and_html_is_sanitized() {
         let encoded = |value: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value);
-        let payload = RawPayload {
-            mime_type: Some("multipart/alternative".into()),
-            headers: None,
-            body: None,
-            parts: Some(vec![
-                RawPayload {
-                    mime_type: Some("text/html".into()),
-                    headers: None,
-                    body: Some(RawBody {
-                        data: Some(encoded("<script>x</script><p>html</p>")),
-                    }),
-                    parts: None,
-                },
-                RawPayload {
-                    mime_type: Some("text/plain".into()),
-                    headers: None,
-                    body: Some(RawBody {
-                        data: Some(encoded("plain")),
-                    }),
-                    parts: None,
-                },
-            ]),
-        };
-        let (_, body, is_html) = flatten_payload(payload).unwrap();
-        assert_eq!(body.as_deref(), Some("plain"));
-        assert!(!is_html);
+        let raw: RawMessage = serde_json::from_value(serde_json::json!({
+            "id": "m1", "payload": { "mimeType": "multipart/mixed",
+            "headers": [{"name":"Subject", "value":"top"}],
+            "parts": [
+                {"mimeType":"text/plain", "filename":"note.txt", "partId":"0",
+                 "body":{"attachmentId":"a1", "size":4}},
+                {"mimeType":"multipart/alternative", "parts":[
+                    {"mimeType":"text/html", "body":{"data":encoded("<script>x</script><p>html</p>")}},
+                    {"mimeType":"text/plain", "headers":[{"name":"Subject","value":"nested"}],
+                     "body":{"data":encoded("plain")}}
+                ]},
+                {"mimeType":"image/png", "filename":"picture.png", "partId":"2",
+                 "headers":[{"name":"Content-Disposition","value":"inline; filename=picture.png"},
+                            {"name":"Content-ID","value":"<picture>"}],
+                 "body":{"attachmentId":"a2", "size":10}},
+                {"mimeType":"text/plain", "headers":[{"name":"Content-Disposition","value":"attachment"}],
+                 "body":{"data":encoded("attachment"),"size":10}}
+            ]}
+        })).unwrap();
+        let message = GmailMessage::try_from(raw).unwrap();
+        assert_eq!(message.body.as_deref(), Some("plain"));
+        assert!(!message.body_is_html);
+        assert_eq!(message.html_body.as_deref(), Some("<p>html</p>"));
+        assert_eq!(message.headers.len(), 1);
+        assert_eq!(message.headers[0].value, "top");
+        assert_eq!(message.attachments.len(), 3);
+        assert_eq!(message.attachments[0].attachment_id.as_deref(), Some("a1"));
+        assert_eq!(message.attachments[0].part_id.as_deref(), Some("0"));
+        assert_eq!(
+            message.attachments[1].content_id.as_deref(),
+            Some("picture")
+        );
+        assert!(message.attachments[1].inline);
+        assert_eq!(
+            message.attachments[2].data.as_deref(),
+            Some(b"attachment".as_slice())
+        );
 
-        let html = RawPayload {
-            mime_type: Some("text/html".into()),
-            headers: None,
-            body: Some(RawBody {
-                data: Some(encoded("<script>x</script><p>html</p>")),
-            }),
-            parts: None,
-        };
-        let (_, body, is_html) = flatten_payload(html).unwrap();
-        assert_eq!(body.as_deref(), Some("<p>html</p>"));
-        assert!(is_html);
+        let raw: RawMessage = serde_json::from_value(serde_json::json!({"id":"m2", "payload":{
+            "mimeType":"text/html", "body":{"data":encoded("<script>x</script><p>html</p>")}
+        }}))
+        .unwrap();
+        let message = GmailMessage::try_from(raw).unwrap();
+        assert_eq!(message.body.as_deref(), Some("<p>html</p>"));
+        assert!(message.body_is_html);
     }
+
+    #[tokio::test]
+    async fn thread_draft_and_attachment_reads_use_narrow_endpoints() {
+        let token = SecretString::from("access-token");
+        let (endpoint, server) = write_server(
+            "GET",
+            "/gmail/v1/users/me/threads/t1?format=full",
+            "",
+            200,
+            r#"{"id":"t1","messages":[{"id":"m1"},{"id":"m2"}]}"#,
+        )
+        .await;
+        let thread = client(endpoint)
+            .get_thread(&token, "t1", MessageFormat::Full)
+            .await
+            .unwrap();
+        assert_eq!(thread.messages.len(), 2);
+        server.await.unwrap();
+
+        let (endpoint, server) = write_server("GET", "/gmail/v1/users/me/drafts?q=hello+world&maxResults=2&pageToken=next%2Bpage", "", 200,
+            r#"{"drafts":[{"id":"d1","message":{"id":"m1","threadId":"t1"}}],"nextPageToken":"p2","resultSizeEstimate":3}"#).await;
+        let drafts = client(endpoint)
+            .list_drafts(&token, Some("hello world"), Some(2), Some("next+page"))
+            .await
+            .unwrap();
+        assert_eq!(drafts.drafts[0].id, "d1");
+        assert_eq!(drafts.next_page_token.as_deref(), Some("p2"));
+        assert_eq!(drafts.result_size_estimate, Some(3));
+        server.await.unwrap();
+
+        let (endpoint, server) = write_server("GET", "/gmail/v1/users/me/drafts/d1?format=full", "", 200,
+            r#"{"id":"d1","message":{"id":"m1","payload":{"mimeType":"text/plain","body":{"data":"aGVsbG8"}}}}"#).await;
+        let draft = client(endpoint).get_draft(&token, "d1").await.unwrap();
+        assert_eq!(draft.message.body.as_deref(), Some("hello"));
+        server.await.unwrap();
+
+        let (endpoint, server) = write_server(
+            "GET",
+            "/gmail/v1/users/me/messages/m1/attachments/a1",
+            "",
+            200,
+            r#"{"size":5,"data":"aGVsbG8="}"#,
+        )
+        .await;
+        let attachment = client(endpoint)
+            .get_attachment(&token, "m1", "a1")
+            .await
+            .unwrap();
+        assert_eq!(attachment.data, b"hello");
+        assert_eq!(attachment.size, 5);
+        assert!(!format!("{attachment:?}").contains("hello"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attachment_reads_reject_invalid_size_encoding_and_resource_ids() {
+        let token = SecretString::from("access-token");
+        for body in [
+            r#"{"size":4,"data":"aGVsbG8"}"#.to_owned(),
+            r#"{"size":5,"data":"%%%"}"#.to_owned(),
+            r#"{"size":5}"#.to_owned(),
+            format!(r#"{{"size":{},"data":""}}"#, MAX_HTTP_ATTACHMENT_BYTES + 1),
+        ] {
+            let (endpoint, server) = write_server(
+                "GET",
+                "/gmail/v1/users/me/messages/m1/attachments/a1",
+                "",
+                200,
+                &body,
+            )
+            .await;
+            assert_eq!(
+                client(endpoint)
+                    .get_attachment(&token, "m1", "a1")
+                    .await
+                    .unwrap_err(),
+                GoogleGmailError::InvalidResponse
+            );
+            server.await.unwrap();
+        }
+        let gmail = GoogleGmailClient::new().unwrap();
+        assert_eq!(
+            gmail
+                .get_thread(&token, "../t1", MessageFormat::Full)
+                .await
+                .unwrap_err(),
+            GoogleGmailError::InvalidThreadId
+        );
+        assert_eq!(
+            gmail.get_draft(&token, "bad/id").await.unwrap_err(),
+            GoogleGmailError::InvalidDraftId
+        );
+        assert_eq!(
+            gmail
+                .get_attachment(&token, "bad/id", "a1")
+                .await
+                .unwrap_err(),
+            GoogleGmailError::InvalidMessageId
+        );
+        assert_eq!(
+            gmail
+                .get_attachment(&token, "m1", "a1?alt=media")
+                .await
+                .unwrap_err(),
+            GoogleGmailError::InvalidAttachmentId
+        );
+        assert_eq!(
+            gmail
+                .list_drafts(&token, None, Some(501), None)
+                .await
+                .unwrap_err(),
+            GoogleGmailError::InvalidPageSize
+        );
+        assert_eq!(
+            gmail
+                .get_draft(&SecretString::from(""), "d1")
+                .await
+                .unwrap_err(),
+            GoogleGmailError::EmptyAccessToken
+        );
+    }
+
     #[tokio::test]
     async fn errors_are_stable_and_debug_does_not_leak_credentials() {
         let cases = [

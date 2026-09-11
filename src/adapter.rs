@@ -10,10 +10,34 @@ use std::{collections::HashMap, fmt, sync::Arc};
 use tokio::sync::RwLock;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MailMessagePage {
+    pub messages: Vec<MailMessage>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MailHeader {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct MailAttachment {
+    pub info: AttachmentInfo,
+    pub data: Vec<u8>,
+}
+
+type AttachmentStore = HashMap<(ConnectionId, String, String), MailAttachment>;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MailMessage {
     pub metadata: MessageMetadata,
     pub body: String,
     pub body_is_html: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_body: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<MailHeader>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -57,12 +81,24 @@ pub trait GmailAdapter: Send + Sync {
         connection: ConnectionId,
         query: Option<&str>,
         page_size: usize,
-    ) -> Result<Vec<MailMessage>, AdapterError>;
+        cursor: Option<&str>,
+    ) -> Result<MailMessagePage, AdapterError>;
     async fn get_message(
         &self,
         connection: ConnectionId,
         message_id: &str,
     ) -> Result<MailMessage, AdapterError>;
+    async fn get_thread(
+        &self,
+        connection: ConnectionId,
+        thread_id: &str,
+    ) -> Result<Vec<MailMessage>, AdapterError>;
+    async fn get_attachment(
+        &self,
+        connection: ConnectionId,
+        message_id: &str,
+        attachment_id: &str,
+    ) -> Result<MailAttachment, AdapterError>;
     async fn list_drafts(&self, connection: ConnectionId) -> Result<Vec<MailDraft>, AdapterError>;
     async fn get_draft(
         &self,
@@ -103,6 +139,7 @@ pub trait GmailAdapter: Send + Sync {
 #[derive(Clone, Default)]
 pub struct FakeGmailAdapter {
     messages: Arc<RwLock<HashMap<(ConnectionId, String), MailMessage>>>,
+    attachments: Arc<RwLock<AttachmentStore>>,
     drafts: Arc<RwLock<HashMap<(ConnectionId, String), MailDraft>>>,
 }
 impl FakeGmailAdapter {
@@ -121,6 +158,17 @@ impl FakeGmailAdapter {
             .await
             .insert((connection, draft.id.clone()), draft);
     }
+    pub async fn insert_attachment(
+        &self,
+        connection: ConnectionId,
+        message_id: impl Into<String>,
+        attachment: MailAttachment,
+    ) {
+        self.attachments.write().await.insert(
+            (connection, message_id.into(), attachment.info.id.clone()),
+            attachment,
+        );
+    }
 }
 #[async_trait]
 impl GmailAdapter for FakeGmailAdapter {
@@ -129,7 +177,11 @@ impl GmailAdapter for FakeGmailAdapter {
         connection: ConnectionId,
         query: Option<&str>,
         page_size: usize,
-    ) -> Result<Vec<MailMessage>, AdapterError> {
+        cursor: Option<&str>,
+    ) -> Result<MailMessagePage, AdapterError> {
+        if cursor.is_some_and(|value| !value.is_empty()) {
+            return Err(AdapterError::InvalidInput);
+        }
         let mut values: Vec<_> = self
             .messages
             .read()
@@ -144,7 +196,10 @@ impl GmailAdapter for FakeGmailAdapter {
             .map(|(_, m)| m.clone())
             .collect();
         values.truncate(page_size.min(100));
-        Ok(values)
+        Ok(MailMessagePage {
+            messages: values,
+            next_cursor: None,
+        })
     }
     async fn get_message(
         &self,
@@ -155,6 +210,41 @@ impl GmailAdapter for FakeGmailAdapter {
             .read()
             .await
             .get(&(connection, message_id.to_owned()))
+            .cloned()
+            .ok_or(AdapterError::NotFound)
+    }
+    async fn get_thread(
+        &self,
+        connection: ConnectionId,
+        thread_id: &str,
+    ) -> Result<Vec<MailMessage>, AdapterError> {
+        let mut messages = self
+            .messages
+            .read()
+            .await
+            .iter()
+            .filter(|((id, _), message)| {
+                *id == connection && message.metadata.thread_id.as_deref() == Some(thread_id)
+            })
+            .map(|(_, message)| message.clone())
+            .collect::<Vec<_>>();
+        messages.sort_by(|left, right| left.metadata.sent_at.cmp(&right.metadata.sent_at));
+        if messages.is_empty() {
+            Err(AdapterError::NotFound)
+        } else {
+            Ok(messages)
+        }
+    }
+    async fn get_attachment(
+        &self,
+        connection: ConnectionId,
+        message_id: &str,
+        attachment_id: &str,
+    ) -> Result<MailAttachment, AdapterError> {
+        self.attachments
+            .read()
+            .await
+            .get(&(connection, message_id.to_owned(), attachment_id.to_owned()))
             .cloned()
             .ok_or(AdapterError::NotFound)
     }

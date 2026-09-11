@@ -5,8 +5,13 @@
 //! returned by search; only safe message metadata crosses this boundary.
 
 use crate::{
-    adapter::{AdapterError, GmailAdapter},
-    domain::{identity::ConnectionId, mailbox::MessageMetadata},
+    adapter::{AdapterError, GmailAdapter, MailAttachment, MailMessage},
+    domain::{
+        identity::ConnectionId,
+        mailbox::{
+            MessageMetadata, NormalizedMessage, html_to_plain_text, strip_html_active_content,
+        },
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -18,13 +23,15 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 const DEFAULT_PAGE_SIZE: usize = 20;
 const MAX_PAGE_SIZE: usize = 100;
+const DEFAULT_BODY_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_BODY_CHUNK_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
 pub enum MailboxReadError {
     #[error(transparent)]
     Adapter(#[from] AdapterError),
-    #[error("opaque cursor pagination is not supported yet")]
-    CursorNotSupported,
+    #[error("cursor is invalid")]
+    InvalidCursor,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -60,24 +67,65 @@ impl MailboxReadService {
         page_size: Option<usize>,
         cursor: Option<&str>,
     ) -> Result<MessageSearchResult, MailboxReadError> {
-        if cursor.is_some_and(|value| !value.is_empty()) {
-            return Err(MailboxReadError::CursorNotSupported);
-        }
         let page_size = page_size
             .unwrap_or(DEFAULT_PAGE_SIZE)
             .clamp(1, MAX_PAGE_SIZE);
         let _permit = self.read_permit(connection).await;
-        let messages = self
+        let page = self
             .adapter
-            .list_messages(connection, query, page_size)
-            .await?
+            .list_messages(connection, query, page_size, cursor)
+            .await?;
+        let messages = page
+            .messages
             .into_iter()
             .map(|message| message.metadata)
             .collect();
         Ok(MessageSearchResult {
             messages,
-            next_cursor: None,
+            next_cursor: page.next_cursor,
         })
+    }
+
+    pub async fn get_message(
+        &self,
+        connection: ConnectionId,
+        message_id: &str,
+        html: bool,
+        cursor: Option<&str>,
+        chunk_bytes: Option<usize>,
+    ) -> Result<NormalizedMessage, MailboxReadError> {
+        let _permit = self.read_permit(connection).await;
+        let message = self.adapter.get_message(connection, message_id).await?;
+        normalize_message(message, html, cursor, chunk_bytes)
+    }
+
+    pub async fn get_thread(
+        &self,
+        connection: ConnectionId,
+        thread_id: &str,
+        html: bool,
+        chunk_bytes: Option<usize>,
+    ) -> Result<Vec<NormalizedMessage>, MailboxReadError> {
+        let _permit = self.read_permit(connection).await;
+        self.adapter
+            .get_thread(connection, thread_id)
+            .await?
+            .into_iter()
+            .map(|message| normalize_message(message, html, None, chunk_bytes))
+            .collect()
+    }
+
+    pub async fn get_attachment(
+        &self,
+        connection: ConnectionId,
+        message_id: &str,
+        attachment_id: &str,
+    ) -> Result<MailAttachment, MailboxReadError> {
+        let _permit = self.read_permit(connection).await;
+        Ok(self
+            .adapter
+            .get_attachment(connection, message_id, attachment_id)
+            .await?)
     }
 
     async fn read_permit(&self, connection: ConnectionId) -> OwnedSemaphorePermit {
@@ -97,6 +145,59 @@ impl MailboxReadService {
             .await
             .expect("read semaphore is never closed")
     }
+}
+
+fn normalize_message(
+    message: MailMessage,
+    html: bool,
+    cursor: Option<&str>,
+    chunk_bytes: Option<usize>,
+) -> Result<NormalizedMessage, MailboxReadError> {
+    let body = if html {
+        message
+            .html_body
+            .as_deref()
+            .or_else(|| message.body_is_html.then_some(message.body.as_str()))
+            .map(strip_html_active_content)
+            .unwrap_or_else(|| message.body.clone())
+    } else if message.body_is_html {
+        html_to_plain_text(&message.body)
+    } else {
+        message.body.clone()
+    };
+    let start = match cursor {
+        Some(value) if !value.is_empty() => value
+            .parse::<usize>()
+            .ok()
+            .filter(|offset| *offset <= body.len() && body.is_char_boundary(*offset))
+            .ok_or(MailboxReadError::InvalidCursor)?,
+        _ => 0,
+    };
+    let limit = chunk_bytes
+        .unwrap_or(DEFAULT_BODY_CHUNK_BYTES)
+        .clamp(1, MAX_BODY_CHUNK_BYTES);
+    let mut end = start.saturating_add(limit).min(body.len());
+    while end > start && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == start && start < body.len() {
+        end = start
+            + body[start..]
+                .chars()
+                .next()
+                .expect("non-empty body remainder")
+                .len_utf8();
+    }
+    let truncated = end < body.len();
+    let body_is_html = html && (message.html_body.is_some() || message.body_is_html);
+    Ok(NormalizedMessage {
+        metadata: message.metadata,
+        body: body[start..end].to_owned(),
+        body_is_html,
+        truncated,
+        next_cursor: truncated.then(|| end.to_string()),
+        untrusted_email_content: true,
+    })
 }
 
 #[cfg(test)]
@@ -132,6 +233,8 @@ mod tests {
             },
             body: body.to_owned(),
             body_is_html: false,
+            html_body: None,
+            headers: vec![],
         }
     }
 
@@ -188,8 +291,61 @@ mod tests {
             service
                 .search(connection, None, Some(20), Some("opaque-cursor"))
                 .await,
-            Err(MailboxReadError::CursorNotSupported)
+            Err(MailboxReadError::Adapter(AdapterError::InvalidInput))
         );
+    }
+
+    #[tokio::test]
+    async fn message_defaults_to_text_and_html_is_explicit_and_sanitized() {
+        let (service, adapter, connection) = service();
+        let mut input = message(
+            "message-1",
+            "subject",
+            "<p>Hello <img src=\"https://bad\">world</p>",
+        );
+        input.body_is_html = true;
+        input.html_body = Some(input.body.clone());
+        adapter.insert_message(connection, input).await;
+
+        let text = service
+            .get_message(connection, "message-1", false, None, None)
+            .await
+            .unwrap();
+        assert_eq!(text.body, "Hello world");
+        assert!(!text.body_is_html);
+
+        let html = service
+            .get_message(connection, "message-1", true, None, None)
+            .await
+            .unwrap();
+        assert!(html.body_is_html);
+        assert!(!html.body.contains("img"));
+    }
+
+    #[tokio::test]
+    async fn message_cursor_is_utf8_safe() {
+        let (service, adapter, connection) = service();
+        adapter
+            .insert_message(connection, message("message-1", "subject", "éé"))
+            .await;
+        let first = service
+            .get_message(connection, "message-1", false, None, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(first.body, "é");
+        assert_eq!(first.next_cursor.as_deref(), Some("2"));
+        let second = service
+            .get_message(
+                connection,
+                "message-1",
+                false,
+                first.next_cursor.as_deref(),
+                Some(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.body, "é");
+        assert!(!second.truncated);
     }
 
     #[derive(Clone)]
@@ -269,7 +425,8 @@ mod tests {
             connection: ConnectionId,
             query: Option<&str>,
             page_size: usize,
-        ) -> Result<Vec<MailMessage>, AdapterError> {
+            cursor: Option<&str>,
+        ) -> Result<crate::adapter::MailMessagePage, AdapterError> {
             self.started.fetch_add(1, Ordering::Relaxed);
             *self
                 .started_by_connection
@@ -284,7 +441,9 @@ mod tests {
                 self.wait_until_released().await;
             }
             self.active.fetch_sub(1, Ordering::Relaxed);
-            self.inner.list_messages(connection, query, page_size).await
+            self.inner
+                .list_messages(connection, query, page_size, cursor)
+                .await
         }
 
         async fn get_message(
@@ -293,6 +452,25 @@ mod tests {
             message_id: &str,
         ) -> Result<MailMessage, AdapterError> {
             self.inner.get_message(connection, message_id).await
+        }
+
+        async fn get_thread(
+            &self,
+            connection: ConnectionId,
+            thread_id: &str,
+        ) -> Result<Vec<MailMessage>, AdapterError> {
+            self.inner.get_thread(connection, thread_id).await
+        }
+
+        async fn get_attachment(
+            &self,
+            connection: ConnectionId,
+            message_id: &str,
+            attachment_id: &str,
+        ) -> Result<crate::adapter::MailAttachment, AdapterError> {
+            self.inner
+                .get_attachment(connection, message_id, attachment_id)
+                .await
         }
 
         async fn list_drafts(

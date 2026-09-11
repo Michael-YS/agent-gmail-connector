@@ -5,10 +5,13 @@
 //! must never fall back to the in-memory fake.
 
 use crate::{
-    adapter::{AdapterError, GmailAdapter, MailDraft, MailMessage},
+    adapter::{
+        AdapterError, GmailAdapter, MailAttachment, MailDraft, MailHeader, MailMessage,
+        MailMessagePage,
+    },
     domain::{
         identity::{ConnectionId, GmailConnection},
-        mailbox::{EmailAddress, MessageMetadata, Recipients},
+        mailbox::{AttachmentInfo, EmailAddress, MessageMetadata, Recipients, sanitize_filename},
     },
     gmail_credentials::{CredentialError, GmailCredentialProvider},
     google_gmail::{GmailMessage, GoogleGmailClient, GoogleGmailError, MessageFormat},
@@ -81,12 +84,13 @@ impl LiveGmailAdapter {
         connection: ConnectionId,
         query: Option<&str>,
         page_size: usize,
-    ) -> Result<Vec<MailMessage>, AdapterError> {
+        cursor: Option<&str>,
+    ) -> Result<MailMessagePage, AdapterError> {
         let token = self.access_token(connection).await?;
         let page_size = page_size.clamp(1, 100);
         let list_result = self
             .gmail
-            .list_messages(&token, query, Some(page_size as u32), None)
+            .list_messages(&token, query, Some(page_size as u32), cursor)
             .await;
         let list = self.map_gmail_result(connection, list_result).await?;
         let mut pending = list.messages.into_iter().take(page_size).enumerate();
@@ -120,7 +124,10 @@ impl LiveGmailAdapter {
             }
         }
         messages.sort_unstable_by_key(|(index, _)| *index);
-        Ok(messages.into_iter().map(|(_, message)| message).collect())
+        Ok(MailMessagePage {
+            messages: messages.into_iter().map(|(_, message)| message).collect(),
+            next_cursor: list.next_page_token,
+        })
     }
     async fn map_gmail_result<T>(
         &self,
@@ -155,10 +162,11 @@ impl GmailAdapter for LiveGmailAdapter {
         connection: ConnectionId,
         query: Option<&str>,
         page_size: usize,
-    ) -> Result<Vec<MailMessage>, AdapterError> {
+        cursor: Option<&str>,
+    ) -> Result<MailMessagePage, AdapterError> {
         tokio::time::timeout(
             LIST_REQUEST_DEADLINE,
-            self.list_messages_with_deadline(connection, query, page_size),
+            self.list_messages_with_deadline(connection, query, page_size, cursor),
         )
         .await
         .map_err(|_| AdapterError::Timeout)?
@@ -178,16 +186,88 @@ impl GmailAdapter for LiveGmailAdapter {
             .map(to_mail_message)
     }
 
-    async fn list_drafts(&self, _connection: ConnectionId) -> Result<Vec<MailDraft>, AdapterError> {
-        Err(AdapterError::Unavailable)
+    async fn get_thread(
+        &self,
+        connection: ConnectionId,
+        thread_id: &str,
+    ) -> Result<Vec<MailMessage>, AdapterError> {
+        let token = self.access_token(connection).await?;
+        let result = self
+            .gmail
+            .get_thread(&token, thread_id, MessageFormat::Full)
+            .await;
+        self.map_gmail_result(connection, result)
+            .await
+            .map(|thread| thread.messages.into_iter().map(to_mail_message).collect())
+    }
+
+    async fn get_attachment(
+        &self,
+        connection: ConnectionId,
+        message_id: &str,
+        attachment_id: &str,
+    ) -> Result<MailAttachment, AdapterError> {
+        let token = self.access_token(connection).await?;
+        let message = self
+            .map_gmail_result(
+                connection,
+                self.gmail
+                    .get_message(&token, message_id, MessageFormat::Full)
+                    .await,
+            )
+            .await?;
+        let part = message
+            .attachments
+            .iter()
+            .find(|part| {
+                part.attachment_id.as_deref() == Some(attachment_id)
+                    || part.part_id.as_deref() == Some(attachment_id)
+            })
+            .ok_or(AdapterError::NotFound)?;
+        let info = attachment_info(part).ok_or(AdapterError::NotFound)?;
+        let data = match &part.data {
+            Some(data) => data.clone(),
+            None => {
+                self.map_gmail_result(
+                    connection,
+                    self.gmail
+                        .get_attachment(&token, message_id, attachment_id)
+                        .await,
+                )
+                .await?
+                .data
+            }
+        };
+        if data.len() as u64 != info.size_bytes {
+            return Err(AdapterError::Unavailable);
+        }
+        Ok(MailAttachment { info, data })
+    }
+
+    async fn list_drafts(&self, connection: ConnectionId) -> Result<Vec<MailDraft>, AdapterError> {
+        let token = self.access_token(connection).await?;
+        let result = self.gmail.list_drafts(&token, None, Some(100), None).await;
+        let list = self.map_gmail_result(connection, result).await?;
+        let mut drafts = Vec::with_capacity(list.drafts.len());
+        for draft in list.drafts {
+            let detail = self
+                .map_gmail_result(connection, self.gmail.get_draft(&token, &draft.id).await)
+                .await?;
+            drafts.push(to_mail_draft(detail.id, detail.message));
+        }
+        Ok(drafts)
     }
 
     async fn get_draft(
         &self,
-        _connection: ConnectionId,
-        _draft_id: &str,
+        connection: ConnectionId,
+        draft_id: &str,
     ) -> Result<MailDraft, AdapterError> {
-        Err(AdapterError::Unavailable)
+        let token = self.access_token(connection).await?;
+        let result = self.gmail.get_draft(&token, draft_id).await;
+        self.map_gmail_result(connection, result)
+            .await
+            .map(|detail| to_mail_draft(detail.id, detail.message))
     }
 
     async fn create_draft(
@@ -364,10 +444,61 @@ fn to_mail_message(message: GmailMessage) -> MailMessage {
             cc,
             subject,
             snippet,
-            attachments: Vec::new(),
+            attachments: message
+                .attachments
+                .iter()
+                .filter_map(attachment_info)
+                .collect(),
         },
         body: message.body.unwrap_or_default(),
         body_is_html: message.body_is_html,
+        html_body: message.html_body,
+        headers: message
+            .headers
+            .iter()
+            .map(|header| MailHeader {
+                name: safe_text(&header.name, 128),
+                value: safe_text(&header.value, 4096),
+            })
+            .collect(),
+    }
+}
+
+fn attachment_info(attachment: &crate::google_gmail::GmailAttachment) -> Option<AttachmentInfo> {
+    let id = attachment
+        .attachment_id
+        .as_deref()
+        .or(attachment.part_id.as_deref())?;
+    if id.is_empty() || attachment.size == 0 {
+        return None;
+    }
+    Some(AttachmentInfo {
+        id: id.to_owned(),
+        filename: sanitize_filename(&attachment.filename),
+        content_type: safe_text(&attachment.mime_type, 256),
+        size_bytes: attachment.size,
+        inline: attachment.inline,
+    })
+}
+
+fn to_mail_draft(id: String, message: GmailMessage) -> MailDraft {
+    let stable_message_id = header_value(&message, "message-id")
+        .map(str::to_owned)
+        .unwrap_or_default();
+    let bcc = header_value(&message, "bcc")
+        .map(parse_address_list)
+        .unwrap_or_default();
+    let mapped = to_mail_message(message);
+    MailDraft {
+        id,
+        stable_message_id,
+        thread_id: mapped.metadata.thread_id,
+        subject: mapped.metadata.subject,
+        body: mapped.body,
+        to: mapped.metadata.to,
+        cc: mapped.metadata.cc,
+        bcc,
+        attachments: mapped.metadata.attachments,
     }
 }
 
@@ -440,6 +571,8 @@ fn map_gmail_error(error: GoogleGmailError) -> AdapterError {
         GoogleGmailError::Timeout => AdapterError::Timeout,
         GoogleGmailError::InvalidMessageId
         | GoogleGmailError::InvalidDraftId
+        | GoogleGmailError::InvalidThreadId
+        | GoogleGmailError::InvalidAttachmentId
         | GoogleGmailError::NotFound => AdapterError::NotFound,
         GoogleGmailError::EmptyAccessToken
         | GoogleGmailError::ReauthRequired
@@ -489,6 +622,8 @@ mod tests {
             }],
             body: None,
             body_is_html: false,
+            html_body: None,
+            attachments: vec![],
             untrusted_email_content: true,
         };
         assert!(is_exact_sent_match(&message, stable));
@@ -523,6 +658,8 @@ mod tests {
             ],
             body: Some("body".into()),
             body_is_html: false,
+            html_body: None,
+            attachments: vec![],
             untrusted_email_content: true,
         });
         assert_eq!(mapped.metadata.from.unwrap().as_str(), "sender@example.com");

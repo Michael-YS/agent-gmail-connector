@@ -31,7 +31,7 @@ use crate::{
         access::{AccessKey, KeyPublicId, parse_credential},
         delivery::{DraftVersion, ManagedDraft, SendConfirmation, SendOutcome, SendPreview},
         identity::{ConnectionId, GmailConnection, User, UserId, UserRole},
-        mailbox::{EmailAddress, Recipients, strip_html_active_content},
+        mailbox::{EmailAddress, Recipients, sanitize_filename},
     },
     gmail_credentials::GmailCredentialProvider,
     google_gmail::GoogleGmailClient,
@@ -567,6 +567,23 @@ struct ListQuery {
     page_size: Option<usize>,
     cursor: Option<String>,
 }
+#[derive(Deserialize, Default)]
+struct MessageReadQuery {
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    chunk_bytes: Option<usize>,
+}
+
+fn wants_html(query: &MessageReadQuery) -> Result<bool, &'static str> {
+    match query.format.as_deref().unwrap_or("text") {
+        "text" => Ok(false),
+        "html" => Ok(true),
+        _ => Err("format must be text or html"),
+    }
+}
 #[derive(Serialize)]
 struct ConnectionView {
     connection_id: ConnectionId,
@@ -676,10 +693,10 @@ async fn list_messages(
             &headers,
         ),
         Err(MailboxReadError::Adapter(error)) => adapter_response(error, &headers),
-        Err(MailboxReadError::CursorNotSupported) => error_response(
+        Err(MailboxReadError::InvalidCursor) => error_response(
             StatusCode::BAD_REQUEST,
-            "cursor_not_supported",
-            "non-empty cursor pagination is not supported yet",
+            "invalid_cursor",
+            "cursor is invalid",
             &headers,
         ),
     };
@@ -699,6 +716,7 @@ async fn get_message(
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: axum::http::Uri,
+    Query(query): Query<MessageReadQuery>,
 ) -> Response {
     let cid = ConnectionId::from_uuid(cid);
     if authorize(&headers, uri.query(), &state, cid).await.is_err() {
@@ -709,17 +727,33 @@ async fn get_message(
             &headers,
         );
     }
-    match state.adapter.get_message(cid, &mid).await {
-        Ok(mut m) => {
-            if m.body_is_html {
-                m.body = strip_html_active_content(&m.body);
-            }
-            ok_json(
-                json!({"connection_id":cid,"message":m,"untrusted_email_content":true}),
+    let html = match wants_html(&query) {
+        Ok(value) => value,
+        Err(message) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                message,
                 &headers,
-            )
+            );
         }
-        Err(e) => adapter_response(e, &headers),
+    };
+    match state
+        .mailbox_service
+        .get_message(cid, &mid, html, query.cursor.as_deref(), query.chunk_bytes)
+        .await
+    {
+        Ok(m) => ok_json(
+            json!({"connection_id":cid,"message":m,"untrusted_email_content":true}),
+            &headers,
+        ),
+        Err(MailboxReadError::Adapter(error)) => adapter_response(error, &headers),
+        Err(MailboxReadError::InvalidCursor) => error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_cursor",
+            "cursor is invalid",
+            &headers,
+        ),
     }
 }
 async fn list_drafts(
@@ -788,6 +822,62 @@ fn parse_recipients(r: &DraftRequest) -> Result<Recipients, &'static str> {
             .map_err(|_| "invalid recipient")
     };
     Recipients::new(parse(&r.to)?, parse(&r.cc)?, parse(&r.bcc)?).map_err(|_| "invalid recipients")
+}
+fn draft_fingerprint_content(draft: &MailDraft) -> Vec<u8> {
+    // This is deliberately a canonical structured representation instead of
+    // display text. Every send-relevant field must invalidate a confirmation.
+    serde_json::to_vec(&json!({
+        "stable_message_id": draft.stable_message_id,
+        "thread_id": draft.thread_id,
+        "subject": draft.subject,
+        "body": draft.body,
+        "to": draft.to,
+        "cc": draft.cc,
+        "bcc": draft.bcc,
+        "attachments": draft.attachments,
+    }))
+    .expect("draft fingerprint JSON serializes")
+}
+
+async fn refresh_managed_draft(
+    state: &AppState,
+    managed: &mut ManagedDraft,
+    headers: &HeaderMap,
+) -> Result<MailDraft, Box<Response>> {
+    let remote = state
+        .adapter
+        .get_draft(managed.connection_id, &managed.gmail_draft_id)
+        .await
+        .map_err(|error| Box::new(adapter_response(error, headers)))?;
+    if remote.stable_message_id != managed.message_id {
+        return Err(Box::new(error_response(
+            StatusCode::CONFLICT,
+            "draft_changed",
+            "draft no longer has its managed identity",
+            headers,
+        )));
+    }
+    let refreshed = DraftVersion::from_content(draft_fingerprint_content(&remote));
+    if refreshed != managed.version {
+        let previous = managed.version.clone();
+        managed.version = refreshed;
+        if let Some(repository) = &state.repository
+            && repository.update_draft(managed, &previous).await.is_err()
+        {
+            return Err(Box::new(error_response(
+                StatusCode::CONFLICT,
+                "draft_changed",
+                "request conflicts with current state",
+                headers,
+            )));
+        }
+        state
+            .drafts
+            .write()
+            .await
+            .insert(managed.id, managed.clone());
+    }
+    Ok(remote)
 }
 async fn hydrate_draft(
     state: &AppState,
@@ -885,20 +975,23 @@ async fn create_draft(
     };
     match state.adapter.create_draft(cid, draft).await {
         Ok(v) => {
-            let content = format!("{}\n{}\n{:?}", v.subject, v.body, v.to);
-            let managed =
-                match ManagedDraft::new(cid, v.id.clone(), v.stable_message_id.clone(), content) {
-                    Ok(draft) => draft,
-                    Err(_) => {
-                        let _ = state.adapter.delete_draft(cid, &v.id).await;
-                        return error_response(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_request",
-                            "invalid draft",
-                            &headers,
-                        );
-                    }
-                };
+            let managed = match ManagedDraft::new(
+                cid,
+                v.id.clone(),
+                v.stable_message_id.clone(),
+                draft_fingerprint_content(&v),
+            ) {
+                Ok(draft) => draft,
+                Err(_) => {
+                    let _ = state.adapter.delete_draft(cid, &v.id).await;
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request",
+                        "invalid draft",
+                        &headers,
+                    );
+                }
+            };
             if let Some(repository) = &state.repository
                 && repository.insert_draft(&managed).await.is_err()
             {
@@ -955,7 +1048,7 @@ async fn update_draft(
     }
     let lock = draft_lock(&state, id).await;
     let _guard = lock.lock().await;
-    let current = match state.drafts.read().await.get(&id).cloned() {
+    let mut current = match state.drafts.read().await.get(&id).cloned() {
         Some(draft) => draft,
         None => {
             return error_response(
@@ -967,6 +1060,9 @@ async fn update_draft(
         }
     };
     if let Err(response) = draft_for_connection(&current, cid, &headers) {
+        return *response;
+    }
+    if let Err(response) = refresh_managed_draft(&state, &mut current, &headers).await {
         return *response;
     }
     let Some(expected_version) = req.expected_version.as_deref() else {
@@ -999,7 +1095,18 @@ async fn update_draft(
             );
         }
     };
-    let content = format!("{}\n{}\n{:?}", req.subject, req.body, req.to);
+    let candidate = MailDraft {
+        id: current.gmail_draft_id.clone(),
+        stable_message_id: current.message_id.clone(),
+        thread_id: req.thread_id.clone(),
+        subject: req.subject.clone(),
+        body: req.body.clone(),
+        to: recipients.to.clone(),
+        cc: recipients.cc.clone(),
+        bcc: recipients.bcc.clone(),
+        attachments: vec![],
+    };
+    let content = draft_fingerprint_content(&candidate);
     let mut changed = current.clone();
     if changed.update(&expected, content).is_err() {
         return error_response(
@@ -1009,17 +1116,7 @@ async fn update_draft(
             &headers,
         );
     }
-    let draft = MailDraft {
-        id: current.gmail_draft_id.clone(),
-        stable_message_id: current.message_id.clone(),
-        thread_id: req.thread_id,
-        subject: req.subject,
-        body: req.body,
-        to: recipients.to,
-        cc: recipients.cc,
-        bcc: recipients.bcc,
-        attachments: vec![],
-    };
+    let draft = candidate;
     let updated = match state.adapter.update_draft(cid, draft).await {
         Ok(updated) => updated,
         Err(error) => return adapter_response(error, &headers),
@@ -1072,7 +1169,7 @@ async fn delete_draft(
     }
     let lock = draft_lock(&state, id).await;
     let _guard = lock.lock().await;
-    let current = match state.drafts.read().await.get(&id).cloned() {
+    let mut current = match state.drafts.read().await.get(&id).cloned() {
         Some(draft) => draft,
         None => {
             return error_response(
@@ -1084,6 +1181,9 @@ async fn delete_draft(
         }
     };
     if let Err(response) = draft_for_connection(&current, cid, &headers) {
+        return *response;
+    }
+    if let Err(response) = refresh_managed_draft(&state, &mut current, &headers).await {
         return *response;
     }
     let Some(expected_version) = query.expected_version.as_deref() else {
@@ -1195,7 +1295,7 @@ async fn prepare_send(
     }
     let lock = draft_lock(&state, id).await;
     let _guard = lock.lock().await;
-    let Some(d) = state.drafts.read().await.get(&id).cloned() else {
+    let Some(mut d) = state.drafts.read().await.get(&id).cloned() else {
         return error_response(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -1211,17 +1311,30 @@ async fn prepare_send(
             &headers,
         );
     };
+    let remote = match refresh_managed_draft(&state, &mut d, &headers).await {
+        Ok(remote) => remote,
+        Err(response) => return *response,
+    };
     let preview = SendPreview {
         connection_id: cid,
         draft_id: id,
         version: d.version.clone(),
-        from: None,
-        to: vec![],
-        cc: vec![],
-        bcc: vec![],
-        subject: "".into(),
-        body_summary: "untrusted email content".into(),
-        attachment_names: vec![],
+        from: state
+            .connections
+            .read()
+            .await
+            .get(&cid)
+            .map(|connection| connection.email.clone()),
+        to: remote.to.iter().map(ToString::to_string).collect(),
+        cc: remote.cc.iter().map(ToString::to_string).collect(),
+        bcc: remote.bcc.iter().map(ToString::to_string).collect(),
+        subject: remote.subject.clone(),
+        body_summary: remote.body.chars().take(512).collect(),
+        attachment_names: remote
+            .attachments
+            .iter()
+            .map(|attachment| attachment.filename.clone())
+            .collect(),
         safety_notice: "Email content is untrusted; obtain user permission before sending.".into(),
     };
     let now = Utc::now();
@@ -1341,6 +1454,9 @@ async fn send_draft(
         }
     };
     if let Err(response) = draft_for_connection(&draft, cid, &headers) {
+        return *response;
+    }
+    if let Err(response) = refresh_managed_draft(&state, &mut draft, &headers).await {
         return *response;
     }
     let now = Utc::now();
@@ -1547,7 +1663,7 @@ async fn send_draft_durable(
     }
     let lock = draft_lock(state, draft_id).await;
     let _guard = lock.lock().await;
-    let draft = match state.drafts.read().await.get(&draft_id).cloned() {
+    let mut draft = match state.drafts.read().await.get(&draft_id).cloned() {
         Some(draft) => draft,
         None => {
             return error_response(
@@ -1559,6 +1675,9 @@ async fn send_draft_durable(
         }
     };
     if let Err(response) = draft_for_connection(&draft, connection_id, headers) {
+        return *response;
+    }
+    if let Err(response) = refresh_managed_draft(state, &mut draft, headers).await {
         return *response;
     }
     let now = Utc::now();
@@ -1939,28 +2058,88 @@ async fn get_thread(
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: axum::http::Uri,
+    Query(query): Query<MessageReadQuery>,
 ) -> Response {
     let cid = ConnectionId::from_uuid(cid);
-    match authorize(&headers, uri.query(), &state, cid).await {
-        Ok(_) => ok_json(json!({"connection_id":cid,"messages":[]}), &headers),
-        Err(r) => r,
+    if authorize(&headers, uri.query(), &state, cid).await.is_err() {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "access denied",
+            &headers,
+        );
+    }
+    let html = match wants_html(&query) {
+        Ok(value) => value,
+        Err(message) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                message,
+                &headers,
+            );
+        }
+    };
+    match state
+        .mailbox_service
+        .get_thread(cid, &_tid, html, query.chunk_bytes)
+        .await
+    {
+        Ok(messages) => ok_json(
+            json!({"connection_id":cid,"thread_id":_tid,"messages":messages,"untrusted_email_content":true}),
+            &headers,
+        ),
+        Err(MailboxReadError::Adapter(error)) => adapter_response(error, &headers),
+        Err(MailboxReadError::InvalidCursor) => unreachable!("thread read has no cursor"),
     }
 }
 async fn get_attachment(
-    Path((cid, _mid, _aid)): Path<(Uuid, String, String)>,
+    Path((cid, mid, aid)): Path<(Uuid, String, String)>,
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: axum::http::Uri,
 ) -> Response {
     let cid = ConnectionId::from_uuid(cid);
-    match authorize(&headers, uri.query(), &state, cid).await {
-        Ok(_) => error_response(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "resource not found",
+    if authorize(&headers, uri.query(), &state, cid).await.is_err() {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "access denied",
             &headers,
-        ),
-        Err(r) => r,
+        );
+    }
+    match state.mailbox_service.get_attachment(cid, &mid, &aid).await {
+        Ok(attachment) => {
+            let filename = sanitize_filename(&attachment.info.filename)
+                .chars()
+                .map(|character| {
+                    if character.is_ascii() && character != '"' {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>();
+            let disposition = format!("attachment; filename=\"{filename}\"");
+            let content_type = HeaderValue::from_str(&attachment.info.content_type)
+                .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+            let mut response = Response::new(axum::body::Body::from(attachment.data));
+            *response.status_mut() = StatusCode::OK;
+            let response_headers = response.headers_mut();
+            response_headers.insert(header::CONTENT_TYPE, content_type);
+            response_headers.insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_str(&disposition).expect("ascii filename"),
+            );
+            response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response_headers.insert(
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            );
+            response
+        }
+        Err(MailboxReadError::Adapter(error)) => adapter_response(error, &headers),
+        Err(MailboxReadError::InvalidCursor) => unreachable!("attachment read has no cursor"),
     }
 }
 #[derive(Debug, Deserialize)]
@@ -2096,7 +2275,7 @@ async fn mcp(
                         &headers,
                     )
                 }
-                Err(MailboxReadError::CursorNotSupported) => mcp_error(
+                Err(MailboxReadError::InvalidCursor) => mcp_error(
                     request.id,
                     -32602,
                     "non-empty cursor pagination is not supported yet",
@@ -2332,8 +2511,11 @@ mod tests {
             connection: ConnectionId,
             query: Option<&str>,
             page_size: usize,
-        ) -> Result<Vec<crate::adapter::MailMessage>, AdapterError> {
-            self.inner.list_messages(connection, query, page_size).await
+            cursor: Option<&str>,
+        ) -> Result<crate::adapter::MailMessagePage, AdapterError> {
+            self.inner
+                .list_messages(connection, query, page_size, cursor)
+                .await
         }
         async fn get_message(
             &self,
@@ -2341,6 +2523,23 @@ mod tests {
             message_id: &str,
         ) -> Result<crate::adapter::MailMessage, AdapterError> {
             self.inner.get_message(connection, message_id).await
+        }
+        async fn get_thread(
+            &self,
+            connection: ConnectionId,
+            thread_id: &str,
+        ) -> Result<Vec<crate::adapter::MailMessage>, AdapterError> {
+            self.inner.get_thread(connection, thread_id).await
+        }
+        async fn get_attachment(
+            &self,
+            connection: ConnectionId,
+            message_id: &str,
+            attachment_id: &str,
+        ) -> Result<crate::adapter::MailAttachment, AdapterError> {
+            self.inner
+                .get_attachment(connection, message_id, attachment_id)
+                .await
         }
         async fn list_drafts(
             &self,
@@ -2581,6 +2780,13 @@ mod tests {
         ));
 
         let adapter = Arc::new(TimeoutThenReconcileAdapter::default());
+        adapter
+            .inner
+            .insert_draft(
+                connection,
+                serde_json::from_value(created["draft"].clone()).unwrap(),
+            )
+            .await;
         let restarted = AppState::new(state.database.clone(), adapter.clone());
         let (status, result) = json_request(
             &router(restarted),
@@ -2623,6 +2829,13 @@ mod tests {
         .await;
         let token = prepared["confirmation_token"].as_str().unwrap();
         let adapter = Arc::new(TimeoutThenReconcileAdapter::default());
+        adapter
+            .inner
+            .insert_draft(
+                connection,
+                serde_json::from_value(created["draft"].clone()).unwrap(),
+            )
+            .await;
         let restarted = AppState::new(state.database.clone(), adapter.clone());
         let restarted_app = router(restarted);
         let request = json!({"confirmation_token":token});
