@@ -4419,6 +4419,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_mcp_error_audit_uses_json_rpc_result_category() {
+        let (state, credential, connection, _) = persisted_state().await;
+        let app = router(state.clone());
+        let (_, created) = json_request(
+            &app,
+            Method::POST,
+            format!("/api/v1/connections/{connection}/drafts"),
+            &credential,
+            json!({"subject":"audit","body":"body","to":["to@example.com"]}),
+        )
+        .await;
+        let draft_id = created["managed_draft"]["id"].as_str().unwrap();
+        let current_version = created["managed_draft"]["version"].as_str().unwrap();
+        let wrong_version = if current_version == "0" { "1" } else { "0" };
+        let response = app
+            .oneshot(
+                Request::post("/mcp")
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "jsonrpc":"2.0",
+                            "id": "audit-conflict",
+                            "method":"tools/call",
+                            "params": {
+                                "name":"drafts.delete",
+                                "arguments": {
+                                    "connection_id": connection,
+                                    "draft_id": draft_id,
+                                    "expected_version": wrong_version
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], -32009);
+        let repository = state.repository.as_ref().unwrap();
+        let result: String = sqlx::query_scalar(
+            "SELECT result_category FROM audit_events WHERE operation='drafts.delete' ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_one(repository.pool())
+        .await
+        .unwrap();
+        assert_eq!(result, "conflict");
+    }
+
+    #[tokio::test]
     async fn persisted_access_key_cannot_access_ungranted_connection() {
         let (state, credential, _, second) = persisted_state().await;
         let response = router(state)

@@ -430,8 +430,35 @@ async fn rmcp_streamable_http_negotiates_and_lists_tools() {
         .unwrap();
     assert_eq!(tools.status(), StatusCode::OK);
     let tools = response_json(tools).await;
-    assert_eq!(tools["result"]["tools"][0]["name"], "messages.search");
-    assert!(tools["result"]["tools"][0]["inputSchema"].is_object());
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "messages.search",
+            "messages.get",
+            "threads.get",
+            "messages.get_attachment",
+            "drafts.create",
+            "drafts.list",
+            "drafts.get",
+            "drafts.update",
+            "drafts.delete",
+            "drafts.prepare_send",
+            "drafts.send",
+        ]
+    );
+    assert!(
+        tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool["inputSchema"].is_object() && tool["annotations"].is_object())
+    );
 
     let call = build_router(state)
         .oneshot(
