@@ -2612,15 +2612,12 @@ async fn get_thread(
     uri: axum::http::Uri,
     Query(query): Query<MessageReadQuery>,
 ) -> Response {
+    let started = Instant::now();
     let cid = ConnectionId::from_uuid(cid);
-    if authorize(&headers, uri.query(), &state, cid).await.is_err() {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "access denied",
-            &headers,
-        );
-    }
+    let context = match authorize(&headers, uri.query(), &state, cid).await {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
     let html = match wants_html(&query) {
         Ok(value) => value,
         Err(message) => {
@@ -2632,7 +2629,7 @@ async fn get_thread(
             );
         }
     };
-    match state
+    let response = match state
         .mailbox_service
         .get_thread(cid, &_tid, html, query.chunk_bytes)
         .await
@@ -2643,7 +2640,17 @@ async fn get_thread(
         ),
         Err(MailboxReadError::Adapter(error)) => adapter_response(error, &headers),
         Err(MailboxReadError::InvalidCursor) => unreachable!("thread read has no cursor"),
-    }
+    };
+    audit_response(
+        &state,
+        &headers,
+        context,
+        Some(cid),
+        AuditOperation::ThreadsGet,
+        started,
+        response,
+    )
+    .await
 }
 async fn get_attachment(
     Path((cid, mid, aid)): Path<(Uuid, String, String)>,
@@ -2651,16 +2658,13 @@ async fn get_attachment(
     headers: HeaderMap,
     uri: axum::http::Uri,
 ) -> Response {
+    let started = Instant::now();
     let cid = ConnectionId::from_uuid(cid);
-    if authorize(&headers, uri.query(), &state, cid).await.is_err() {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "access denied",
-            &headers,
-        );
-    }
-    match state.mailbox_service.get_attachment(cid, &mid, &aid).await {
+    let context = match authorize(&headers, uri.query(), &state, cid).await {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let response = match state.mailbox_service.get_attachment(cid, &mid, &aid).await {
         Ok(attachment) => {
             let filename = sanitize_filename(&attachment.info.filename)
                 .chars()
@@ -2692,7 +2696,17 @@ async fn get_attachment(
         }
         Err(MailboxReadError::Adapter(error)) => adapter_response(error, &headers),
         Err(MailboxReadError::InvalidCursor) => unreachable!("attachment read has no cursor"),
-    }
+    };
+    audit_response(
+        &state,
+        &headers,
+        context,
+        Some(cid),
+        AuditOperation::AttachmentsGet,
+        started,
+        response,
+    )
+    .await
 }
 #[derive(Debug, Deserialize)]
 struct McpRequest {
