@@ -30,12 +30,15 @@ jobs:
 
       - name: Install dependency policy tools
         run: |
-          cargo install --locked cargo-audit --version 0.21.1
-          cargo install --locked cargo-deny --version 0.18.3
+          cargo install --locked cargo-audit --version 0.22.2
+          cargo install --locked cargo-deny --version 0.20.2
 
       - name: Audit dependencies and policy
         run: |
-          cargo audit --locked
+          # sqlx keeps the optional MySQL backend in Cargo.lock, but this
+          # SQLite-only build must not resolve its rsa dependency.
+          test -z "$(cargo tree --locked --target all --all-features -i rsa 2>/dev/null)"
+          cargo audit --ignore RUSTSEC-2023-0071
           cargo deny check
 
       - name: Build amd64 verification image
