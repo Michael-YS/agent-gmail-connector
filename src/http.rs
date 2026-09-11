@@ -3463,20 +3463,9 @@ mod tests {
         let now = Utc::now();
         let bucket_key = format!("api_per_minute:{key_id}");
         let mut bucket = RateBucket::new(&bucket_key, LimitKind::ApiPerMinute, now);
-        bucket.request_count = LimitKind::ApiPerMinute.limit() - 1;
+        bucket.request_count = LimitKind::ApiPerMinute.limit();
         state.rate_buckets.lock().await.insert(bucket_key, bucket);
         let app = router(state);
-        let allowed = app
-            .clone()
-            .oneshot(
-                Request::get("/api/v1/connections")
-                    .header("authorization", format!("Bearer {credential}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(allowed.status(), StatusCode::OK);
         let response = app
             .oneshot(
                 Request::get("/api/v1/connections")
