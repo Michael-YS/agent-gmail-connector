@@ -4475,6 +4475,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_rmcp_create_idempotency_replays_without_duplicate() {
+        let (state, credential, connection, _) = persisted_state().await;
+        let app = router(state);
+        let send = |request: Value| {
+            let app = app.clone();
+            let credential = credential.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::post("/mcp-streamable")
+                            .header("authorization", format!("Bearer {credential}"))
+                            .header("host", "localhost")
+                            .header("accept", "application/json, text/event-stream")
+                            .header("content-type", "application/json")
+                            .body(Body::from(request.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Value>(&body).unwrap()
+            }
+        };
+        let initialized = send(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "idempotency-test", "version": "1"}
+            }
+        }))
+        .await;
+        assert_eq!(initialized["result"]["protocolVersion"], "2025-06-18");
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "create-once",
+            "method": "tools/call",
+            "params": {
+                "name": "drafts.create",
+                "arguments": {
+                    "connection_id": connection,
+                    "subject": "once",
+                    "body": "body",
+                    "to": ["to@example.com"]
+                }
+            }
+        });
+        let first = send(request.clone()).await;
+        let second = send(request).await;
+        assert_eq!(
+            first["result"]["structuredContent"]["managed_draft"]["id"],
+            second["result"]["structuredContent"]["managed_draft"]["id"]
+        );
+        assert_eq!(
+            second["result"]["structuredContent"]["idempotent_replay"],
+            true
+        );
+    }
+
+    #[tokio::test]
     async fn persisted_access_key_cannot_access_ungranted_connection() {
         let (state, credential, _, second) = persisted_state().await;
         let response = router(state)
