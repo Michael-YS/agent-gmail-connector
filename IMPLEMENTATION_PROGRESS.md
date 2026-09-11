@@ -1,6 +1,6 @@
 # AgentMail v1 实现进度
 
-更新时间：2026-09-08
+更新时间：2026-09-10
 
 ## 当前状态
 
@@ -26,7 +26,9 @@
 14. `0f8b8ff feat(control-ui): owner HTML dashboard and invitations`
 15. `3f45d95 feat(connections): revoke Gmail access safely`
 16. `11d78f2 feat(control): manage members and accounts`
-17. 工作区：持久化限流、机器端无内容审计与自动清理。
+17. `646f91e feat(governance): persist limits and audits`
+18. `7b86676 feat(mail): add live reads`
+19. `3cc5516 feat(draft): add reply intents`
 
 ## 当前实现断点
 
@@ -37,9 +39,10 @@
 - HTML control plane 已接入 `serve`：Askama 模板（base + owner/{dashboard,invitations,members,capacity}.html + member/account.html），严格 CSP、`HttpOnly; Secure; SameSite=Lax` session + csrf cookie、双重 cookie session/csrf 绑定、PRG + flash 一次性 cookie 携带邀请 token 或 Access Key credential。Owner 管理邀请、成员和容量；Owner/Member 在 `/control/account` 管理自己的 Connection 与 Access Key，Member 可删除自身账号。未登录请求 302 `/auth/google/login`，所有 mutation 强制 CSRF 和资源所有权。
 - 登录 OAuth callback 现在除 session cookie 外另发 `__Host-agentmail_csrf` cookie，作为 HTML 表单 CSRF 明文载体，HttpOnly 仍由服务端读取；JSON 客户端不受影响（依旧从 response body 取 csrf 并以 `x-csrf-token` 头提交）。
 - 新增仓库函数 `list_member_summaries` 与 `personal_use_summary`，仅返回 active Member 聚合元数据与单调历史计数，供 `/control/members` 和 `/control/capacity` 渲染；`list_member_summaries` 查询已修正为 SQLite 兼容的 `MAX(u.last_activity_at, subqueries...)` 形式。
-- production Gmail adapter 已完成读取及无附件 managed draft create/update/delete/send，不再回退到 fake adapter。
+- production Gmail adapter 已完成 Gmail 搜索分页、消息、线程、草稿列表/详情与附件读取，并完成 managed draft create/update/delete/send，不再回退到 fake adapter。消息默认返回规范化文本；HTML 必须显式请求且会删除主动内容。附件不会落盘，响应采用 `no-store`、强制下载及 `nosniff`。
 - 安全 MIME 构建层已使用 `mail-builder 0.5` 完成：稳定 Message-ID、reply References、reply-all 排除当前主地址、非 ASCII header、安全附件 filename/content-type、inline CID、原始附件与最终编码消息的 25 MiB 双重限制，以及有界 writer。
-- 无附件 managed draft 已接入真实 Gmail create/update/delete：使用稳定 Message-ID 和安全 MIME，按草稿独立串行化，从 SQLite 恢复重启后的 managed record，保持 expected-version 乐观锁，并对 create 持久化失败做补偿删除、对 delete 404 做幂等成功。
+- managed draft 已接入真实 Gmail create/update/delete：使用稳定 Message-ID 和安全 MIME，按草稿独立串行化，从 SQLite 恢复重启后的 managed record，保持 expected-version 乐观锁，并对 create 持久化失败做补偿删除、对 delete 404 做幂等成功。prepare/send/update/delete 会重读 Gmail 当前草稿并以完整结构化内容重算 version，网页端编辑会使旧确认失效；prepare 也返回真实收件人、主题、正文摘要和附件名。
+- REST create draft 已支持 `new`、`reply`、`reply_all`、`forward` 意图。reply/reply_all 使用源邮件 thread、`In-Reply-To` 和 `References`；reply_all 排除当前主地址。forward 默认复制同一已授权源邮件的附件与内嵌 CID 数据，并经过 MIME 原始/编码双重大小限制。
 - confirmation token 只以 SHA-256 hash 入库；prepare 先持久化再返回明文一次；claim/outcome 与 managed draft 状态分别在 SQLite 事务中原子更新。相同 token 重放首次结果，不再次发送。
 - production send 已启用单次 Gmail `drafts.send`。Timeout、5xx/Unavailable、429 和 claim 后进程重启均只按系统生成的 `@agentmail.invalid` Message-ID 查询 Sent；要求精确 Message-ID header 与 `SENT` 标签，无法确认则持久化 `send_state_unknown`，绝不盲目重发。
 - 限流已接入 REST/MCP 共用认证和发送链路：每把 Access Key 120 次 API/MCP 调用/分钟、30 次 prepare/小时；每个 Connection 10 次发送/小时、50 次/天。小时/日额度在同一 SQLite 事务内预占，确认重放、无效确认和明确失败会原子返还，`send_state_unknown` 保留占用；429 返回 header/body retry 秒数。机器端 search/prepare/send 审计只写 ID、操作、结果、延迟、request ID 和时间。
@@ -48,15 +51,15 @@
 - 邀请接受以 POST body 中的一次性 token 启动 Login OAuth；token 仅以 SHA-256 hash 绑定到 OAuth transaction，callback 仅以已验证、规范化 email 和精确 Google `sub` 原子接受邀请、创建 Member 与 session。重放、错误 email、过期或撤销邀请均不创建 session。
 - 常规 Google Login 会以精确 Google `sub` 与规范化 verified email 登录既有 active Owner 或 Member；没有既有用户时才保留首次 Owner bootstrap 规则。
 - Owner JSON API 已接入：`GET/POST /control/api/invitations`、`POST /control/api/invitations/{id}/revoke`、`POST /control/api/invitations/{id}/regenerate`；HTML 保留 `/control/invitations...`。mutation 要求 Owner session+CSRF，列表不返回 hash，create/regenerate token 只返回一次并 `Cache-Control: no-store`。
-- 最新本地完整验证：169 个 library tests、4 个 HTTP tests、5 个 REST/MCP tests，共 178 项；`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo check --all-targets --all-features --locked` 已通过。未执行部署、真实 Google 或浏览器 smoke。
+- 最新本地完整验证：174 个 library tests、4 个 HTTP tests、5 个 REST/MCP tests，共 183 项；`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo check --all-targets --all-features --locked` 已通过。未执行部署、真实 Google 或浏览器 smoke。
 
 ## 剩余实现里程碑
 
 ### 1. MIME 与附件入口
 
 - MIME 构建层已完成并提交；后续不得回退为手写 MIME。
-- new draft 的无附件路径已接入；剩余：reply、reply-all、forward 的完整编排。
-- 剩余：HTTP multipart 上传、已有 Gmail 附件/内嵌图片转发、附件下载流。
+- new/reply/reply-all/forward 已接入；剩余：HTTP multipart 上传和 MCP 小附件输入。
+- 已有 Gmail 附件/内嵌图片转发与下载已接入；附件下载受 Gmail JSON/base64url API 限制，在内存中有界解码后转发，不会落盘。
 - 已有稳定 Message-ID、In-Reply-To/References、header injection 防护、非 ASCII header、filename/content type 校验、双重 25 MiB 限制和有界 writer 测试。
 
 ### 2. Gmail 写入与发送链路（已完成本地实现）

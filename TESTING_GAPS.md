@@ -1,6 +1,6 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：169 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端无内容审计和保留期清理）、4 项 HTTP 安全与 managed-draft 契约测试、5 项 REST/MCP 契约测试，共 178 项；并已运行 `cargo fmt --check`、`cargo check --all-targets --all-features --locked`、`cargo clippy --all-targets --all-features -- -D warnings`。未执行部署、真实 Google 或浏览器 smoke。
+本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：174 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端无内容审计和保留期清理、Gmail thread/attachment/draft read 与 reply-all 路由）、4 项 HTTP 安全与 managed-draft 契约测试、5 项 REST/MCP 契约测试，共 183 项；并已运行 `cargo fmt --check`、`cargo check --all-targets --all-features --locked`、`cargo clippy --all-targets --all-features -- -D warnings`。未执行部署、真实 Google 或浏览器 smoke。
 
 ## A. 尚未实现，因此目前无法执行的测试
 
@@ -27,7 +27,7 @@
 
 ### A4. MIME、附件与完整 managed draft
 
-- 已实现：mail-builder MIME、稳定 Message-ID、reply References、reply-all 排除当前主地址、非 ASCII header 编码、header/filename/content-type 注入防护、原始附件与最终编码消息的 25 MiB 双重限制、无附件 Gmail draft create/update/delete/send、hash-only confirmation、原子 outcome 持久化、重启恢复和 Sent Message-ID 对账。缺口：reply/reply-all/forward 编排、multipart 流式上传以及附件转发/下载尚未完成。
+- 已实现：mail-builder MIME、稳定 Message-ID、reply References、reply-all 排除当前主地址、非 ASCII header 编码、header/filename/content-type 注入防护、原始附件与最终编码消息的 25 MiB 双重限制、Gmail draft create/update/delete/send、hash-only confirmation、原子 outcome 持久化、重启恢复和 Sent Message-ID 对账，以及 REST new/reply/reply-all/forward、同 Connection 源附件转发和附件下载。缺口：HTTP multipart 上传和 MCP base64 小附件。
 - 实现后测试：非 ASCII headers、header injection、reply references、reply-all 排除当前地址、forward 内嵌图、恶意文件名、MCP 4 MiB、HTTP 25 MiB、超限和响应丢失。
 - 命令目标：`cargo test --test mime_and_drafts --all-features`。
 - 通过标准：非 managed draft 只能读取；版本变化返回 `409 draft_changed`；超时不自动重发，无法对账进入 `send_state_unknown`。
