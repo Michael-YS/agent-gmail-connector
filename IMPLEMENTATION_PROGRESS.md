@@ -39,7 +39,8 @@
 27. `24b2e24 test: cover rmcp protocol boundaries`
 28. `a303a2d test(mcp): lock transport contract snapshots`
 29. `425f760 docs: clarify mcp endpoint migration`
-30. 当前工作区：canonical `/mcp` 迁移与并发压力测试稳定性修复，待提交。
+30. `d265b16 feat(mcp): align canonical streamable endpoint`
+31. 当前工作区干净；剩余为真实 client、部署与 Google 外部验收。
 
 ## 当前实现断点
 
