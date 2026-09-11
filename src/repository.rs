@@ -60,6 +60,15 @@ pub struct DurableRateCharge {
     window_started_at: DateTime<Utc>,
 }
 
+/// Result of atomically claiming a REST draft-create idempotency key.
+/// The database retains only hashes and the resulting internal draft ID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DraftCreateIdempotencyClaim {
+    Claimed,
+    Completed(DraftId),
+    InProgress,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CleanupResult {
     pub audit_events: u64,
@@ -1537,6 +1546,119 @@ impl Repository {
     pub async fn insert_draft(&self, d: &ManagedDraft) -> Result<(), RepositoryError> {
         let now = encode_time(Utc::now());
         sqlx::query("INSERT INTO managed_drafts (id,connection_id,gmail_draft_id,stable_message_id,current_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").bind(d.id.to_string()).bind(d.connection_id.to_string()).bind(&d.gmail_draft_id).bind(&d.message_id).bind(d.version.as_str()).bind(draft_status(d.state)).bind(&now).bind(now.clone()).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Reserve an HTTP draft-create key, or return its already-created draft.
+    /// No request body, recipient, or attachment data is persisted here.
+    pub async fn claim_draft_create_idempotency(
+        &self,
+        caller_id: AccessKeyId,
+        key_hash: &str,
+        request_digest: &str,
+        now: DateTime<Utc>,
+    ) -> Result<DraftCreateIdempotencyClaim, RepositoryError> {
+        validate_token_hash(key_hash, "idempotency key hash")?;
+        validate_token_hash(request_digest, "idempotency request digest")?;
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query(
+            "INSERT INTO idempotency_records (id,caller_id,operation,idempotency_key_hash,request_digest,state,status_code,result_json,created_at,updated_at) VALUES (?,?,?,?,?,'in_progress',NULL,NULL,?,?) ON CONFLICT(caller_id,operation,idempotency_key_hash) DO NOTHING",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(caller_id.to_string())
+        .bind("draft.create")
+        .bind(key_hash)
+        .bind(request_digest)
+        .bind(encode_time(now))
+        .bind(encode_time(now))
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 1 {
+            tx.commit().await?;
+            return Ok(DraftCreateIdempotencyClaim::Claimed);
+        }
+        let row = sqlx::query(
+            "SELECT request_digest,state,result_json FROM idempotency_records WHERE caller_id=? AND operation='draft.create' AND idempotency_key_hash=?",
+        )
+        .bind(caller_id.to_string())
+        .bind(key_hash)
+        .fetch_one(&mut *tx)
+        .await?;
+        let stored_digest: String = row.try_get("request_digest")?;
+        if stored_digest != request_digest {
+            return Err(RepositoryError::Conflict);
+        }
+        let state: String = row.try_get("state")?;
+        let claim = match state.as_str() {
+            "in_progress" => DraftCreateIdempotencyClaim::InProgress,
+            "completed" => {
+                let result: String = row
+                    .try_get::<Option<String>, _>("result_json")?
+                    .ok_or(RepositoryError::Corrupt("idempotency result"))?;
+                DraftCreateIdempotencyClaim::Completed(DraftId::from_uuid(parse_uuid(result)?))
+            }
+            _ => return Err(RepositoryError::Corrupt("idempotency state")),
+        };
+        tx.commit().await?;
+        Ok(claim)
+    }
+
+    pub async fn complete_draft_create_idempotency(
+        &self,
+        caller_id: AccessKeyId,
+        key_hash: &str,
+        draft_id: DraftId,
+        now: DateTime<Utc>,
+    ) -> Result<(), RepositoryError> {
+        let updated = sqlx::query(
+            "UPDATE idempotency_records SET state='completed',status_code=200,result_json=?,updated_at=? WHERE caller_id=? AND operation='draft.create' AND idempotency_key_hash=? AND state='in_progress'",
+        )
+        .bind(draft_id.to_string())
+        .bind(encode_time(now))
+        .bind(caller_id.to_string())
+        .bind(key_hash)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(RepositoryError::Conflict)
+        }
+    }
+
+    /// Persist the managed draft and its idempotent result in one transaction.
+    pub async fn insert_draft_and_complete_idempotency(
+        &self,
+        draft: &ManagedDraft,
+        caller_id: AccessKeyId,
+        key_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let time = encode_time(now);
+        sqlx::query("INSERT INTO managed_drafts (id,connection_id,gmail_draft_id,stable_message_id,current_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)")
+            .bind(draft.id.to_string()).bind(draft.connection_id.to_string()).bind(&draft.gmail_draft_id).bind(&draft.message_id).bind(draft.version.as_str()).bind(draft_status(draft.state)).bind(&time).bind(&time)
+            .execute(&mut *tx).await?;
+        let completed = sqlx::query("UPDATE idempotency_records SET state='completed',status_code=200,result_json=?,updated_at=? WHERE caller_id=? AND operation='draft.create' AND idempotency_key_hash=? AND state='in_progress'")
+            .bind(draft.id.to_string()).bind(&time).bind(caller_id.to_string()).bind(key_hash)
+            .execute(&mut *tx).await?;
+        if completed.rows_affected() != 1 {
+            return Err(RepositoryError::Conflict);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn abandon_draft_create_idempotency(
+        &self,
+        caller_id: AccessKeyId,
+        key_hash: &str,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query("DELETE FROM idempotency_records WHERE caller_id=? AND operation='draft.create' AND idempotency_key_hash=? AND state='in_progress'")
+            .bind(caller_id.to_string())
+            .bind(key_hash)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
     pub async fn get_draft(&self, id: DraftId) -> Result<Option<ManagedDraft>, RepositoryError> {
