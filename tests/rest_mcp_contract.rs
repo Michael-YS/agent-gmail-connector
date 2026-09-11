@@ -161,6 +161,77 @@ async fn rest_and_mcp_draft_reads_share_auth_and_adapter() {
 }
 
 #[tokio::test]
+async fn mcp_drafts_create_accepts_bounded_base64_attachment() {
+    let (state, credential, connection) = AppState::test_fixture();
+    let response = build_router(state)
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(mcp_request(
+                    "tools/call",
+                    9,
+                    json!({
+                        "name": "drafts.create",
+                        "arguments": {
+                            "connection_id": connection,
+                            "subject": "mcp draft",
+                            "body": "untrusted body",
+                            "to": ["to@example.com"],
+                            "attachments": [{
+                                "filename": "hello.txt",
+                                "content_type": "text/plain",
+                                "data_base64": "aGVsbG8="
+                            }]
+                        }
+                    }),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response_json(response).await;
+    let draft = &value["result"]["structuredContent"]["draft"];
+    assert_eq!(draft["subject"], "mcp draft");
+    assert_eq!(draft["attachments"][0]["filename"], "hello.txt");
+    assert_eq!(draft["attachments"][0]["size_bytes"], 5);
+}
+
+#[tokio::test]
+async fn mcp_drafts_create_rejects_invalid_base64_attachment() {
+    let (state, credential, connection) = AppState::test_fixture();
+    let response = build_router(state)
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(mcp_request(
+                    "tools/call",
+                    10,
+                    json!({
+                        "name": "drafts.create",
+                        "arguments": {
+                            "connection_id": connection,
+                            "to": ["to@example.com"],
+                            "attachments": [{
+                                "filename": "bad.bin",
+                                "data_base64": "not base64"
+                            }]
+                        }
+                    }),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response_json(response).await;
+    assert_eq!(value["error"]["code"], -32602);
+    assert_eq!(value["error"]["message"], "invalid attachment base64");
+}
+
+#[tokio::test]
 async fn mcp_thread_and_bounded_base64_attachment_reads_use_mailbox_service() {
     let (state, credential, connection, adapter) = AppState::test_fixture_with_adapter();
     let message = agentmail::adapter::MailMessage {
