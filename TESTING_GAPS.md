@@ -1,6 +1,6 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：193 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端及控制面/OAuth 无内容审计、并发撤销压力测试和保留期清理、Gmail thread/attachment/draft read、reply-all、HTTP multipart 与 MCP base64 草稿附件、持久化 REST/MCP 创建幂等性、MCP JSON-RPC 错误审计分类、rmcp Streamable HTTP 草稿幂等性、内容协商、Host rebinding 及无状态协议负向测试、Gmail 401/invalid_grant → `reauth_required` 持久化与 REST/MCP 独立错误码、JSON reauthorize 入口）、4 项 HTTP 安全与 managed-draft 契约测试、16 项 REST/MCP 契约测试，共 213 项；并已运行 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets --all-features --locked`。未执行部署、真实 Google 或浏览器 smoke。
+本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：194 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端及控制面/OAuth 无内容审计、并发撤销压力测试和保留期清理、Gmail thread/attachment/draft read、reply-all、HTTP multipart 与 MCP base64 草稿附件、持久化 REST/MCP 创建幂等性、MCP JSON-RPC 错误审计分类、rmcp Streamable HTTP 草稿幂等性、内容协商、Host rebinding 及无状态协议负向测试、Gmail 401/invalid_grant → `reauth_required` 持久化与 REST/MCP 独立错误码、JSON reauthorize 入口、Gmail 读取 429/5xx 有界重试）、4 项 HTTP 安全与 managed-draft 契约测试、21 项 REST/MCP 契约测试，共 219 项；并已运行 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets --all-features --locked`。未执行部署、真实 Google 或浏览器 smoke。
 
 ## A. 尚未实现，因此目前无法执行的测试
 

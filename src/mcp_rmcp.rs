@@ -155,9 +155,34 @@ impl ServerHandler for AgentMailMcpServer {
                 .get("error")
                 .cloned()
                 .unwrap_or_else(|| json!({"code":status.as_u16(),"message":"request failed"}));
-            Ok(CallToolResult::structured_error(json!({"error": error})).into())
+            Ok(
+                CallToolResult::structured_error(json!({"error": mcp_error_category(error)}))
+                    .into(),
+            )
         }
     }
+}
+
+/// Preserve the safe authorization category across the Streamable HTTP bridge:
+/// the compatibility dispatcher reports JSON-RPC numeric codes, while this
+/// surface reports stable snake_case error categories.
+fn mcp_error_category(error: Value) -> Value {
+    let Some(code) = error["code"].as_i64() else {
+        return error;
+    };
+    let category = match code {
+        -32001 => "invalid_confirmation",
+        -32003 => "upstream_unavailable",
+        -32004 => "not_found",
+        -32005 => "reauth_required",
+        -32006 => "forbidden",
+        -32009 => "conflict",
+        -32029 => "rate_limited",
+        -32601 => "tool_not_found",
+        -32602 => "invalid_request",
+        _ => return error,
+    };
+    json!({"code": category, "message": error["message"]})
 }
 
 #[cfg(test)]

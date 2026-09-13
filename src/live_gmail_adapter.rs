@@ -16,7 +16,7 @@ use crate::{
     gmail_credentials::{CredentialError, GmailCredentialProvider, GmailCredentialStore},
     google_gmail::{GmailMessage, GoogleGmailClient, GoogleGmailError, MessageFormat},
     google_token::GoogleTokenClient,
-    mime::{MimeAttachment, MimeMessage, build_mime},
+    mime::{MimeAttachment, MimeMessage, ReplyHeaders, build_mime},
     repository::Repository,
 };
 use async_trait::async_trait;
@@ -316,6 +316,11 @@ impl GmailAdapter for LiveGmailAdapter {
         mut draft: MailDraft,
     ) -> Result<MailDraft, AdapterError> {
         let (connection_record, token) = self.connection_and_access_token(connection).await?;
+        if !draft.attachments.is_empty() && draft.attachment_data.is_empty() {
+            let draft_id = draft.id.clone();
+            self.backfill_attachment_data(connection, &token, &draft_id, &mut draft)
+                .await?;
+        }
         let raw = build_draft_mime(&connection_record, &draft)?;
         let result = self
             .gmail
@@ -374,6 +379,55 @@ impl GmailAdapter for LiveGmailAdapter {
             }
         }
         Ok((exact.len() == 1).then(|| exact.remove(0)))
+    }
+}
+
+impl LiveGmailAdapter {
+    /// Reload the current draft and fetch the raw data of inherited
+    /// attachments so a partial update can rebuild the full MIME message.
+    /// Only read endpoints are used; nothing is sent.
+    async fn backfill_attachment_data(
+        &self,
+        connection: ConnectionId,
+        token: &SecretString,
+        draft_id: &str,
+        draft: &mut MailDraft,
+    ) -> Result<(), AdapterError> {
+        let detail = self
+            .map_gmail_result(connection, self.gmail.get_draft(token, draft_id).await)
+            .await?;
+        let mut data = Vec::with_capacity(draft.attachments.len());
+        for attachment in &draft.attachments {
+            let embedded = detail
+                .message
+                .attachments
+                .iter()
+                .find(|candidate| {
+                    candidate.attachment_id.as_deref() == Some(attachment.id.as_str())
+                        || candidate.part_id.as_deref() == Some(attachment.id.as_str())
+                })
+                .and_then(|candidate| candidate.data.clone());
+            let bytes = match embedded {
+                Some(bytes) => bytes,
+                None => {
+                    self.map_gmail_result(
+                        connection,
+                        self.gmail
+                            .get_attachment(token, &detail.message.id, &attachment.id)
+                            .await,
+                    )
+                    .await?
+                    .data
+                }
+            };
+            data.push(MailAttachment {
+                info: attachment.clone(),
+                data: bytes,
+                inline_content_id: None,
+            });
+        }
+        draft.attachment_data = data;
+        Ok(())
     }
 }
 
@@ -526,6 +580,7 @@ fn to_mail_draft(id: String, message: GmailMessage) -> MailDraft {
     let bcc = header_value(&message, "bcc")
         .map(parse_address_list)
         .unwrap_or_default();
+    let reply_headers = reply_headers_from_message(&message);
     let mapped = to_mail_message(message);
     MailDraft {
         id,
@@ -538,9 +593,19 @@ fn to_mail_draft(id: String, message: GmailMessage) -> MailDraft {
         bcc,
         attachments: mapped.metadata.attachments,
         html_body: mapped.html_body,
-        reply_headers: None,
+        reply_headers,
         attachment_data: vec![],
     }
+}
+
+fn reply_headers_from_message(message: &GmailMessage) -> Option<ReplyHeaders> {
+    let parent = header_value(message, "in-reply-to")?;
+    let references = header_value(message, "references")
+        .into_iter()
+        .flat_map(|value| value.split_ascii_whitespace())
+        .map(str::to_owned)
+        .collect();
+    ReplyHeaders::new(parent, references).ok()
 }
 
 fn header_value<'a>(message: &'a GmailMessage, name: &str) -> Option<&'a str> {

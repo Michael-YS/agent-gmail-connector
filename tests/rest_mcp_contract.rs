@@ -1,13 +1,61 @@
+use agentmail::adapter::GmailAdapter;
 use agentmail::domain::identity::ConnectionStatus;
 use agentmail::http::{AppState, build_router};
+use agentmail::{
+    adapter::FakeGmailAdapter,
+    database::Database,
+    domain::{
+        access::AccessKey,
+        identity::{
+            ConnectionId, GMAIL_COMPOSE_SCOPE, GMAIL_READONLY_SCOPE, GmailConnection, User,
+            UserRole,
+        },
+    },
+    repository::Repository,
+};
 use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+async fn persisted_fixture() -> (AppState, String, ConnectionId) {
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    database.migrate().await.unwrap();
+    let repository = Repository::new(&database);
+    let user = User::new(
+        "contract-sub",
+        "contract@example.com",
+        UserRole::Owner,
+        chrono::Utc::now(),
+    )
+    .unwrap();
+    repository.insert_user(&user).await.unwrap();
+    let connection = GmailConnection::new(
+        user.id,
+        "contract-gmail-sub",
+        "contract.gmail@example.com",
+        vec![GMAIL_READONLY_SCOPE.into(), GMAIL_COMPOSE_SCOPE.into()],
+    )
+    .unwrap();
+    let cid = connection.id;
+    repository
+        .insert_connection(&connection, None)
+        .await
+        .unwrap();
+    let created = AccessKey::generate(user.id, "contract-key", [cid]).unwrap();
+    let credential = created.credential.clone();
+    repository.insert_access_key(&created).await.unwrap();
+    (
+        AppState::new(Some(database), Arc::new(FakeGmailAdapter::new())),
+        credential,
+        cid,
+    )
+}
 
 async fn response_json(response: axum::response::Response) -> Value {
     serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap()
@@ -446,6 +494,9 @@ async fn rmcp_streamable_http_negotiates_and_lists_tools() {
             "threads.get",
             "messages.get_attachment",
             "drafts.create",
+            "drafts.reply",
+            "drafts.reply_all",
+            "drafts.forward",
             "drafts.list",
             "drafts.get",
             "drafts.update",
@@ -466,7 +517,7 @@ async fn rmcp_streamable_http_negotiates_and_lists_tools() {
     ));
     assert_eq!(
         streamable_digest,
-        "4d085848720023737060922ca308b761f9e69452cb850c22e9b2931c4350b8bf"
+        "6e6e92ee7c3b3d505976de163d175cbc8be5bc79a925581f3111382807302d31"
     );
 
     let call = build_router(state)
@@ -884,7 +935,7 @@ async fn mcp_tools_schema_snapshot_is_stable() {
     ));
     assert_eq!(
         digest,
-        "4d085848720023737060922ca308b761f9e69452cb850c22e9b2931c4350b8bf"
+        "6e6e92ee7c3b3d505976de163d175cbc8be5bc79a925581f3111382807302d31"
     );
 }
 
@@ -979,5 +1030,446 @@ async fn rest_and_mcp_reject_query_tokens_and_cross_connection_ids() {
         )
         .await
         .unwrap();
-    assert_eq!(mcp_idor.status(), StatusCode::FORBIDDEN);
+    assert_eq!(mcp_idor.status(), StatusCode::OK);
+    let mcp_idor = response_json(mcp_idor).await;
+    assert_eq!(mcp_idor["error"]["code"], -32006);
+}
+
+#[tokio::test]
+async fn mcp_drafts_create_reused_jsonrpc_id_is_not_an_idempotency_key() {
+    let (state, credential, connection) = persisted_fixture().await;
+    let call = |state: AppState, subject: &'static str| {
+        let credential = credential.clone();
+        async move {
+            response_json(
+                build_router(state)
+                    .oneshot(
+                        Request::post("/mcp-compat")
+                            .header("authorization", format!("Bearer {credential}"))
+                            .header("content-type", "application/json")
+                            .body(mcp_request(
+                                "tools/call",
+                                1,
+                                json!({
+                                    "name": "drafts.create",
+                                    "arguments": {
+                                        "connection_id": connection,
+                                        "subject": subject,
+                                        "body": "untrusted body",
+                                        "to": ["to@example.com"]
+                                    }
+                                }),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await
+        }
+    };
+    let first = call(state.clone(), "first").await;
+    let second = call(state, "second").await;
+    assert!(first["result"]["structuredContent"]["draft"].is_object());
+    assert!(second["result"]["structuredContent"]["draft"].is_object());
+    assert_ne!(
+        first["result"]["structuredContent"]["draft"]["id"],
+        second["result"]["structuredContent"]["draft"]["id"]
+    );
+}
+
+#[tokio::test]
+async fn mcp_drafts_create_explicit_idempotency_key_replays_and_conflicts() {
+    let (state, credential, connection) = persisted_fixture().await;
+    let call = |state: AppState, subject: &'static str| {
+        let credential = credential.clone();
+        async move {
+            response_json(
+                build_router(state)
+                    .oneshot(
+                        Request::post("/mcp-compat")
+                            .header("authorization", format!("Bearer {credential}"))
+                            .header("content-type", "application/json")
+                            .body(mcp_request(
+                                "tools/call",
+                                2,
+                                json!({
+                                    "name": "drafts.create",
+                                    "arguments": {
+                                        "connection_id": connection,
+                                        "idempotency_key": "client-op-1",
+                                        "subject": subject,
+                                        "body": "untrusted body",
+                                        "to": ["to@example.com"]
+                                    }
+                                }),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await
+        }
+    };
+    let first = call(state.clone(), "once").await;
+    let replay = call(state.clone(), "once").await;
+    assert!(first["result"]["structuredContent"]["draft"].is_object());
+    assert_eq!(
+        replay["result"]["structuredContent"]["draft"]["id"],
+        first["result"]["structuredContent"]["draft"]["id"]
+    );
+    assert_eq!(
+        replay["result"]["structuredContent"]["idempotent_replay"],
+        true
+    );
+
+    let conflict = call(state, "different").await;
+    assert_eq!(conflict["error"]["code"], -32009);
+}
+
+#[tokio::test]
+async fn mcp_reply_and_forward_tools_create_threaded_drafts() {
+    let (state, credential, connection, adapter) = AppState::test_fixture_with_adapter();
+    adapter
+        .insert_message(
+            connection,
+            agentmail::adapter::MailMessage {
+                metadata: agentmail::domain::mailbox::MessageMetadata {
+                    id: "source-9".into(),
+                    thread_id: Some("thread-9".into()),
+                    sent_at: None,
+                    from: Some(
+                        agentmail::domain::mailbox::EmailAddress::new("sender@example.com")
+                            .unwrap(),
+                    ),
+                    to: vec![
+                        agentmail::domain::mailbox::EmailAddress::new("gmail@example.com").unwrap(),
+                    ],
+                    cc: vec![],
+                    subject: "Topic".into(),
+                    snippet: "snippet".into(),
+                    attachments: vec![],
+                },
+                body: "original".into(),
+                body_is_html: false,
+                html_body: None,
+                headers: vec![agentmail::adapter::MailHeader {
+                    name: "Message-ID".into(),
+                    value: "<parent@example.com>".into(),
+                }],
+            },
+        )
+        .await;
+    let call = |state: AppState, name: &'static str, arguments: Value| {
+        let credential = credential.clone();
+        async move {
+            response_json(
+                build_router(state)
+                    .oneshot(
+                        Request::post("/mcp-compat")
+                            .header("authorization", format!("Bearer {credential}"))
+                            .header("content-type", "application/json")
+                            .body(mcp_request(
+                                "tools/call",
+                                3,
+                                json!({"name": name, "arguments": arguments}),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await
+        }
+    };
+    let reply = call(
+        state.clone(),
+        "drafts.reply",
+        json!({"connection_id": connection, "source_message_id": "source-9", "body": "answer"}),
+    )
+    .await;
+    let reply = &reply["result"]["structuredContent"]["draft"];
+    assert_eq!(reply["thread_id"], "thread-9");
+    assert_eq!(reply["subject"], "Re: Topic");
+    assert_eq!(reply["to"], json!(["sender@example.com"]));
+
+    let forward = call(
+        state,
+        "drafts.forward",
+        json!({
+            "connection_id": connection,
+            "source_message_id": "source-9",
+            "to": ["other@example.com"],
+            "body": "see this"
+        }),
+    )
+    .await;
+    let forward = &forward["result"]["structuredContent"]["draft"];
+    assert_eq!(forward["subject"], "Fwd: Topic");
+    assert_eq!(forward["to"], json!(["other@example.com"]));
+    assert!(
+        forward["body"]
+            .as_str()
+            .unwrap()
+            .contains("Forwarded message")
+    );
+}
+
+#[tokio::test]
+async fn mcp_draft_create_and_update_accept_existing_attachment_references() {
+    let (state, credential, connection, adapter) = AppState::test_fixture_with_adapter();
+    adapter
+        .insert_message(
+            connection,
+            agentmail::adapter::MailMessage {
+                metadata: agentmail::domain::mailbox::MessageMetadata {
+                    id: "message-9".into(),
+                    thread_id: None,
+                    sent_at: None,
+                    from: None,
+                    to: vec![],
+                    cc: vec![],
+                    subject: "untrusted subject".into(),
+                    snippet: "untrusted snippet".into(),
+                    attachments: vec![],
+                },
+                body: "untrusted body".into(),
+                body_is_html: false,
+                html_body: None,
+                headers: vec![],
+            },
+        )
+        .await;
+    adapter
+        .insert_attachment(
+            connection,
+            "message-9",
+            agentmail::adapter::MailAttachment {
+                info: agentmail::domain::mailbox::AttachmentInfo {
+                    id: "attachment-9".into(),
+                    filename: "report.txt".into(),
+                    content_type: "text/plain".into(),
+                    size_bytes: 5,
+                    inline: false,
+                },
+                data: b"hello".to_vec(),
+                inline_content_id: None,
+            },
+        )
+        .await;
+
+    let created = response_json(
+        build_router(state.clone())
+            .oneshot(
+                Request::post("/mcp-compat")
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("content-type", "application/json")
+                    .body(mcp_request(
+                        "tools/call",
+                        4,
+                        json!({
+                            "name": "drafts.create",
+                            "arguments": {
+                                "connection_id": connection,
+                                "subject": "with reference",
+                                "body": "untrusted body",
+                                "to": ["to@example.com"],
+                                "attachments": [{"message_id": "message-9", "attachment_id": "attachment-9"}]
+                            }
+                        }),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let draft = &created["result"]["structuredContent"]["draft"];
+    assert_eq!(draft["attachments"][0]["filename"], "report.txt");
+    assert_eq!(draft["attachments"][0]["size_bytes"], 5);
+
+    let missing = response_json(
+        build_router(state)
+            .oneshot(
+                Request::post("/mcp-compat")
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("content-type", "application/json")
+                    .body(mcp_request(
+                        "tools/call",
+                        5,
+                        json!({
+                            "name": "drafts.create",
+                            "arguments": {
+                                "connection_id": connection,
+                                "subject": "missing reference",
+                                "body": "untrusted body",
+                                "to": ["to@example.com"],
+                                "attachments": [{"message_id": "message-9", "attachment_id": "nope"}]
+                            }
+                        }),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], -32602);
+    assert_eq!(
+        missing["error"]["message"],
+        "attachment reference not found"
+    );
+}
+
+#[tokio::test]
+async fn rest_draft_update_inherits_threading_and_attachments() {
+    let (state, credential, connection, adapter) = AppState::test_fixture_with_adapter();
+    adapter
+        .insert_message(
+            connection,
+            agentmail::adapter::MailMessage {
+                metadata: agentmail::domain::mailbox::MessageMetadata {
+                    id: "source-7".into(),
+                    thread_id: Some("thread-7".into()),
+                    sent_at: None,
+                    from: Some(
+                        agentmail::domain::mailbox::EmailAddress::new("sender@example.com")
+                            .unwrap(),
+                    ),
+                    to: vec![
+                        agentmail::domain::mailbox::EmailAddress::new("gmail@example.com").unwrap(),
+                    ],
+                    cc: vec![],
+                    subject: "Topic".into(),
+                    snippet: "snippet".into(),
+                    attachments: vec![agentmail::domain::mailbox::AttachmentInfo {
+                        id: "attachment-7".into(),
+                        filename: "doc.txt".into(),
+                        content_type: "text/plain".into(),
+                        size_bytes: 5,
+                        inline: false,
+                    }],
+                },
+                body: "original".into(),
+                body_is_html: false,
+                html_body: None,
+                headers: vec![agentmail::adapter::MailHeader {
+                    name: "Message-ID".into(),
+                    value: "<parent@example.com>".into(),
+                }],
+            },
+        )
+        .await;
+    adapter
+        .insert_attachment(
+            connection,
+            "source-7",
+            agentmail::adapter::MailAttachment {
+                info: agentmail::domain::mailbox::AttachmentInfo {
+                    id: "attachment-7".into(),
+                    filename: "doc.txt".into(),
+                    content_type: "text/plain".into(),
+                    size_bytes: 5,
+                    inline: false,
+                },
+                data: b"hello".to_vec(),
+                inline_content_id: None,
+            },
+        )
+        .await;
+
+    let created = response_json(
+        build_router(state.clone())
+            .oneshot(
+                Request::post(format!("/api/v1/connections/{connection}/drafts"))
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"reply_all","source_message_id":"source-7","body":"answer"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let managed = &created["managed_draft"];
+    let draft_id = managed["id"].as_str().unwrap().to_owned();
+    let version = managed["version"].as_str().unwrap().to_owned();
+    let gmail_draft_id = managed["gmail_draft_id"].as_str().unwrap().to_owned();
+
+    let updated = response_json(
+        build_router(state.clone())
+            .oneshot(
+                Request::patch(format!("/api/v1/connections/{connection}/drafts/{draft_id}"))
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"expected_version": version, "subject": "edited subject", "body": "edited"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(updated["draft"]["thread_id"], "thread-7");
+    assert_eq!(updated["draft"]["to"], json!(["sender@example.com"]));
+
+    let stored = adapter
+        .get_draft(connection, &gmail_draft_id)
+        .await
+        .unwrap();
+    assert!(stored.reply_headers.is_some());
+    assert_eq!(stored.subject, "edited subject");
+
+    let forwarded = response_json(
+        build_router(state.clone())
+            .oneshot(
+                Request::post(format!("/api/v1/connections/{connection}/drafts"))
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"forward","source_message_id":"source-7","to":["other@example.com"],"body":"fyi"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let managed = &forwarded["managed_draft"];
+    let forward_id = managed["id"].as_str().unwrap().to_owned();
+    let forward_version = managed["version"].as_str().unwrap().to_owned();
+    let forward_gmail_id = managed["gmail_draft_id"].as_str().unwrap().to_owned();
+
+    let forwarded_updated = response_json(
+        build_router(state.clone())
+            .oneshot(
+                Request::patch(format!(
+                    "/api/v1/connections/{connection}/drafts/{forward_id}"
+                ))
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"expected_version": forward_version, "body": "still fyi"}).to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        forwarded_updated["draft"]["attachments"][0]["filename"],
+        "doc.txt"
+    );
+
+    let stored = adapter
+        .get_draft(connection, &forward_gmail_id)
+        .await
+        .unwrap();
+    assert_eq!(stored.attachment_data.len(), 1);
+    assert_eq!(stored.attachment_data[0].data, b"hello");
 }

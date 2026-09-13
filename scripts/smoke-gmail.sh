@@ -93,16 +93,22 @@ say "drafts.create HTTP $STATUS (idempotency-key $idem_key)"
 http POST "/api/v1/connections/$cid/drafts/$draft_id/prepare-send" ''
 check_status 'prepare-send'
 confirmation_token=$(jq -er '.confirmation_token' <<<"$BODY") || die 'prepare-send response had no confirmation_token'
-recipients=$(jq -r '[.preview.to[], .preview.cc[], .preview.bcc[]] | join(", ")' <<<"$BODY")
-body_summary=$(jq -r '.preview.body_summary // ""' <<<"$BODY")
-attachments=$(jq -r '(.preview.attachment_names // []) | join(", ")' <<<"$BODY")
+recipient_count=$(jq -r '[.preview.to[], .preview.cc[], .preview.bcc[]] | length' <<<"$BODY")
+all_recipients_match_self=$(jq -r --arg self "$AGENTMAIL_SELF_ADDRESS" \
+  '([.preview.to[], .preview.cc[], .preview.bcc[]] | length == 1) and
+   ([.preview.to[], .preview.cc[], .preview.bcc[]][] | ascii_downcase == ($self | ascii_downcase))' \
+  <<<"$BODY")
+# Security boundary: message bodies (and their summaries) must never reach
+# logs or CI output. Only metadata — presence and length — is reported.
+body_len=$(jq -r '(.preview.body_summary // "") | length' <<<"$BODY")
+attachment_count=$(jq -r '(.preview.attachment_names // []) | length' <<<"$BODY")
 say "prepare-send HTTP $STATUS"
 say "run-id: $run_id"
 say "draft id: $draft_id"
-say "recipient(s): $recipients"
-say "subject: $subject"
-say "body summary: $body_summary"
-say "attachments: ${attachments:-none}"
+say "recipient count: $recipient_count"
+say "subject: withheld (script-generated E2E marker; run-id above)"
+say "body summary: withheld (present=$([[ $body_len -gt 0 ]] && echo yes || echo no), length=${body_len} chars)"
+say "attachment count: $attachment_count"
 
 if [[ $mode == prepare ]]; then
   say 'prepare-only run complete; nothing was sent'
@@ -110,12 +116,12 @@ if [[ $mode == prepare ]]; then
 fi
 
 # Hard allowlist: refuse to send to anything but the single self address.
-[[ "${recipients,,}" == "${AGENTMAIL_SELF_ADDRESS,,}" ]] \
-  || die "allowlist violation: recipients ($recipients) are not exactly $AGENTMAIL_SELF_ADDRESS"
+[[ "$all_recipients_match_self" == true ]] \
+  || die 'allowlist violation: preview recipients are not exactly one configured self address'
 
 if [[ $assume_yes == false ]]; then
   [[ -t 0 ]] || die 'stdin is not a TTY; rerun with --send --yes to confirm non-interactively'
-  printf 'smoke-gmail: send 1 message to %s with subject "%s"? [y/N] ' "$AGENTMAIL_SELF_ADDRESS" "$subject"
+  printf 'smoke-gmail: send 1 message to %s (run-id %s)? [y/N] ' "$AGENTMAIL_SELF_ADDRESS" "$run_id"
   reply=''
   read -r reply || reply=''
   [[ $reply == [yY] ]] || die 'aborted by user; nothing was sent'

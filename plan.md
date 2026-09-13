@@ -135,6 +135,15 @@ SQLite 至少包含以下表：
 
 Askama 服务端渲染，少量原生 JavaScript；不引入 React、Vite 或生产 Node runtime。所有修改操作使用 POST、CSRF token 和 Post/Redirect/Get。
 
+权限模型以资源所有权为边界：Member 完整管理自己名下的 Gmail Connections 和 Access Keys；Owner 负责成员资格、邀请、实例容量和整账号撤销，Owner 角色不能绕过资源所有权。
+
+- Member 可以查看、创建、重新授权和撤销自己的 Gmail Connection。
+- Member 可以查看、创建、rotate 和 revoke 自己的 Access Key，并在自己的 active Access Key 与 active Connection 之间增加、移除或替换 grants。
+- Member 不能查看或修改其他用户的 Connections、Access Keys 或 grants，不能把 key 授权给其他用户的 Connection。
+- Owner 可以 revoke 整个 Member 账号，但不能为 Member 创建或 rotate Access Key、修改其 grants，也不能以 Member 身份调用 Gmail。
+- 所有 control-plane mutation 都必须验证有效 session、CSRF token 和资源所有权。grant 两端必须属于同一 active 用户。
+- create/rotate 只一次返回完整 credential，响应必须 `Cache-Control: no-store`；数据库只保存 hash。revoke 后不可恢复，需要新资源时重新 connect 或 create。
+
 公共页面：
 
 - 产品用途与数据处理说明。
@@ -157,7 +166,7 @@ Owner 额外页面：
 - revoke 某个 AgentMail 账号。
 - 查看 Personal Use 当前成员、历史授权计数和剩余额度。
 
-Owner 不能读取成员邮件或草稿，不能查看 Google token、Access Key 明文、查询字符串、收件人、主题、正文或附件名。
+Owner 不能读取成员邮件或草稿，不能查看 Google token、Access Key 明文、查询字符串、收件人、主题、正文或附件名；Owner 的管理角色不授予成员资源的代理访问权。
 
 Owner 通过 `OWNER_EMAIL` 引导首次登录，成功后以 Google `sub` 作为稳定身份。Owner 不能在 UI 中被删除或降级；转移 Owner 必须由服务器 owner 修改配置并运行专门管理命令。
 

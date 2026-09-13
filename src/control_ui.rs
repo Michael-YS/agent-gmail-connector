@@ -296,6 +296,36 @@ struct FlashParts {
     message: Option<&'static str>,
 }
 
+struct FlashView {
+    is_some: bool,
+    token_is_some: bool,
+    css_class: &'static str,
+    label: &'static str,
+    token: String,
+    message: &'static str,
+}
+
+fn flash_view(flash: Option<FlashParts>) -> FlashView {
+    let Some(flash) = flash else {
+        return FlashView {
+            is_some: false,
+            token_is_some: false,
+            css_class: "",
+            label: "",
+            token: String::new(),
+            message: "",
+        };
+    };
+    FlashView {
+        is_some: true,
+        token_is_some: flash.token.is_some(),
+        css_class: flash.css_class,
+        label: flash.label,
+        token: flash.token.unwrap_or_default(),
+        message: flash.message.unwrap_or_default(),
+    }
+}
+
 async fn dashboard<V, E>(
     State(state): State<ControlHttpState<V, E>>,
     headers: HeaderMap,
@@ -321,7 +351,7 @@ where
         Err(error) => return server_error(error),
     };
     let flash = match take_flash(&headers) {
-        Ok(flash) => flash,
+        Ok(flash) => flash_view(flash),
         Err(response) => return response,
     };
     let mut response = render(OwnerDashboardTemplate {
@@ -336,15 +366,12 @@ where
         historical_authorization_count: summary.historical_authorization_count,
         remaining_capacity: summary.remaining_capacity,
         configured_limit: u32::from(state.config.personal_use_user_limit),
-        flash_is_some: flash.is_some(),
-        flash_token_is_some: flash.as_ref().is_some_and(|f| f.token.is_some()),
-        flash_css_class: flash.as_ref().map(|f| f.css_class).unwrap_or(""),
-        flash_label: flash.as_ref().map(|f| f.label).unwrap_or(""),
-        flash_token: flash
-            .as_ref()
-            .and_then(|f| f.token.as_deref())
-            .unwrap_or(""),
-        flash_message: flash.as_ref().and_then(|f| f.message).unwrap_or(""),
+        flash_is_some: flash.is_some,
+        flash_token_is_some: flash.token_is_some,
+        flash_css_class: flash.css_class,
+        flash_label: flash.label,
+        flash_token: &flash.token,
+        flash_message: flash.message,
     });
     append_clear_flash_cookie(&mut response);
     response
@@ -388,7 +415,7 @@ where
         .collect();
     let invitations_empty = rows.is_empty();
     let flash = match take_flash(&headers) {
-        Ok(flash) => flash,
+        Ok(flash) => flash_view(flash),
         Err(response) => return response,
     };
     let mut response = render(InvitationsTemplate {
@@ -402,15 +429,12 @@ where
         invitations_empty,
         invitations: rows,
         preset_email: "",
-        flash_is_some: flash.is_some(),
-        flash_token_is_some: flash.as_ref().is_some_and(|f| f.token.is_some()),
-        flash_css_class: flash.as_ref().map(|f| f.css_class).unwrap_or(""),
-        flash_label: flash.as_ref().map(|f| f.label).unwrap_or(""),
-        flash_token: flash
-            .as_ref()
-            .and_then(|f| f.token.as_deref())
-            .unwrap_or(""),
-        flash_message: flash.as_ref().and_then(|f| f.message).unwrap_or(""),
+        flash_is_some: flash.is_some,
+        flash_token_is_some: flash.token_is_some,
+        flash_css_class: flash.css_class,
+        flash_label: flash.label,
+        flash_token: &flash.token,
+        flash_message: flash.message,
     });
     append_clear_flash_cookie(&mut response);
     response
@@ -599,7 +623,7 @@ where
         .collect();
     let members_empty = rows.is_empty();
     let flash = match take_flash(&headers) {
-        Ok(flash) => flash,
+        Ok(flash) => flash_view(flash),
         Err(response) => return response,
     };
     let mut response = render(MembersTemplate {
@@ -612,15 +636,12 @@ where
         csrf: &csrf,
         members_empty,
         members: rows,
-        flash_is_some: flash.is_some(),
-        flash_token_is_some: flash.as_ref().is_some_and(|f| f.token.is_some()),
-        flash_css_class: flash.as_ref().map(|f| f.css_class).unwrap_or(""),
-        flash_label: flash.as_ref().map(|f| f.label).unwrap_or(""),
-        flash_token: flash
-            .as_ref()
-            .and_then(|f| f.token.as_deref())
-            .unwrap_or(""),
-        flash_message: flash.as_ref().and_then(|f| f.message).unwrap_or(""),
+        flash_is_some: flash.is_some,
+        flash_token_is_some: flash.token_is_some,
+        flash_css_class: flash.css_class,
+        flash_label: flash.label,
+        flash_token: &flash.token,
+        flash_message: flash.message,
     });
     append_clear_flash_cookie(&mut response);
     response
@@ -688,7 +709,7 @@ where
         Err(error) => return server_error(error),
     };
     let flash = match take_flash(&headers) {
-        Ok(flash) => flash,
+        Ok(flash) => flash_view(flash),
         Err(response) => return response,
     };
     let mut response = render(CapacityTemplate {
@@ -703,15 +724,12 @@ where
         historical_authorization_count: summary.historical_authorization_count,
         remaining_capacity: summary.remaining_capacity,
         configured_limit: u32::from(state.config.personal_use_user_limit),
-        flash_is_some: flash.is_some(),
-        flash_token_is_some: flash.as_ref().is_some_and(|f| f.token.is_some()),
-        flash_css_class: flash.as_ref().map(|f| f.css_class).unwrap_or(""),
-        flash_label: flash.as_ref().map(|f| f.label).unwrap_or(""),
-        flash_token: flash
-            .as_ref()
-            .and_then(|f| f.token.as_deref())
-            .unwrap_or(""),
-        flash_message: flash.as_ref().and_then(|f| f.message).unwrap_or(""),
+        flash_is_some: flash.is_some,
+        flash_token_is_some: flash.token_is_some,
+        flash_css_class: flash.css_class,
+        flash_label: flash.label,
+        flash_token: &flash.token,
+        flash_message: flash.message,
     });
     append_clear_flash_cookie(&mut response);
     response
@@ -795,7 +813,7 @@ where
     };
     let access_keys_empty = access_keys.is_empty();
     let flash = match take_flash(&headers) {
-        Ok(flash) => flash,
+        Ok(flash) => flash_view(flash),
         Err(response) => return response,
     };
     let is_owner = user.role == UserRole::Owner;
@@ -813,15 +831,12 @@ where
         access_keys_empty,
         access_keys,
         may_delete_account: !is_owner,
-        flash_is_some: flash.is_some(),
-        flash_token_is_some: flash.as_ref().is_some_and(|f| f.token.is_some()),
-        flash_css_class: flash.as_ref().map(|f| f.css_class).unwrap_or(""),
-        flash_label: flash.as_ref().map(|f| f.label).unwrap_or(""),
-        flash_token: flash
-            .as_ref()
-            .and_then(|f| f.token.as_deref())
-            .unwrap_or(""),
-        flash_message: flash.as_ref().and_then(|f| f.message).unwrap_or(""),
+        flash_is_some: flash.is_some,
+        flash_token_is_some: flash.token_is_some,
+        flash_css_class: flash.css_class,
+        flash_label: flash.label,
+        flash_token: &flash.token,
+        flash_message: flash.message,
     });
     append_clear_flash_cookie(&mut response);
     response

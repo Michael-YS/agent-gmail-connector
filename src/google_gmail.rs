@@ -9,7 +9,10 @@ use base64::Engine as _;
 use reqwest::{Client, StatusCode, Url};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use std::{fmt, time::Duration};
+use std::{
+    fmt,
+    time::{Duration, SystemTime},
+};
 
 pub const GMAIL_API_BASE: &str = "https://gmail.googleapis.com/gmail/v1/";
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -164,10 +167,34 @@ impl MessageFormat {
     }
 }
 
+/// Bounded retry budget for Gmail **read** requests only.  Writes and sends
+/// are never retried because they are not idempotent.
+#[derive(Clone, Copy, Debug)]
+struct RetryPolicy {
+    /// Total attempts per read request, including the first one.
+    max_attempts: u32,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    /// Upper bound applied to a server-provided `Retry-After` value.
+    max_retry_after: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_backoff: Duration::from_millis(250),
+            max_backoff: Duration::from_secs(4),
+            max_retry_after: Duration::from_secs(30),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct GoogleGmailClient {
     http: Client,
     base_url: Url,
+    read_retry: RetryPolicy,
 }
 
 impl fmt::Debug for GoogleGmailClient {
@@ -224,7 +251,11 @@ impl GoogleGmailClient {
         {
             return Err(GoogleGmailError::InvalidResponse);
         }
-        Ok(Self { http, base_url })
+        Ok(Self {
+            http,
+            base_url,
+            read_retry: RetryPolicy::default(),
+        })
     }
 
     pub async fn list_messages(
@@ -258,7 +289,7 @@ impl GoogleGmailClient {
         if !params.is_empty() {
             request = request.query(&params);
         }
-        let raw: RawMessageList = self.send(request).await?;
+        let raw: RawMessageList = self.send_read(request, MAX_JSON_RESPONSE_BYTES).await?;
         Ok(MessageList {
             messages: raw
                 .messages
@@ -297,7 +328,7 @@ impl GoogleGmailClient {
         let request = self
             .authorized(self.http.get(url), access_token)?
             .query(&[("format", format.as_str())]);
-        let raw: RawMessage = self.send(request).await?;
+        let raw: RawMessage = self.send_read(request, MAX_JSON_RESPONSE_BYTES).await?;
         raw.try_into()
     }
 
@@ -316,7 +347,7 @@ impl GoogleGmailClient {
         let request = self
             .authorized(self.http.get(url), access_token)?
             .query(&[("format", format.as_str())]);
-        let raw: RawThread = self.send(request).await?;
+        let raw: RawThread = self.send_read(request, MAX_JSON_RESPONSE_BYTES).await?;
         validate_resource_id(&raw.id, GoogleGmailError::InvalidResponse)?;
         Ok(GmailThread {
             id: raw.id,
@@ -357,7 +388,7 @@ impl GoogleGmailClient {
         let request = self
             .authorized(self.http.get(url), access_token)?
             .query(&params);
-        let raw: RawDraftList = self.send(request).await?;
+        let raw: RawDraftList = self.send_read(request, MAX_JSON_RESPONSE_BYTES).await?;
         Ok(DraftList {
             drafts: raw
                 .drafts
@@ -384,7 +415,7 @@ impl GoogleGmailClient {
         let request = self
             .authorized(self.http.get(url), access_token)?
             .query(&[("format", "full")]);
-        let raw: RawDraftDetail = self.send(request).await?;
+        let raw: RawDraftDetail = self.send_read(request, MAX_JSON_RESPONSE_BYTES).await?;
         validate_resource_id(&raw.id, GoogleGmailError::InvalidResponse)?;
         Ok(GmailDraftDetail {
             id: raw.id,
@@ -408,9 +439,7 @@ impl GoogleGmailClient {
             ))
             .map_err(|_| GoogleGmailError::InvalidResponse)?;
         let request = self.authorized(self.http.get(url), access_token)?;
-        let raw: RawBody = self
-            .send_bounded(request, MAX_ATTACHMENT_JSON_BYTES)
-            .await?;
+        let raw: RawBody = self.send_read(request, MAX_ATTACHMENT_JSON_BYTES).await?;
         let size = raw.size.ok_or(GoogleGmailError::InvalidResponse)?;
         if size > MAX_HTTP_ATTACHMENT_BYTES as u64 {
             return Err(GoogleGmailError::InvalidResponse);
@@ -540,28 +569,170 @@ impl GoogleGmailClient {
         request: reqwest::RequestBuilder,
         max_bytes: usize,
     ) -> Result<T, GoogleGmailError> {
-        let mut response = request.send().await.map_err(classify_transport_error)?;
-        ensure_success(&response)?;
+        match self.send_bounded_once(request, max_bytes).await {
+            ReadAttempt::Done(result) => result,
+            ReadAttempt::Retry { error, .. } => Err(error),
+        }
+    }
+
+    /// One wire attempt of a bounded JSON read.  Retryable failures (429, 5xx,
+    /// and connect/send-phase transport errors) are reported separately from
+    /// final ones so only the read path can act on them.
+    async fn send_bounded_once<T: for<'de> Deserialize<'de>>(
+        &self,
+        request: reqwest::RequestBuilder,
+        max_bytes: usize,
+    ) -> ReadAttempt<T> {
+        let mut response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                return match classify_transport_error(error) {
+                    // Connect/send-phase failures never reach the server and
+                    // are safe to retry for idempotent reads.
+                    GoogleGmailError::Upstream => ReadAttempt::Retry {
+                        error: GoogleGmailError::Upstream,
+                        retry_after: None,
+                    },
+                    // A timeout may already have been processed upstream.
+                    other => ReadAttempt::Done(Err(other)),
+                };
+            }
+        };
+        let status = response.status();
+        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            let retry_after_seconds = header_retry_after_seconds(&response);
+            let error = if status == StatusCode::TOO_MANY_REQUESTS {
+                GoogleGmailError::RateLimited {
+                    retry_after_seconds,
+                }
+            } else {
+                GoogleGmailError::Upstream
+            };
+            return ReadAttempt::Retry {
+                error,
+                retry_after: retry_after_seconds.map(Duration::from_secs),
+            };
+        }
+        if let Err(error) = ensure_success(&response) {
+            return ReadAttempt::Done(Err(error));
+        }
         if response
             .content_length()
             .is_some_and(|length| length > max_bytes as u64)
         {
-            return Err(GoogleGmailError::InvalidResponse);
+            return ReadAttempt::Done(Err(GoogleGmailError::InvalidResponse));
         }
         let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(classify_transport_error)? {
-            if body.len().saturating_add(chunk.len()) > max_bytes {
-                return Err(GoogleGmailError::InvalidResponse);
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if body.len().saturating_add(chunk.len()) > max_bytes {
+                        return ReadAttempt::Done(Err(GoogleGmailError::InvalidResponse));
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    // Mid-body failures cannot be replayed safely.
+                    return ReadAttempt::Done(Err(classify_transport_error(error)));
+                }
             }
-            body.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&body).map_err(|_| GoogleGmailError::InvalidResponse)
+        match serde_json::from_slice(&body) {
+            Ok(value) => ReadAttempt::Done(Ok(value)),
+            Err(_) => ReadAttempt::Done(Err(GoogleGmailError::InvalidResponse)),
+        }
     }
 
     async fn send_empty(&self, request: reqwest::RequestBuilder) -> Result<(), GoogleGmailError> {
         let response = request.send().await.map_err(classify_transport_error)?;
         ensure_success(&response)
     }
+
+    /// Send an idempotent Gmail read with bounded retries on 429 and 5xx.
+    ///
+    /// Only read paths route through here; writes and sends stay on `send` and
+    /// `send_empty` because a retried non-idempotent request could duplicate
+    /// effects.  Timeouts are deliberately not retried: the transport layer
+    /// cannot tell whether a timed-out request was already processed.
+    async fn send_read<T: for<'de> Deserialize<'de>>(
+        &self,
+        request: reqwest::RequestBuilder,
+        max_bytes: usize,
+    ) -> Result<T, GoogleGmailError> {
+        let policy = self.read_retry;
+        let mut pending = Some(request);
+        let mut attempt = 0_u32;
+        loop {
+            attempt += 1;
+            let builder = pending.take().expect("request builder present per attempt");
+            match builder.try_clone() {
+                // Send a clone so the builder survives for a later attempt.
+                Some(clone) if attempt < policy.max_attempts => {
+                    match self.send_bounded_once(clone, max_bytes).await {
+                        ReadAttempt::Done(result) => return result,
+                        ReadAttempt::Retry {
+                            retry_after,
+                            error: _,
+                        } => {
+                            let delay = read_retry_delay(policy, attempt, retry_after);
+                            tokio::time::sleep(delay).await;
+                            pending = Some(builder);
+                        }
+                    }
+                }
+                // Final attempt (or an uncloneable request): send once.
+                _ => {
+                    return match self.send_bounded_once(builder, max_bytes).await {
+                        ReadAttempt::Done(result) => result,
+                        ReadAttempt::Retry { error, .. } => Err(error),
+                    };
+                }
+            }
+        }
+    }
+}
+
+/// Outcome of one read attempt: a final result, or a retryable failure that
+/// carries the server's `Retry-After` hint when present.
+enum ReadAttempt<T> {
+    Done(Result<T, GoogleGmailError>),
+    Retry {
+        error: GoogleGmailError,
+        retry_after: Option<Duration>,
+    },
+}
+
+/// The `Retry-After` header as whole seconds, when parseable.  HTTP-date
+/// forms are ignored rather than guessed at.
+fn header_retry_after_seconds(response: &reqwest::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+/// `Retry-After` from the server wins over the computed exponential backoff
+/// when present; both are capped by policy.  Only status codes, header hints,
+/// and attempt counts feed this computation, never request or response
+/// payloads.
+fn read_retry_delay(policy: RetryPolicy, attempt: u32, retry_after: Option<Duration>) -> Duration {
+    if let Some(seconds) = retry_after {
+        return seconds.min(policy.max_retry_after);
+    }
+    let exponent = attempt.saturating_sub(1).min(16);
+    let base = policy
+        .initial_backoff
+        .saturating_mul(1_u32 << exponent)
+        .min(policy.max_backoff);
+    // Full jitter without external crates: derive the fraction from the
+    // sub-second nanoseconds of the current clock.
+    let nanos = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
+    let seed = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()));
+    Duration::from_nanos(seed % nanos.max(1))
 }
 
 fn ensure_success(response: &reqwest::Response) -> Result<(), GoogleGmailError> {
@@ -573,13 +744,8 @@ fn ensure_success(response: &reqwest::Response) -> Result<(), GoogleGmailError> 
         return Err(GoogleGmailError::NotFound);
     }
     if status == StatusCode::TOO_MANY_REQUESTS {
-        let retry_after_seconds = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse::<u64>().ok());
         return Err(GoogleGmailError::RateLimited {
-            retry_after_seconds,
+            retry_after_seconds: header_retry_after_seconds(response),
         });
     }
     if status.is_server_error() {
@@ -1060,14 +1226,98 @@ mod tests {
     }
 
     fn client(endpoint: Url) -> GoogleGmailClient {
-        GoogleGmailClient::with_base(
+        let mut gmail = GoogleGmailClient::with_base(
             Client::builder()
                 .timeout(Duration::from_millis(40))
                 .build()
                 .unwrap(),
             endpoint,
         )
-        .unwrap()
+        .unwrap();
+        gmail.read_retry = RetryPolicy {
+            max_attempts: 3,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(2),
+            max_retry_after: Duration::from_millis(1),
+        };
+        gmail
+    }
+
+    /// Serves one response per connection and reports how many connections
+    /// were accepted, so tests can observe retry attempts.
+    async fn sequence_server(
+        responses: &[(u16, Option<&'static str>, &'static str)],
+    ) -> (
+        Url,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Url::parse(&format!(
+            "http://{}/gmail/v1/",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let response_texts: Vec<String> = responses
+            .iter()
+            .map(|(status, retry_after, body)| {
+                format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{body}",
+                    body.len(),
+                    retry_after.map_or(String::new(), |value| format!("Retry-After: {value}\r\n")),
+                )
+            })
+            .collect();
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served_for_task = served.clone();
+        let handle = tokio::spawn(async move {
+            for response in response_texts {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                served_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut request = Vec::new();
+                let mut expected_length = None;
+                loop {
+                    stream.readable().await.unwrap();
+                    let mut chunk = [0_u8; 4096];
+                    match stream.try_read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(_) => break,
+                    }
+                    if let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let header_text = String::from_utf8_lossy(&request[..header_end]);
+                        let content_length = header_text
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(str::to_owned)
+                            })
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        expected_length = Some(header_end + 4 + content_length);
+                    }
+                    if expected_length.is_some_and(|length| request.len() >= length) {
+                        break;
+                    }
+                }
+                let mut written = 0;
+                while written < response.len() {
+                    stream.writable().await.unwrap();
+                    match stream.try_write(&response.as_bytes()[written..]) {
+                        Ok(n) => written += n,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+        (endpoint, served, handle)
     }
 
     #[tokio::test]
@@ -1373,25 +1623,13 @@ mod tests {
                 r#"{"error":{"message":"secret-body"}}"#,
                 GoogleGmailError::ReauthRequired,
             ),
-            (
-                429,
-                Some("17"),
-                r#"{"error":{"message":"secret-body"}}"#,
-                GoogleGmailError::RateLimited {
-                    retry_after_seconds: Some(17),
-                },
-            ),
+            // 429 and 500 are excluded here: they are retryable reads and are
+            // covered by the dedicated retry tests below.
             (
                 404,
                 None,
                 r#"{"error":{"message":"secret-body"}}"#,
                 GoogleGmailError::NotFound,
-            ),
-            (
-                500,
-                None,
-                r#"{"error":{"message":"secret-body"}}"#,
-                GoogleGmailError::Upstream,
             ),
             (200, None, "not-json", GoogleGmailError::InvalidResponse),
         ];
@@ -1420,9 +1658,98 @@ mod tests {
         assert_eq!(error, GoogleGmailError::InvalidResponse);
         server.await.unwrap();
 
+        // A persistent 5xx exhausts the read retry budget and still hides the
+        // upstream response body.
+        let (endpoint, served, server) =
+            sequence_server(&[(500, None, r#"{"error":{"message":"secret-body"}}"#); 3]).await;
+        let error = client(endpoint)
+            .list_messages(&SecretString::from("access-token"), None, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error, GoogleGmailError::Upstream);
+        assert!(!error.to_string().contains("secret-body"));
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 3);
+        server.await.unwrap();
+
         let debug = format!("{:?}", client(Url::parse(GMAIL_API_BASE).unwrap()));
         assert!(!debug.contains("access-token"));
         assert!(debug.contains("REDACTED"));
+    }
+
+    #[tokio::test]
+    async fn read_requests_retry_429_and_5xx_with_bounded_backoff() {
+        let token = SecretString::from("access-token");
+        let ok_list = r#"{"messages":[{"id":"m1"}],"resultSizeEstimate":1}"#;
+
+        // 5xx followed by success: retried exactly once.
+        let (endpoint, served, server) =
+            sequence_server(&[(500, None, "{}"), (200, None, ok_list)]).await;
+        let result = client(endpoint)
+            .list_messages(&token, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.messages[0].id, "m1");
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.await.unwrap();
+
+        // 429 with Retry-After followed by success: header is honored and the
+        // read succeeds on the second attempt.
+        let (endpoint, served, server) =
+            sequence_server(&[(429, Some("0"), "{}"), (200, None, ok_list)]).await;
+        client(endpoint)
+            .list_messages(&token, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.await.unwrap();
+
+        // Exhausted retries surface the final rate-limit error, including its
+        // Retry-After value.
+        let (endpoint, served, server) = sequence_server(&[(429, Some("17"), "{}"); 3]).await;
+        let error = client(endpoint)
+            .list_messages(&token, None, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            GoogleGmailError::RateLimited {
+                retry_after_seconds: Some(17)
+            }
+        );
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 3);
+        server.await.unwrap();
+
+        // Other 4xx statuses are never retried even when a later response
+        // would have succeeded.
+        let (endpoint, served, server) = sequence_server(&[(403, None, "{}")]).await;
+        let error = client(endpoint)
+            .list_messages(&token, None, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error, GoogleGmailError::Upstream);
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.await.unwrap();
+
+        // Draft writes and the send path stay single-attempt: the server keeps
+        // offering success responses, but a retried client is the only way to
+        // reach them.
+        let (endpoint, served, server) = sequence_server(&[(500, None, "{}")]).await;
+        let error = client(endpoint)
+            .create_draft(&token, b"hello", None)
+            .await
+            .unwrap_err();
+        assert_eq!(error, GoogleGmailError::Upstream);
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.await.unwrap();
+
+        let (endpoint, served, server) = sequence_server(&[(500, None, "{}")]).await;
+        let error = client(endpoint)
+            .send_draft(&token, "draft_1")
+            .await
+            .unwrap_err();
+        assert_eq!(error, GoogleGmailError::Upstream);
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.await.unwrap();
     }
 
     #[tokio::test]

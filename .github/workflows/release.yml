@@ -45,13 +45,14 @@ jobs:
         run: docker build --platform linux/amd64 --tag agentmail:release-verify .
 
       - name: Scan verification image
-        run: |
-          if docker scout version >/dev/null 2>&1; then
-            docker scout cves --exit-code 1 agentmail:release-verify
-          else
-            echo 'Docker Scout unavailable; configure an approved scanner with a pinned action SHA.' >&2
-            exit 1
-          fi
+        # Commit pin prevents a mutable release tag or install script from
+        # altering the release pipeline's scanner implementation.
+        uses: docker/scout-action@7c6b6c3f7844478ace1ffd4e7aef649053d1f87d # v1.24.0
+        with:
+          command: cves
+          image: local://agentmail:release-verify
+          exit-code: true
+          write-comment: false
 
   release:
     name: Build, attest, and sign amd64 image
