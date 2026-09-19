@@ -4,7 +4,7 @@
 
 审查基线：`origin/feat/agentmail-v1...HEAD`（本地分支领先 35 个提交）
 
-状态：审查后的本地修复已于 2026-09-12 完成并通过 219 项测试；Docker、GitHub tag release 和真实 Google/browser smoke 仍是外部验收，见 `TESTING_GAPS.md`。本文保留原始发现作为决策记录。
+状态：审查后的本地修复已于 2026-09-12 完成并通过 219 项测试；WSL Docker 的 amd64 构建、Compose 运行态、安全边界和备份/迁移脚本验收已通过，真实 VPS、GitHub tag release 和 Google/browser smoke 仍待外部验收，见 `TESTING_GAPS.md`。本文保留原始发现作为决策记录。
 
 ## 修复结果（2026-09-12）
 

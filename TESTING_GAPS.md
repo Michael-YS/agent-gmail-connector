@@ -1,6 +1,6 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：194 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端及控制面/OAuth 无内容审计、并发撤销压力测试和保留期清理、Gmail thread/attachment/draft read、reply-all、HTTP multipart 与 MCP base64 草稿附件、持久化 REST/MCP 创建幂等性、MCP JSON-RPC 错误审计分类、rmcp Streamable HTTP 草稿幂等性、内容协商、Host rebinding 及无状态协议负向测试、Gmail 401/invalid_grant → `reauth_required` 持久化与 REST/MCP 独立错误码、JSON reauthorize 入口、Gmail 读取 429/5xx 有界重试）、4 项 HTTP 安全与 managed-draft 契约测试、21 项 REST/MCP 契约测试，共 219 项；并已运行 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets --all-features --locked`。未执行部署、真实 Google 或浏览器 smoke。
+本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：194 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端及控制面/OAuth 无内容审计、并发撤销压力测试和保留期清理、Gmail thread/attachment/draft read、reply-all、HTTP multipart 与 MCP base64 草稿附件、持久化 REST/MCP 创建幂等性、MCP JSON-RPC 错误审计分类、rmcp Streamable HTTP 草稿幂等性、内容协商、Host rebinding 及无状态协议负向测试、Gmail 401/invalid_grant → `reauth_required` 持久化与 REST/MCP 独立错误码、JSON reauthorize 入口、Gmail 读取 429/5xx 有界重试）、4 项 HTTP 安全与 managed-draft 契约测试、21 项 REST/MCP 契约测试，共 219 项；并已运行 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets --all-features --locked`。WSL Docker 已通过 amd64 镜像构建、容器安全检查、Compose 迁移与 live/ready、SQLite backup integrity、迁移成功/受控失败及 backup/migrate 并发锁验收；尚未完成真实 VPS、GitHub tag release、真实 Google 或浏览器 smoke。
 
 ## A. 尚未实现，因此目前无法执行的测试
 
@@ -60,22 +60,6 @@
 - 命令：先运行 `cargo tree --locked --target all --all-features -i rsa`，确认 SQLite-only 构建不解析 rsa；再运行 `cargo audit --ignore RUSTSEC-2023-0071`; `cargo deny check`（`cargo audit` 不提供 `--locked` 选项；构建检查仍使用 `--locked`）。
 - 期望：无未处理 advisory、许可证或来源违规。
 - 当前结果：已将 `jsonwebtoken 11` 的密码学后端切到 `aws_lc_rs`，运行时依赖图不再包含 rsa；Cargo.lock 仍记录 sqlx-mysql 的未启用可选依赖，因此 CI/release 对 `RUSTSEC-2023-0071` 使用带原因的窄例外，并用 `cargo tree` 守卫确保 rsa 不可达。`cargo-audit 0.22.2 --ignore RUSTSEC-2023-0071` 通过；`cargo-deny 0.20.2` 的 advisory/license/source 检查通过，保留 duplicate-version warnings。该例外必须在启用 MySQL 或更换 JWT 后端时重新审查。
-
-### B2. Docker/Compose 与容器安全
-
-- 前置条件：amd64 Docker Engine、Compose v2、`.env` 和四个 0400 secret 文件。
-- 命令：`docker compose --env-file .env -f compose.yaml config --quiet`; `docker build --platform linux/amd64 -t agentmail:test .`; `docker run --rm --entrypoint /usr/bin/id agentmail:test --user`。
-- 期望：构建成功、架构 amd64、UID/GID 10001；只监听 `127.0.0.1:18080`，rootfs 只读、无 capabilities、no-new-privileges。
-- 当前原因：本机没有 Docker 可执行文件。
-
-### B3. 备份与迁移脚本
-
-- 前置条件：Linux、Docker/Compose、`flock`、可恢复测试数据。
-- 成功路径：`bash -n scripts/backup.sh scripts/migrate.sh`; `./scripts/backup.sh`; `./scripts/migrate.sh`。
-- 失败路径：加入一条受控失败迁移或使用损坏测试镜像后执行 migrate。
-- 并发路径：并行运行两次 backup，再并行运行两次 migrate。
-- 期望：在线 backup 是可打开的 SQLite DB；迁移先备份，成功恢复 ready；失败保持主服务 stopped；每组仅一个进程拿到锁；不删除 volume/旧备份。
-- 当前结果：`bash -n` 已通过；真实 Docker 路径未运行。
 
 ### B4. Nginx/TLS 公网入口
 

@@ -389,10 +389,13 @@ fn read_secret_file(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
+        // A non-root container process cannot read a root-owned 0400 bind
+        // mount. Permit owner/group read (for root:agentmail 0440), while
+        // rejecting group write/execute and every permission for others.
+        if metadata.permissions().mode() & 0o037 != 0 {
             return Err(ConfigError::SecretFile {
                 field,
-                reason: "file permissions must not grant group or other access",
+                reason: "file permissions may grant group read only; group write/execute and all other access are forbidden",
             });
         }
     }
@@ -724,7 +727,37 @@ mod tests {
                 AppConfig::from_map(values),
                 Err(ConfigError::SecretFile {
                     field: "LOGIN_CLIENT_SECRET",
-                    reason: "file permissions must not grant group or other access"
+                    reason: "file permissions may grant group read only; group write/execute and all other access are forbidden"
+                })
+            ));
+
+            let group_readable = dir.path().join("group-readable");
+            std::fs::write(&group_readable, "g".repeat(32)).unwrap();
+            std::fs::set_permissions(&group_readable, std::fs::Permissions::from_mode(0o440))
+                .unwrap();
+            let mut values = map();
+            values.remove("LOGIN_CLIENT_SECRET");
+            values.insert(
+                "LOGIN_CLIENT_SECRET_FILE".into(),
+                group_readable.display().to_string(),
+            );
+            assert!(AppConfig::from_map(values).is_ok());
+
+            let group_writable = dir.path().join("group-writable");
+            std::fs::write(&group_writable, "w".repeat(32)).unwrap();
+            std::fs::set_permissions(&group_writable, std::fs::Permissions::from_mode(0o460))
+                .unwrap();
+            let mut values = map();
+            values.remove("LOGIN_CLIENT_SECRET");
+            values.insert(
+                "LOGIN_CLIENT_SECRET_FILE".into(),
+                group_writable.display().to_string(),
+            );
+            assert!(matches!(
+                AppConfig::from_map(values),
+                Err(ConfigError::SecretFile {
+                    field: "LOGIN_CLIENT_SECRET",
+                    reason: "file permissions may grant group read only; group write/execute and all other access are forbidden"
                 })
             ));
         }

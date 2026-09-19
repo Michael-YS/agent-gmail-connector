@@ -42,7 +42,7 @@ Dev 可另加 localhost 回调并把 junk-mail 账号加入 test users。Prod �
 
 ```text
 /opt/agentmail/                 compose.yaml、.env、scripts/
-/etc/agentmail/secrets/         root-owned 0400 secrets
+/etc/agentmail/secrets/         root:10001、0440 secrets
 /var/lib/docker/volumes/...     Compose 管理的 agentmail-data
 /var/backups/agentmail/         宿主机备份
 ```
@@ -51,27 +51,42 @@ Dev 可另加 localhost 回调并把 junk-mail 账号加入 test users。Prod �
 
 ```sh
 cp config/example.env .env
-mkdir -p secrets backups
-chmod 700 secrets backups
+sudo install -d -o root -g 10001 -m 0750 /etc/agentmail/secrets
+sudo install -d -o 10001 -g 10001 -m 0700 /var/backups/agentmail
 ```
 
-当前 Compose 从 `./secrets` 读取四个只读文件：
+本地 Linux/WSL 隔离测试若保留 `.env` 的默认相对路径，则改为：
+
+```sh
+sudo install -d -o root -g 10001 -m 0750 ./secrets
+sudo install -d -o 10001 -g 10001 -m 0700 ./backups
+```
+
+当前 Compose 从 `AGENTMAIL_SECRETS_DIR`（默认 `./secrets`）以只读 bind mount 读取四个文件。Compose 的本地 file secrets 不可靠地支持 `uid`/`gid`/`mode`，因此生产部署约定把宿主机文件设为 `root:10001`、`0440`；应用校验权限位，允许 group 只读，但拒绝 group 写/执行和任何 other 权限。`migrate.sh` 预检精确 owner/GID/mode，而应用配置解析器只强制安全权限位。
 
 - `login_client_secret`：Google Login Client secret，单行。
 - `gmail_client_secret`：Google Gmail Client secret，单行。
 - `credential_encryption_keyring`：例如 `active=1;v1=<32-byte-key 的 base64url 或 hex>`。
 - `session_csrf_secret`：严格两行；第一行 session secret，第二行 CSRF secret，每行至少 32 字节。
 
-安全生成本地 secret（输出只落文件）：
+先在 `.env` 中设置生产目录：
 
 ```sh
-umask 077
-printf 'active=1;v1=%s\n' "$(openssl rand -hex 32)" > secrets/credential_encryption_keyring
-{ openssl rand -base64 48; openssl rand -base64 48; } > secrets/session_csrf_secret
-chmod 400 secrets/*
+AGENTMAIL_SECRETS_DIR=/etc/agentmail/secrets
+AGENTMAIL_BACKUP_DIR=/var/backups/agentmail
 ```
 
-Google 两个 client secret 请从 Cloud Console 下载后手工写入对应文件，不要放进 shell history、`.env`、GitHub Secrets 或镜像层。把 production secrets 放到 `/etc/agentmail/secrets` 时，应相应修改 Compose 的 secret `file:` 路径。
+安全生成生产 secret（输出只落文件）：
+
+```sh
+secret_dir=/etc/agentmail/secrets # 本地测试改为 "$(pwd)/secrets"
+sudo sh -c 'umask 027; printf "active=1;v1=%s\n" "$(openssl rand -hex 32)" > "$1/credential_encryption_keyring"' sh "$secret_dir"
+sudo sh -c 'umask 027; { openssl rand -base64 48; openssl rand -base64 48; } > "$1/session_csrf_secret"' sh "$secret_dir"
+sudo chown root:10001 "$secret_dir"/*
+sudo chmod 0440 "$secret_dir"/*
+```
+
+Google 两个 client secret 请从 Cloud Console 下载后手工写入同一目录的对应文件，不要放进 shell history、`.env`、GitHub Secrets 或镜像层，并保持上述 owner/mode。本地隔离测试也必须让容器 UID/GID 10001 拥有 backup 目录写权限。
 
 ## Compose 部署步骤
 
@@ -129,7 +144,7 @@ chmod 0755 scripts/backup.sh scripts/migrate.sh
 ./scripts/migrate.sh
 ```
 
-`backup.sh` 通过一次性容器调用应用的 SQLite 在线 backup API，目标是宿主机 backup bind mount；不会 tar 一个与真实 volume 无关的目录。`migrate.sh` 使用 `flock`，先记录 schema、创建并验证备份，再停止主服务、运行一次性迁移容器、重启并等待 readiness。迁移失败时主服务保持停止，脚本不会执行 `docker compose down`、删除 volume、数据库或旧备份。
+`backup.sh` 从 Compose 环境解析 `AGENTMAIL_BACKUP_DIR`，先确认 bind mount 对容器 UID 10001 可写，再通过一次性容器调用应用的 SQLite 在线 backup API；不会 tar 一个与真实 volume 无关的目录。`migrate.sh` 从同一 Compose 环境解析 `AGENTMAIL_SECRETS_DIR`，使用 `flock`，先记录 schema、创建并验证备份，再停止主服务、运行一次性迁移容器、重启并等待 readiness。迁移失败时主服务保持停止，脚本不会执行 `docker compose down`、删除 volume、数据库或旧备份。
 
 升级生产镜像时只修改明确版本或 digest，先拉取并运行 `scripts/migrate.sh`；不要跟随 `latest`。恢复时保持服务停止，将选定 `.db` 备份复制回 SQLite 路径，并由 owner 核对权限、schema 与 readiness 后再启动。
 

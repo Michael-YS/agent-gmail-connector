@@ -8,6 +8,7 @@ services:
       platforms: [linux/amd64]
     image: ${AGENTMAIL_IMAGE:-agentmail:local}
     platform: linux/amd64
+    command: [serve]
     env_file:
       - ./.env
     environment:
@@ -23,6 +24,22 @@ services:
     volumes:
       - agentmail-data:/var/lib/agentmail
       - ${AGENTMAIL_BACKUP_DIR:-./backups}:/var/backups/agentmail
+      - type: bind
+        source: ${AGENTMAIL_SECRETS_DIR:-./secrets}/login_client_secret
+        target: /run/secrets/login_client_secret
+        read_only: true
+      - type: bind
+        source: ${AGENTMAIL_SECRETS_DIR:-./secrets}/gmail_client_secret
+        target: /run/secrets/gmail_client_secret
+        read_only: true
+      - type: bind
+        source: ${AGENTMAIL_SECRETS_DIR:-./secrets}/credential_encryption_keyring
+        target: /run/secrets/credential_encryption_keyring
+        read_only: true
+      - type: bind
+        source: ${AGENTMAIL_SECRETS_DIR:-./secrets}/session_csrf_secret
+        target: /run/secrets/session_csrf_secret
+        read_only: true
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m
@@ -31,19 +48,6 @@ services:
     init: true
     restart: unless-stopped
     stop_grace_period: 30s
-    secrets:
-      - source: login_client_secret
-        target: login_client_secret
-        mode: 0400
-      - source: gmail_client_secret
-        target: gmail_client_secret
-        mode: 0400
-      - source: credential_encryption_keyring
-        target: credential_encryption_keyring
-        mode: 0400
-      - source: session_csrf_secret
-        target: session_csrf_secret
-        mode: 0400
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:18080/health/live"]
       interval: 30s
@@ -53,13 +57,3 @@ services:
 
 volumes:
   agentmail-data:
-
-secrets:
-  login_client_secret:
-    file: ./secrets/login_client_secret
-  gmail_client_secret:
-    file: ./secrets/gmail_client_secret
-  credential_encryption_keyring:
-    file: ./secrets/credential_encryption_keyring
-  session_csrf_secret:
-    file: ./secrets/session_csrf_secret

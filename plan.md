@@ -332,12 +332,12 @@ VPS 推荐布局：
 
 ```text
 /opt/agentmail/                 # compose、版本配置、宿主机脚本
-/etc/agentmail/secrets/         # root-owned 0400 secrets
+/etc/agentmail/secrets/         # root:10001、0440 secrets
 /var/lib/agentmail/             # SQLite 与持久状态
-/var/backups/agentmail/         # 迁移备份
+/var/backups/agentmail/         # 迁移备份，10001:10001、0700
 ```
 
-Compose secrets 只读挂载：
+Compose 使用显式只读 bind mount 挂载 secrets。生产部署约定宿主机文件由 root 拥有、专用容器 group `10001` 只读（`0440`）；应用强制禁止 group 写/执行和任何 other 权限，宿主机迁移脚本精确预检 owner/GID/mode：
 
 - Google login client secret。
 - Google Gmail client secret。
@@ -384,7 +384,7 @@ agentmail serve
 
 1. `set -euo pipefail` 并解析真实部署目录。
 2. 使用 `flock` 防止并行迁移。
-3. 检查 Compose 配置、目标镜像、数据目录、权限和可用空间。
+3. 从 Compose 环境解析 secrets/backup 宿主机目录，检查 Compose/service、secret owner/GID/mode，并确认 backup bind mount 对容器 UID 10001 可写。
 4. 查询当前 schema 和 pending migrations；无变化时安全退出。
 5. 优雅停止 AgentMail。
 6. 调用一次性容器与 SQLite backup API 创建带 UTC 时间、旧 schema 和应用版本的备份。

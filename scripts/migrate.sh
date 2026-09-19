@@ -12,19 +12,29 @@ LOCK_FILE=${MIGRATE_LOCK_FILE:-"$ROOT_DIR/.migrate.lock"}
 die() { printf 'migrate: %s\n' "$*" >&2; exit 1; }
 command -v docker >/dev/null 2>&1 || die 'docker is required'
 command -v flock >/dev/null 2>&1 || die 'flock (util-linux) is required'
+command -v stat >/dev/null 2>&1 || die 'stat (coreutils) is required'
 [[ -f "$COMPOSE_FILE" ]] || die "compose file not found: $COMPOSE_FILE"
 [[ -f "$ENV_FILE" ]] || die "environment file not found: $ENV_FILE"
+COMPOSE_DIR=$(cd -- "$(dirname -- "$COMPOSE_FILE")" && pwd -P)
 exec 9>"$LOCK_FILE"
 flock -n 9 || die 'another migration is already running'
 compose=(docker compose --env-file "$ENV_FILE" --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE")
 "${compose[@]}" config --quiet || die 'compose preflight failed'
 "${compose[@]}" config --services | grep -Fxq -- "$SERVICE" || die "service is not defined: $SERVICE"
+compose_environment=$("${compose[@]}" config --environment) || die 'could not resolve compose environment'
+secrets_dir=$(sed -n 's/^AGENTMAIL_SECRETS_DIR=//p' <<<"$compose_environment" | tail -n 1)
+secrets_dir=${secrets_dir:-./secrets}
+if [[ "$secrets_dir" != /* ]]; then
+  secrets_dir="$COMPOSE_DIR/$secrets_dir"
+fi
 for secret in login_client_secret gmail_client_secret credential_encryption_keyring session_csrf_secret; do
-  [[ -s "$ROOT_DIR/secrets/$secret" ]] || die "secret file is missing or empty: $ROOT_DIR/secrets/$secret"
+  [[ -s "$secrets_dir/$secret" ]] || die "secret file is missing or empty: $secrets_dir/$secret"
+  [[ "$(stat -c '%u:%g:%a' -- "$secrets_dir/$secret")" == '0:10001:440' ]] \
+    || die "secret file must be owned by root:10001 with mode 0440: $secrets_dir/$secret"
 done
 before=$("${compose[@]}" run --rm --no-deps "$SERVICE" migrate status)
 printf 'migrate: before %s\n' "$before"
-backup_output=$("$ROOT_DIR/scripts/backup.sh")
+backup_output=$(COMPOSE_FILE="$COMPOSE_FILE" ENV_FILE="$ENV_FILE" COMPOSE_PROJECT_NAME="$PROJECT_NAME" SERVICE="$SERVICE" "$ROOT_DIR/scripts/backup.sh")
 printf '%s\n' "$backup_output"
 "${compose[@]}" stop --timeout 30 "$SERVICE" || die 'could not stop service; migration was not attempted'
 if ! "${compose[@]}" run --rm --no-deps "$SERVICE" migrate; then
