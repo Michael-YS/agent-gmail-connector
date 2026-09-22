@@ -1784,16 +1784,11 @@ where
     } else {
         state.control_plane.login_session(&identity, now).await?
     };
-    let mut response = (
-        StatusCode::OK,
-        Json(json!({
-            "user_id": credentials.user.id,
-            "email": credentials.user.email,
-            "role": credentials.user.role,
-            "csrf_token": credentials.csrf_token,
-        })),
-    )
-        .into_response();
+    let location = match credentials.user.role {
+        UserRole::Owner => "/control",
+        UserRole::Member => "/control/account",
+    };
+    let mut response = Redirect::to(location).into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -3724,7 +3719,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_finish_sets_member_cookie_and_invitation_replay_cannot_create_session() {
+    async fn login_finish_redirects_by_role_and_invitation_replay_cannot_create_session() {
         let database = Database::connect("sqlite::memory:").await.unwrap();
         database.migrate().await.unwrap();
         let repository = Repository::new(&database);
@@ -3752,15 +3747,37 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/control/account");
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|value| value.starts_with("__Host-agentmail_csrf="))
+        );
         assert!(cookie.unwrap().contains("__Host-agentmail_session="));
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&body).unwrap()["role"],
-            "member"
-        );
+        assert!(body.is_empty());
+
+        let (owner_response, owner_cookie) = finish_login(
+            &state,
+            ValidatedOidcIdentity {
+                subject: owner.google_sub.clone(),
+                email: owner.email.clone(),
+            },
+            login_claim(None),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(owner_response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(owner_response.headers()[header::LOCATION], "/control");
+        assert!(owner_cookie.unwrap().contains("__Host-agentmail_session="));
 
         let invitation_token = "callback-invitation-token";
         repository
@@ -3806,7 +3823,7 @@ mod tests {
             .fetch_one(repository.pool())
             .await
             .unwrap();
-        assert_eq!((members, sessions), (2, 2));
+        assert_eq!((members, sessions), (2, 3));
     }
 
     #[tokio::test]
