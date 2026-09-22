@@ -30,7 +30,10 @@ async fn health_and_public_contract_are_available_without_machine_credentials() 
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         assert!(response.headers().contains_key("x-request-id"));
         assert_eq!(response.headers()["x-content-type-options"], "nosniff");
-        assert!(response.headers().contains_key("content-security-policy"));
+        assert_eq!(
+            response.headers()["content-security-policy"],
+            "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+        );
         assert_eq!(response.headers()["cache-control"], "no-store");
     }
     let ready = app

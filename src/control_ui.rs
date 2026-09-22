@@ -1744,6 +1744,13 @@ mod tests {
         assert!(body.contains("Owner dashboard"));
         assert!(body.contains("Personal Use capacity"));
         assert!(body.contains("Active members"));
+        assert!(
+            body.contains(
+                "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'"
+            )
+        );
+        assert!(body.contains("<style>"));
+        assert!(!body.contains("<script"));
         assert!(!body.contains("secret_hash"));
         assert!(!body.contains("__Host-agentmail_csrf"));
         assert!(!body.contains(&csrf));

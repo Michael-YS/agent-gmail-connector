@@ -4196,7 +4196,7 @@ async fn request_context(mut req: Request<axum::body::Body>, next: Next) -> Resp
     response.headers_mut().insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+            "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         ),
     );
     response.headers_mut().insert(
