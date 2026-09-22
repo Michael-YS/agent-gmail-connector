@@ -5,7 +5,7 @@ use axum::{
     extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, State},
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -2778,7 +2778,28 @@ async fn ready(State(state): State<AppState>, headers: HeaderMap) -> Response {
     }
 }
 async fn landing() -> impl IntoResponse {
-    (StatusCode::OK, "AgentMail")
+    Html(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentMail</title>
+</head>
+<body>
+  <main>
+    <h1>AgentMail</h1>
+    <p>A privacy-first Gmail access layer for agents.</p>
+    <p><a href="/auth/google/login">Sign in with Google</a></p>
+    <nav aria-label="Legal">
+      <a href="/privacy">Privacy</a>
+      <a href="/terms">Terms</a>
+      <a href="/data-deletion">Data deletion</a>
+    </nav>
+  </main>
+</body>
+</html>"#,
+    )
 }
 async fn privacy() -> impl IntoResponse {
     (StatusCode::OK, "Privacy policy")

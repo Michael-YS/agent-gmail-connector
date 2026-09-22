@@ -41,6 +41,26 @@ async fn health_and_public_contract_are_available_without_machine_credentials() 
 }
 
 #[tokio::test]
+async fn landing_exposes_google_login_and_legal_links() {
+    let response = build_router(AppState::empty())
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/html; charset=utf-8"
+    );
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body = std::str::from_utf8(&body).unwrap();
+    assert!(body.contains("href=\"/auth/google/login\""));
+    assert!(body.contains("href=\"/privacy\""));
+    assert!(body.contains("href=\"/terms\""));
+    assert!(body.contains("href=\"/data-deletion\""));
+}
+
+#[tokio::test]
 async fn machine_api_rejects_missing_and_query_string_credentials() {
     let app = build_router(AppState::empty());
     for path in [
