@@ -79,3 +79,4 @@
 - 前置条件：Dev/Prod Cloud Projects、测试 Gmail、正确 OAuth clients/scopes/callbacks、明确的测试收件 allowlist。
 - 方法：完成 A1-A6 后登录、连接 Gmail，运行 `scripts/smoke-gmail.sh`（默认 prepare-only，创建带 `[AgentMail E2E <run-id>]` 的单个 managed draft）；人工核对 preview 后用 `--send` 交互确认发送到测试账号自身。
 - 期望：只产生一个预期草稿/邮件，不改既有标签或已读状态；token 加密入库；所有 revoke 立即切断本地权限。
+- 当前结果（2026-09-22）：Prod project 已发布为 External / In Production，Gmail API、`openid email profile gmail.readonly gmail.compose` scopes、Login/Gmail 两个 Web client 与固定 HTTPS callbacks 已配置。本地新 Prod 配置已通过独立 Compose migration、live/ready；Login 启动生成 Google authorize endpoint、精确 Login callback、`openid email profile`、S256 PKCE、state/nonce 与 `select_account`，Google 授权页返回 200 且未出现 `invalid_client` 或 `redirect_uri_mismatch`。`agentmail.michaelsun.top` 当前没有 A/AAAA/CNAME，真实浏览器 Login、Gmail offline consent/refresh、prepare-only、发送与 revoke 仍待 DNS/VPS 部署后人工验收；旧 Google client secret 在这些验收完成前不得停用或删除。
