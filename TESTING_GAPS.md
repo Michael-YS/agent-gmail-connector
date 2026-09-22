@@ -1,6 +1,6 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：194 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端及控制面/OAuth 无内容审计、并发撤销压力测试和保留期清理、Gmail thread/attachment/draft read、reply-all、HTTP multipart 与 MCP base64 草稿附件、持久化 REST/MCP 创建幂等性、MCP JSON-RPC 错误审计分类、rmcp Streamable HTTP 草稿幂等性、内容协商、Host rebinding 及无状态协议负向测试、Gmail 401/invalid_grant → `reauth_required` 持久化与 REST/MCP 独立错误码、JSON reauthorize 入口、Gmail 读取 429/5xx 有界重试）、4 项 HTTP 安全与 managed-draft 契约测试、21 项 REST/MCP 契约测试，共 219 项；并已运行 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets --all-features --locked`。WSL Docker 已通过 amd64 镜像构建、容器安全检查、Compose 迁移与 live/ready、SQLite backup integrity、迁移成功/受控失败及 backup/migrate 并发锁验收；arm64 目标 VPS 原生构建/运行、GitHub tag release、真实 Google 或浏览器 smoke 尚未完成。
+本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：194 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端及控制面/OAuth 无内容审计、并发撤销压力测试和保留期清理、Gmail thread/attachment/draft read、reply-all、HTTP multipart 与 MCP base64 草稿附件、持久化 REST/MCP 创建幂等性、MCP JSON-RPC 错误审计分类、rmcp Streamable HTTP 草稿幂等性、内容协商、Host rebinding 及无状态协议负向测试、Gmail 401/invalid_grant → `reauth_required` 持久化与 REST/MCP 独立错误码、JSON reauthorize 入口、Gmail 读取 429/5xx 有界重试）、4 项 HTTP 安全与 managed-draft 契约测试、21 项 REST/MCP 契约测试，共 219 项；并已运行 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets --all-features --locked`。WSL Docker 已通过 amd64 镜像构建、容器安全检查、Compose 迁移与 live/ready、SQLite backup integrity、迁移成功/受控失败及 backup/migrate 并发锁验收；S1 amd64 VPS 的原生构建、迁移、loopback-only 运行、安全检查、在线备份、重启恢复和 Nginx/TLS/Cloudflare 公网入口也已通过。尚未完成 arm64 真实主机、GitHub tag release、真实 Google 或浏览器 smoke。
 
 ## A. 尚未实现，因此目前无法执行的测试
 
@@ -61,12 +61,6 @@
 - 期望：无未处理 advisory、许可证或来源违规。
 - 当前结果：已将 `jsonwebtoken 11` 的密码学后端切到 `aws_lc_rs`，运行时依赖图不再包含 rsa；Cargo.lock 仍记录 sqlx-mysql 的未启用可选依赖，因此 CI/release 对 `RUSTSEC-2023-0071` 使用带原因的窄例外，并用 `cargo tree` 守卫确保 rsa 不可达。`cargo-audit 0.22.2 --ignore RUSTSEC-2023-0071` 通过；`cargo-deny 0.20.2` 的 advisory/license/source 检查通过，保留 duplicate-version warnings。该例外必须在启用 MySQL 或更换 JWT 后端时重新审查。
 
-### B4. Nginx/TLS 公网入口
-
-- 前置条件：VPS、DNS、有效证书、Nginx 和只在 loopback 运行的容器。
-- 命令：`nginx -t`; reload；从外网分别访问 `/`、`/api`、`/mcp`、`/health/live`、`/health/ready`。
-- 期望：HTTP 固定跳转 canonical HTTPS；证书主机名正确；MCP buffering 关闭；不能绕过 Nginx 直连 Docker port。
-
 ### B5. GHCR release 供应链
 
 - 前置条件：GitHub Actions/GHCR 权限和版本 tag。
@@ -79,4 +73,4 @@
 - 前置条件：Dev/Prod Cloud Projects、测试 Gmail、正确 OAuth clients/scopes/callbacks、明确的测试收件 allowlist。
 - 方法：完成 A1-A6 后登录、连接 Gmail，运行 `scripts/smoke-gmail.sh`（默认 prepare-only，创建带 `[AgentMail E2E <run-id>]` 的单个 managed draft）；人工核对 preview 后用 `--send` 交互确认发送到测试账号自身。
 - 期望：只产生一个预期草稿/邮件，不改既有标签或已读状态；token 加密入库；所有 revoke 立即切断本地权限。
-- 当前结果（2026-09-22）：Prod project 已发布为 External / In Production，Gmail API、`openid email profile gmail.readonly gmail.compose` scopes、Login/Gmail 两个 Web client 与固定 HTTPS callbacks 已配置。本地新 Prod 配置已通过独立 Compose migration、live/ready；Login 启动生成 Google authorize endpoint、精确 Login callback、`openid email profile`、S256 PKCE、state/nonce 与 `select_account`，Google 授权页返回 200 且未出现 `invalid_client` 或 `redirect_uri_mismatch`。DNS 已切换到目标 VPS，真实浏览器 Login、Gmail offline consent/refresh、prepare-only、发送与 revoke 仍待 VPS 部署后人工验收；旧 Google client secret 在这些验收完成前不得停用或删除。
+- 当前结果（2026-09-22）：Prod project 已发布为 External / In Production，Gmail API、`openid email profile gmail.readonly gmail.compose` scopes、Login/Gmail 两个 Web client 与固定 HTTPS callbacks 已配置。S1 生产部署、证书与 Cloudflare 公网入口已就绪；公网 Login start 生成 Google authorize endpoint、精确生产 callback、`openid email profile`、S256 PKCE、state/nonce 与 `select_account`。真实浏览器 Login、Gmail offline consent/refresh、prepare-only、发送与 revoke 仍待人工验收；旧 Google client secret 在这些验收完成前不得停用或删除。
