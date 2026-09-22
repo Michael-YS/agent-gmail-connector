@@ -1,6 +1,6 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：194 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端及控制面/OAuth 无内容审计、并发撤销压力测试和保留期清理、Gmail thread/attachment/draft read、reply-all、HTTP multipart 与 MCP base64 草稿附件、持久化 REST/MCP 创建幂等性、MCP JSON-RPC 错误审计分类、rmcp Streamable HTTP 草稿幂等性、内容协商、Host rebinding 及无状态协议负向测试、Gmail 401/invalid_grant → `reauth_required` 持久化与 REST/MCP 独立错误码、JSON reauthorize 入口、Gmail 读取 429/5xx 有界重试）、4 项 HTTP 安全与 managed-draft 契约测试、21 项 REST/MCP 契约测试，共 219 项；并已运行 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets --all-features --locked`。WSL Docker 已通过 amd64 镜像构建、容器安全检查、Compose 迁移与 live/ready、SQLite backup integrity、迁移成功/受控失败及 backup/migrate 并发锁验收；尚未完成真实 VPS、GitHub tag release、真实 Google 或浏览器 smoke。
+本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：194 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端及控制面/OAuth 无内容审计、并发撤销压力测试和保留期清理、Gmail thread/attachment/draft read、reply-all、HTTP multipart 与 MCP base64 草稿附件、持久化 REST/MCP 创建幂等性、MCP JSON-RPC 错误审计分类、rmcp Streamable HTTP 草稿幂等性、内容协商、Host rebinding 及无状态协议负向测试、Gmail 401/invalid_grant → `reauth_required` 持久化与 REST/MCP 独立错误码、JSON reauthorize 入口、Gmail 读取 429/5xx 有界重试）、4 项 HTTP 安全与 managed-draft 契约测试、21 项 REST/MCP 契约测试，共 219 项；并已运行 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets --all-features --locked`。WSL Docker 已通过 amd64 镜像构建、容器安全检查、Compose 迁移与 live/ready、SQLite backup integrity、迁移成功/受控失败及 backup/migrate 并发锁验收；arm64 目标 VPS 原生构建/运行、GitHub tag release、真实 Google 或浏览器 smoke 尚未完成。
 
 ## A. 尚未实现，因此目前无法执行的测试
 
@@ -70,13 +70,13 @@
 ### B5. GHCR release 供应链
 
 - 前置条件：GitHub Actions/GHCR 权限和版本 tag。
-- 方法：发布 `vX.Y.Z`，核对 `X.Y.Z`、`X.Y`、`latest`、commit SHA 标签；下载 SBOM，验证 provenance/attestation 和 keyless signature；在干净 amd64 主机按 digest 拉取。
+- 方法：发布 `vX.Y.Z`，核对 `X.Y.Z`、`X.Y`、`latest`、commit SHA 标签和 amd64/arm64 manifest；下载 SBOM，验证 provenance/attestation 和 keyless signature；分别在干净 amd64、arm64 主机按 digest 拉取。
 - 期望：产物与 commit/digest 一致，镜像不含 `.env`、OAuth secret、keyring 或测试凭据。
-- 当前结果：已新增 tag-triggered GHCR workflow（先执行 locked fmt/check/clippy/test、cargo-audit/deny 和 amd64 镜像漏洞扫描，再进行固定 action SHA 的构建、SPDX SBOM、provenance/SBOM attestations、cosign keyless sign/verify）；尚未在真实 GitHub tag 上执行，因此下载产物、签名身份和干净主机 digest 拉取仍待外部验收。
+- 当前结果：已新增 tag-triggered GHCR workflow（先执行 locked fmt/check/clippy/test、cargo-audit/deny 和 amd64/arm64 镜像漏洞扫描，再使用固定基础镜像 digest 和固定 action SHA 进行多架构构建、per-platform SBOM attestations、provenance attestation、cosign keyless sign/verify）；尚未在真实 GitHub tag 上执行，因此下载产物、签名身份和干净主机 digest 拉取仍待外部验收。
 
 ### B6. Google Dev/Prod 与真实 Gmail smoke
 
 - 前置条件：Dev/Prod Cloud Projects、测试 Gmail、正确 OAuth clients/scopes/callbacks、明确的测试收件 allowlist。
 - 方法：完成 A1-A6 后登录、连接 Gmail，运行 `scripts/smoke-gmail.sh`（默认 prepare-only，创建带 `[AgentMail E2E <run-id>]` 的单个 managed draft）；人工核对 preview 后用 `--send` 交互确认发送到测试账号自身。
 - 期望：只产生一个预期草稿/邮件，不改既有标签或已读状态；token 加密入库；所有 revoke 立即切断本地权限。
-- 当前结果（2026-09-22）：Prod project 已发布为 External / In Production，Gmail API、`openid email profile gmail.readonly gmail.compose` scopes、Login/Gmail 两个 Web client 与固定 HTTPS callbacks 已配置。本地新 Prod 配置已通过独立 Compose migration、live/ready；Login 启动生成 Google authorize endpoint、精确 Login callback、`openid email profile`、S256 PKCE、state/nonce 与 `select_account`，Google 授权页返回 200 且未出现 `invalid_client` 或 `redirect_uri_mismatch`。`agentmail.michaelsun.top` 当前没有 A/AAAA/CNAME，真实浏览器 Login、Gmail offline consent/refresh、prepare-only、发送与 revoke 仍待 DNS/VPS 部署后人工验收；旧 Google client secret 在这些验收完成前不得停用或删除。
+- 当前结果（2026-09-22）：Prod project 已发布为 External / In Production，Gmail API、`openid email profile gmail.readonly gmail.compose` scopes、Login/Gmail 两个 Web client 与固定 HTTPS callbacks 已配置。本地新 Prod 配置已通过独立 Compose migration、live/ready；Login 启动生成 Google authorize endpoint、精确 Login callback、`openid email profile`、S256 PKCE、state/nonce 与 `select_account`，Google 授权页返回 200 且未出现 `invalid_client` 或 `redirect_uri_mismatch`。DNS 已切换到目标 VPS，真实浏览器 Login、Gmail offline consent/refresh、prepare-only、发送与 revoke 仍待 VPS 部署后人工验收；旧 Google client secret 在这些验收完成前不得停用或删除。

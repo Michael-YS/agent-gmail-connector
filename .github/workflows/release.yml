@@ -11,12 +11,18 @@ jobs:
   verify:
     name: Verify release commit
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
       - name: Checkout release tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal
@@ -42,23 +48,34 @@ jobs:
           cargo deny check
 
       - name: Build amd64 verification image
-        run: docker build --platform linux/amd64 --tag agentmail:release-verify .
+        run: docker buildx build --platform linux/amd64 --load --tag agentmail:release-verify-amd64 .
 
-      - name: Scan verification image
+      - name: Scan amd64 verification image
         # Commit pin prevents a mutable release tag or install script from
         # altering the release pipeline's scanner implementation.
         uses: docker/scout-action@7c6b6c3f7844478ace1ffd4e7aef649053d1f87d # v1.24.0
         with:
           command: cves
-          image: local://agentmail:release-verify
+          image: local://agentmail:release-verify-amd64
+          exit-code: true
+          write-comment: false
+
+      - name: Build arm64 verification image
+        run: docker buildx build --platform linux/arm64 --load --tag agentmail:release-verify-arm64 .
+
+      - name: Scan arm64 verification image
+        uses: docker/scout-action@7c6b6c3f7844478ace1ffd4e7aef649053d1f87d # v1.24.0
+        with:
+          command: cves
+          image: local://agentmail:release-verify-arm64
           exit-code: true
           write-comment: false
 
   release:
-    name: Build, attest, and sign amd64 image
+    name: Build, attest, and sign multi-platform image
     needs: verify
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
@@ -73,6 +90,9 @@ jobs:
         id: image
         shell: bash
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/agentmail" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -95,40 +115,22 @@ jobs:
             type=raw,value=latest
             type=raw,value=${{ github.sha }}
 
-      - name: Build and push amd64 image
+      - name: Build and push multi-platform image
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           push: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-
-      - name: Generate SPDX SBOM
-        id: sbom
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
-        with:
-          image: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
-          format: spdx-json
-          output-file: sbom.spdx.json
-          artifact-name: agentmail-${{ github.ref_name }}.spdx.json
-          upload-artifact: true
-          upload-release-assets: false
+          sbom: true
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
-
-      - name: Attest SBOM
-        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
-        with:
-          subject-name: ${{ steps.image.outputs.name }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          sbom-path: sbom.spdx.json
           push-to-registry: true
 
       - name: Install cosign

@@ -348,7 +348,7 @@ Compose 使用显式只读 bind mount 挂载 secrets。生产部署约定宿主�
 
 容器：
 
-- 仅构建 `linux/amd64`。
+- 构建 `linux/amd64` 与 `linux/arm64` 多架构镜像。
 - 两阶段 Rust build，运行层使用 Debian slim 和 CA certificates。
 - 非 root 用户。
 - root filesystem 只读；仅数据目录和 tmpfs 可写。
@@ -479,4 +479,4 @@ v1 验收必须证明：
 - 网络超时和客户端重试不会造成重复草稿或重复发送。
 - account/Connection/key revoke 立即切断本地访问。
 - pending migration 时应用拒绝启动；宿主机脚本能备份、迁移、重启并验证 readiness。
-- 发布镜像可在 Debian/Ubuntu amd64 VPS 上由 Compose 拉取运行，且只通过宿主机 Nginx 暴露公网。
+- 发布镜像可在 Debian/Ubuntu amd64 或 arm64 VPS 上由 Compose 拉取运行，且只通过宿主机 Nginx 暴露公网。

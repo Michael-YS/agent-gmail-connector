@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM --platform=$BUILDPLATFORM rust:1.97-bookworm AS builder
+FROM rust:1.97-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src && printf 'fn main() {}\n' > src/main.rs
@@ -8,7 +8,7 @@ RUN cargo build --release --locked
 COPY . .
 RUN touch src/main.rs && cargo build --release --locked
 
-FROM --platform=linux/amd64 debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 ENV RUST_BACKTRACE=1
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes ca-certificates wget \

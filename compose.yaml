@@ -5,9 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      platforms: [linux/amd64]
     image: ${AGENTMAIL_IMAGE:-agentmail:local}
-    platform: linux/amd64
     command: [serve]
     env_file:
       - ./.env
