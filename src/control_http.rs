@@ -1698,7 +1698,10 @@ where
     };
     let token_set = match token_exchanger.exchange_code(&code, &verifier).await {
         Ok(tokens) => tokens,
-        Err(error) => return error_response(error.into()),
+        Err(error) => {
+            tracing::warn!(flow = ?expected_flow, error = ?error, "OAuth token exchange failed");
+            return error_response(error.into());
+        }
     };
     let Some(id_token) = token_set.id_token.as_ref() else {
         return error_response(ControlHttpError::MissingIdToken);
@@ -1709,7 +1712,10 @@ where
         .await
     {
         Ok(claims) => claims,
-        Err(_) => return error_response(ControlHttpError::OidcVerification),
+        Err(error) => {
+            tracing::warn!(flow = ?expected_flow, error = ?error, "OIDC token verification failed");
+            return error_response(ControlHttpError::OidcVerification);
+        }
     };
     let identity = match validate_verified_claims(
         &claims,
@@ -1718,7 +1724,10 @@ where
         Utc::now(),
     ) {
         Ok(identity) => identity,
-        Err(error) => return error_response(error),
+        Err(error) => {
+            tracing::warn!(flow = ?expected_flow, error = ?error, "OIDC claims validation failed");
+            return error_response(error);
+        }
     };
     let response = match expected_flow {
         OAuthFlowKind::Login => finish_login(&state, identity, claim, Utc::now()).await,
@@ -1734,7 +1743,29 @@ where
             }
             response
         }
-        Err(error) => error_response(error),
+        Err(error) => {
+            tracing::warn!(
+                flow = ?expected_flow,
+                error_category = control_http_error_category(&error),
+                "OAuth flow completion failed"
+            );
+            error_response(error)
+        }
+    }
+}
+
+fn control_http_error_category(error: &ControlHttpError) -> &'static str {
+    match error {
+        ControlHttpError::InvalidRequest => "invalid_request",
+        ControlHttpError::InvalidTransactionCookie => "invalid_transaction_cookie",
+        ControlHttpError::OidcVerification => "oidc_verification",
+        ControlHttpError::MissingIdToken => "missing_id_token",
+        ControlHttpError::NonceMismatch => "nonce_mismatch",
+        ControlHttpError::OAuth(_) => "oauth",
+        ControlHttpError::GoogleToken(_) => "google_token",
+        ControlHttpError::Crypto(_) => "crypto",
+        ControlHttpError::Repository(_) => "repository",
+        ControlHttpError::ControlPlane(_) => "control_plane",
     }
 }
 
