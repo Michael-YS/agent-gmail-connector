@@ -1,8 +1,17 @@
 # 未完成测试与测试方法
 
-本文件只记录当前还没有通过的测试与外部验收。已通过的本地结果：194 项 library（含邀请与账号管理、Connection revoke/恢复、Access Key、持久化限流、发送额度返还、机器端及控制面/OAuth 无内容审计、并发撤销压力测试和保留期清理、Gmail thread/attachment/draft read、reply-all、HTTP multipart 与 MCP base64 草稿附件、持久化 REST/MCP 创建幂等性、MCP JSON-RPC 错误审计分类、rmcp Streamable HTTP 草稿幂等性、内容协商、Host rebinding 及无状态协议负向测试、Gmail 401/invalid_grant → `reauth_required` 持久化与 REST/MCP 独立错误码、JSON reauthorize 入口、Gmail 读取 429/5xx 有界重试）、4 项 HTTP 安全与 managed-draft 契约测试、21 项 REST/MCP 契约测试，共 219 项；并已运行 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets --all-features --locked`。WSL Docker 已通过 amd64 镜像构建、容器安全检查、Compose 迁移与 live/ready、SQLite backup integrity、迁移成功/受控失败及 backup/migrate 并发锁验收；S1 amd64 VPS 的原生构建、迁移、loopback-only 运行、安全检查、在线备份、重启恢复和 Nginx/TLS/Cloudflare 公网入口也已通过。尚未完成 arm64 真实主机、GitHub tag release、真实 Google 或浏览器 smoke。
+## S1 beta 修复验收（2026-09-23）
 
-## A. 尚未实现，因此目前无法执行的测试
+- 只读核对：S1 仍运行 `agentmail:692ab15`，公网响应仍返回缺少 `style-src`/`script-src` 的旧 CSP。本地 `419b89c` 已修正 HTTP header 和模板 meta，Firefox 142 测试夹具验证了内联 CSS、同源脚本可用且内联脚本被阻止；真实登录页面仍需部署后验收。
+- Gmail callback 的 scope 兼容修复接受 Google 的完整 `userinfo.email/profile` URL，并规范化、去重。它解释了合法 token response 被映射为 `authentication_failed` 的机制，但尚未通过真实 Google 授权验证该次线上失败的具体原因。
+- 待执行：部署包含本轮修复的版本，重新从 `/control/account` 发起 Gmail 授权（失败回调的 transaction 已消费，不能刷新旧 callback 重试）；使用同一 Owner Google 账号完成 consent，确认只新增自己的 Connection，再验证 refresh。不要复制 callback URL、authorization code 或 token 到日志/文档。
+- 生产未在本轮修改；真实 Google consent/refresh、邮件发送与 revoke 仍为 pending。历史本地/部署验收背景如下，最新本地门禁结果见 `IMPLEMENTATION_PROGRESS.md`。
+- 本机测试环境注意：默认 `umask 022` 会使 `config::tests::google_client_secret_files_use_size_permission_and_exclusivity_rules` 的空文件先触发权限错误；默认测试并发叠加编译负载时，Connection revoke 压力测试曾触发 SQLite `PoolTimedOut`。复跑使用 `umask 077` 和 `--test-threads=2`；测试夹具对权限/负载的敏感性仍未在代码中修正，本轮没有放宽生产权限校验或测试超时。
+- `mcp_draft_writes_validate_arguments_and_charge_per_request` 要求 REST create 和 MCP update 后当前分钟桶计数为 2，跨分钟时可能为 1。低并发全量和首次单测复跑失败，随后 19:39:21–19:39:35 UTC 的独立复跑通过；仍需将该测试与真实墙钟边界解耦，不能把分次通过描述为全量命令一次通过。
+
+本文件聚焦剩余测试与外部验收。最新本地门禁结果统一记录在 `IMPLEMENTATION_PROGRESS.md`。历史上 WSL Docker 与 S1 amd64 的构建、迁移、loopback-only 运行、安全边界、备份和重启恢复，以及 S1 Nginx/TLS/Cloudflare 入口均已通过验收；这些结果不代表本轮代码已部署。arm64 真实主机、GitHub tag release 和真实 Google/browser smoke 仍未完成。
+
+## A. 已实现功能的验收覆盖与剩余缺口
 
 ### A1. Google OIDC 登录与邀请制 control plane
 

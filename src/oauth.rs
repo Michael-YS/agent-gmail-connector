@@ -684,8 +684,8 @@ pub fn decrypt_pkce_verifier(
 }
 
 /// Return the canonical, deduplicated granted scope set when both Gmail
-/// scopes are present.  Google may report the short aliases in test doubles;
-/// they are normalized to the canonical URLs before persistence.
+/// scopes are present. Gmail short aliases normalize to the API scope URLs;
+/// Google's userinfo URLs normalize to the requested OIDC email/profile names.
 pub fn validate_granted_gmail_scopes<I, S>(scopes: I) -> Result<Vec<String>, OAuthError>
 where
     I: IntoIterator<Item = S>,
@@ -695,6 +695,8 @@ where
     for scope in scopes {
         let scope = scope.as_ref();
         let canonical = match scope {
+            "https://www.googleapis.com/auth/userinfo.email" => "email",
+            "https://www.googleapis.com/auth/userinfo.profile" => "profile",
             "gmail.readonly" => GMAIL_READONLY_SCOPE,
             "gmail.compose" => GMAIL_COMPOSE_SCOPE,
             "openid" | "email" | "profile" | GMAIL_READONLY_SCOPE | GMAIL_COMPOSE_SCOPE => scope,
@@ -809,6 +811,43 @@ mod tests {
                 .consume_callback(&state, &nonce, later),
             Err(OAuthError::Expired)
         ));
+    }
+
+    #[test]
+    fn google_identity_scope_urls_are_normalized_and_deduplicated() {
+        let scopes = validate_granted_gmail_scopes([
+            "openid",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile",
+            "email",
+            "profile",
+            GMAIL_READONLY_SCOPE,
+            GMAIL_COMPOSE_SCOPE,
+        ])
+        .unwrap();
+        assert_eq!(scopes, GMAIL_SCOPES);
+
+        for extra in [
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/userinfo.email.evil",
+            "http://www.googleapis.com/auth/userinfo.profile",
+        ] {
+            assert_eq!(
+                validate_granted_gmail_scopes([GMAIL_READONLY_SCOPE, GMAIL_COMPOSE_SCOPE, extra]),
+                Err(OAuthError::InvalidScope)
+            );
+        }
+        for only_gmail_scope in [GMAIL_READONLY_SCOPE, GMAIL_COMPOSE_SCOPE] {
+            assert_eq!(
+                validate_granted_gmail_scopes([
+                    "openid",
+                    "https://www.googleapis.com/auth/userinfo.email",
+                    "https://www.googleapis.com/auth/userinfo.profile",
+                    only_gmail_scope,
+                ]),
+                Err(OAuthError::IncompleteGmailScopes)
+            );
+        }
     }
 
     #[test]

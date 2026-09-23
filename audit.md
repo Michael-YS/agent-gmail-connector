@@ -22,9 +22,9 @@
 - Owner 管理邀请、成员资格、Personal Use 容量和整账号 revoke，但不能借助 Owner 角色访问或修改成员的 Connection、Access Key 或 grants。
 - 所有 mutation 必须同时通过 session、CSRF 和资源所有权验证。一次性 credential 只在 create/rotate 成功时显示，数据库只保存 hash。
 
-### 待对齐的规则文件
+### 已对齐的规则文件
 
-`AGENTS.md` 当前写着“Access Key mutation 只允许 Owner session+CSRF”，容易被理解为只允许 `Owner` 角色，与上述决策和当前 Member 自助实现冲突。应改为“Access Key mutation 只允许资源所有者 session+CSRF”，并保留 same-owner active Connection 的 grant 约束。
+`AGENTS.md` 已明确“Access Key mutation 只允许资源所有者 session+CSRF”，允许 Member 自助管理自己的 Keys，并保留 active same-owner Connection 的 grant 约束。
 
 ## P1：合并或发布前应修复
 

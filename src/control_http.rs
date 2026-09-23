@@ -2121,6 +2121,120 @@ mod tests {
     #[derive(Clone)]
     struct UnusedExchanger;
 
+    #[derive(Clone)]
+    struct CallbackVerifier(OidcClaims);
+
+    #[async_trait::async_trait]
+    impl OidcTokenVerifier for CallbackVerifier {
+        async fn verify_with_refresh(&self, _: &str) -> Result<OidcClaims, GoogleOidcError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct CallbackExchanger(TokenSet);
+
+    #[async_trait::async_trait]
+    impl OAuthCodeExchanger for CallbackExchanger {
+        async fn exchange_code(
+            &self,
+            _: &str,
+            _: &SecretString,
+        ) -> Result<TokenSet, GoogleTokenError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn gmail_callback_accepts_owner_identity_with_google_scope_urls() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        database.migrate().await.unwrap();
+        let repository = Repository::new(&database);
+        let now = Utc::now();
+        let config = test_config();
+        let owner = User::new("owner-sub", "owner@example.com", UserRole::Owner, now).unwrap();
+        repository.insert_user(&owner).await.unwrap();
+        let flow = GmailFlow::with_context(
+            &config.public_base_url,
+            config.google_gmail_client_id.clone(),
+            Some(owner.id.to_string()),
+            None,
+            now,
+            Duration::minutes(10),
+        )
+        .unwrap();
+        let exchanger = CallbackExchanger(TokenSet {
+            access_token: "test-access".into(),
+            expires_in: 3600,
+            refresh_token: Some("test-refresh".into()),
+            id_token: Some("test-id-token".into()),
+            scope: [
+                "openid",
+                "https://www.googleapis.com/auth/userinfo.email",
+                "https://www.googleapis.com/auth/userinfo.profile",
+                crate::oauth::GMAIL_READONLY_SCOPE,
+                crate::oauth::GMAIL_COMPOSE_SCOPE,
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        });
+        let state = ControlHttpState::new(
+            config,
+            repository.clone(),
+            CallbackVerifier(OidcClaims {
+                issuer: GOOGLE_ISSUER.to_owned(),
+                audience: vec!["gmail-client-id".to_owned()],
+                azp: None,
+                subject: owner.google_sub.clone(),
+                email: owner.email.clone(),
+                email_verified: true,
+                expires_at: (now + Duration::hours(1)).timestamp(),
+                nonce: flow.nonce().to_owned(),
+            }),
+            exchanger.clone(),
+            exchanger,
+        )
+        .unwrap();
+        let transaction_id = Uuid::now_v7();
+        begin_gmail_response(&state, flow.clone(), transaction_id)
+            .await
+            .unwrap();
+        let app = router(state);
+        let request = || {
+            axum::http::Request::builder()
+                .uri(format!(
+                    "{GMAIL_CALLBACK_PATH}?code=test-code&state={}",
+                    flow.state()
+                ))
+                .header(
+                    header::COOKIE,
+                    format!("{GMAIL_TRANSACTION_COOKIE}={transaction_id}"),
+                )
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let connections = repository
+            .list_connections_for_user(owner.id)
+            .await
+            .unwrap();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].google_sub, owner.google_sub);
+        assert_eq!(connections[0].email, owner.email);
+        assert_eq!(connections[0].granted_scopes, crate::oauth::GMAIL_SCOPES);
+        let replay = app.oneshot(request()).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            repository
+                .list_connections_for_user(owner.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     #[async_trait::async_trait]
     impl OAuthCodeExchanger for UnusedExchanger {
         async fn exchange_code(

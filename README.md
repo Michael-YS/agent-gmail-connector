@@ -34,6 +34,8 @@ agentmail serve
 
 Dev 可另加 localhost 回调并把 junk-mail 账号加入 test users。Prod 只保留 HTTPS 生产回调，`PERSONAL_USE_USER_LIMIT` 不得超过 99。`serve` 只从 `PUBLIC_BASE_URL` 与上述固定路径构造 redirect URI，不读取请求的 `Host`/`Forwarded`；Gmail 授权启动是需要有效 session 与 `X-CSRF-Token` 的 POST。真实浏览器/Google Cloud 验收方法列在 `TESTING_GAPS.md`。
 
+Gmail callback 将 Google 返回的 `https://www.googleapis.com/auth/userinfo.email` 和 `https://www.googleapis.com/auth/userinfo.profile` 分别规范化为 `email`、`profile` 并去重；仍要求同时具备 `gmail.readonly` 与 `gmail.compose`，并拒绝其他未允许的 scope。Owner 可以将登录所用的 Google 账号连接为自己的 Gmail Connection。
+
 `AUDIT_RETENTION_DAYS` 默认为 30，可配置为 1–3650。`serve` 启动时清理过期的无内容审计和失效限流桶，之后每小时重复执行。机器接口按 Access Key 限制 120 次/分钟、30 次 prepare/小时；发送按 Connection 限制 10 次/小时和 50 次/天。`429` 同时返回 `Retry-After` 与 `retry_after_seconds`。
 
 ## VPS 目录与 secrets
@@ -159,6 +161,8 @@ chmod 0755 scripts/backup.sh scripts/migrate.sh
 - `/health/live`、`/health/ready`
 
 机器接口只接受 `Authorization: Bearer amk_<public-id>.<secret>`，显式拒绝 query-string token；每次 Connection 操作都检查 owner、状态与 grant。Connection 的 Google 凭证失效（Gmail 401 或 refresh `invalid_grant`）会被持久化为 `reauth_required`，机器接口对 grant 仍有效但需要重新授权的 Connection 返回 REST 403 `reauth_required` / JSON-RPC -32005，与统一拒绝的 403 `forbidden` 可区分。所有响应生成 request ID，并设置 CSP、`nosniff`、`no-referrer`、`no-store` 等安全头。
+
+控制面 CSP 的 HTTP header 与模板 meta 策略保持一致：允许同源脚本、同源及内联样式、同源及 data 图片，禁止内联脚本、eval 和第三方资源。部署后应核对公网响应和 Firefox 页面样式；本地测试通过不代表 S1 已更新。
 
 连接撤销：HTML 使用 `/control/account`，JSON 使用 `POST /control/api/connections/{connection_id}/revoke`；Owner 或 Member 只能操作自己的连接。先原子切断本地 grants、发送确认与待处理重授权，再尝试撤销 Google token；最后删除本地连接、加密凭证及受管草稿记录，保留 Gmail 中的邮件和草稿。远端未确认时需在 Google 账号授权页检查。
 

@@ -1,12 +1,14 @@
 # AgentMail v1 实现进度
 
-更新时间：2026-09-11
+更新时间：2026-09-23
 
 ## 当前状态
 
 - 工作分支：`feat/agentmail-v1`
 - 当前实现尚未全部完成。
-- Windows sandbox helper 仍会间歇返回 `helper_unknown_error: setup refresh had errors`；本轮通过用户批准的只读/构建命令和 Codex 标准 `apply_patch` 模式完成工作。
+- S1 beta 在 2026-09-23 只读检查时仍运行 `agentmail:692ab15`；公网响应仍为旧的 default-deny CSP。本地已提交的 `419b89c`（CSP）与 `213a1d1`（安全 OAuth 错误分类日志）尚未体现在该运行版本。代码验证与线上验收必须分别记录。
+- Gmail scope 兼容修复：将 Google `userinfo.email/profile` 完整 URL 规范化为 OIDC 名称，保持 Gmail 双 scope 和未知权限拒绝规则。新增 scope 与同 Owner callback 回归测试；修复前已复现 `InvalidScope` 和 HTTP 400，修复后 8 项相关测试全部通过。真实 Google consent/refresh 仍待外部验收。
+- 本轮验证：`cargo fmt --check`、`git diff --check` 和严格全目标/全特性 Clippy 通过；OAuth 端点校验仅做等价布尔表达式简化以兼容当前 Clippy，7 项 Google token-client 测试通过。`umask 077` 下以 `--test-threads=2` 运行全目标/全特性测试，196 项 library、5 项 HTTP、20/21 项 REST/MCP 通过；余下限流计数测试在同一分钟内单独复跑通过。共 222 项测试均有通过记录，但全量命令没有一次性全绿，权限、负载和分钟边界敏感性仍见 `TESTING_GAPS.md`。
 
 ## 已提交里程碑
 
@@ -71,7 +73,7 @@
 - Connection 生命周期新增机器端可感知的 reauth 分类：Gmail API 401 或 Google refresh `invalid_grant` 会把 Connection 原子标记为 `reauth_required`（`invalid_grant` 在凭证提供方内持久化；Gmail 401 由 adapter 经 `mark_reauth_required` 持久化并清除内存 token）。REST 对 grant 仍有效但状态为 `reauth_required` 的 Connection 返回 403 `reauth_required`（owner 不匹配或无 grant 仍是统一 403 `forbidden`，grant 检查改用与连接状态无关的 `access_key_grant_exists`）；MCP JSON-RPC 兼容面映射为 -32005，rmcp Streamable 桥按错误类别透传；发送失败 outcome 新增 `reauth_required`（401 不可能已投递，不做 Sent 对账）。
 - 新增 JSON 控制面入口 `POST /control/api/connections/{connection_id}/reauthorize`：Owner/Member 的有效 session + CSRF，缺失或他人连接返回 404 `connection_not_found`，`revoking` 状态返回 409 `connection_revoking`，Active/`reauth_required` 均可发起；成功返回 `authorize_url` 与 Gmail transaction cookie（`Cache-Control: no-store`），并以 `connection.reauthorize` 记录无内容审计。HTML `/control/account` 流程不变。
 - 新增 `scripts/smoke-gmail.sh`（垃圾邮箱 + 单收件人 allowlist 的真实 Gmail smoke 入口，默认 prepare-only，`--send` 需交互确认）。
-- 最新本地完整验证：194 个 library tests、4 个 HTTP tests、21 个 REST/MCP tests，共 219 项；`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo test --all-targets --all-features --locked` 已通过。Gmail 读取仅对 429/5xx 使用有界退避重试；写入和发送不重试。`cargo audit 0.22.2 --ignore RUSTSEC-2023-0071` 通过，且 `cargo tree --target all --all-features -i rsa` 证明 rsa 仅存在于未启用的 sqlx-mysql 可选分支；`cargo deny 0.20.2` 的 advisory/license/source 检查通过（仅 duplicate-version warnings）。WSL Docker 已通过 amd64 镜像构建、Compose 迁移与 live/ready、容器安全边界、SQLite backup integrity、迁移成功/受控失败及 backup/migrate 并发锁验收；2026-09-22 新 Prod OAuth 配置又通过独立 Compose 启动和 Login authorize URL/Google 接受性检查。发布定义已扩展为 amd64/arm64 多架构。S1 amd64 VPS 已完成原生镜像构建、迁移、loopback-only Compose 部署、容器安全检查、在线备份与重启恢复；Nginx/Let's Encrypt/Cloudflare 公网入口的 `/`、`/api`、live/ready 和 OAuth start 已通过，`/mcp` 未认证请求返回 401。GitHub tag release、浏览器 Login、Gmail offline consent/refresh 与真实 Gmail smoke 尚未完成。
+- 历史验证记录（本轮本地门禁见「当前状态」）：194 个 library tests、4 个 HTTP tests、21 个 REST/MCP tests，共 219 项；`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo test --all-targets --all-features --locked` 已通过。Gmail 读取仅对 429/5xx 使用有界退避重试；写入和发送不重试。`cargo audit 0.22.2 --ignore RUSTSEC-2023-0071` 通过，且 `cargo tree --target all --all-features -i rsa` 证明 rsa 仅存在于未启用的 sqlx-mysql 可选分支；`cargo deny 0.20.2` 的 advisory/license/source 检查通过（仅 duplicate-version warnings）。WSL Docker 已通过 amd64 镜像构建、Compose 迁移与 live/ready、容器安全边界、SQLite backup integrity、迁移成功/受控失败及 backup/migrate 并发锁验收；2026-09-22 新 Prod OAuth 配置又通过独立 Compose 启动和 Login authorize URL/Google 接受性检查。发布定义已扩展为 amd64/arm64 多架构。S1 amd64 VPS 已完成原生镜像构建、迁移、loopback-only Compose 部署、容器安全检查、在线备份与重启恢复；Nginx/Let's Encrypt/Cloudflare 公网入口的 `/`、`/api`、live/ready 和 OAuth start 已通过，`/mcp` 未认证请求返回 401。GitHub tag release、浏览器 Login、Gmail offline consent/refresh 与真实 Gmail smoke 尚未完成。
 
 ## 剩余实现里程碑
 

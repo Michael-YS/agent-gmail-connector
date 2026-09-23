@@ -127,8 +127,8 @@ impl GoogleTokenClient {
         redirect_uri: Url,
     ) -> Result<Self, GoogleTokenError> {
         if token_endpoint.host_str().is_none()
-            || (!matches!(token_endpoint.scheme(), "https")
-                && !(cfg!(test) && token_endpoint.scheme() == "http"))
+            || !(token_endpoint.scheme() == "https"
+                || cfg!(test) && token_endpoint.scheme() == "http")
             || token_endpoint.username() != ""
             || token_endpoint.password().is_some()
             || token_endpoint.query().is_some()
