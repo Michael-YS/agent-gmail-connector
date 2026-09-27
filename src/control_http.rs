@@ -1856,7 +1856,7 @@ where
         .as_ref()
         .ok_or(ControlHttpError::InvalidRequest)?;
 
-    let connection = if let Some(connection_id) = claim.target_connection {
+    let _connection = if let Some(connection_id) = claim.target_connection {
         let existing = state
             .repository
             .get_connection(connection_id)
@@ -1919,17 +1919,11 @@ where
         connection
     };
 
-    Ok((
-        (
-            StatusCode::OK,
-            Json(json!({
-                "connection_id": connection.id,
-                "email": connection.email,
-            })),
-        )
-            .into_response(),
-        None,
-    ))
+    let mut response = Redirect::to("/control/account").into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok((response, None))
 }
 pub async fn logout<V, E>(
     State(state): State<ControlHttpState<V, E>>,
@@ -2214,7 +2208,9 @@ mod tests {
                 .unwrap()
         };
         let response = app.clone().oneshot(request()).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/control/account");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         let connections = repository
             .list_connections_for_user(owner.id)
             .await
