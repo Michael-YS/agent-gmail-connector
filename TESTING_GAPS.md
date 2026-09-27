@@ -81,4 +81,4 @@
 - 前置条件：Dev/Prod Cloud Projects、测试 Gmail、正确 OAuth clients/scopes/callbacks、明确的测试收件 allowlist。
 - 方法：完成 A1-A6 后登录、连接 Gmail，运行 `scripts/smoke-gmail.sh`（默认 prepare-only，创建带 `[AgentMail E2E <run-id>]` 的单个 managed draft）；人工核对 preview 后用 `--send` 交互确认发送到测试账号自身。
 - 期望：只产生一个预期草稿/邮件，不改既有标签或已读状态；token 加密入库；所有 revoke 立即切断本地权限。
-- 当前结果（2026-09-27）：Prod project 的两个 Web client、固定 HTTPS callbacks 和所需 scope 已配置；S1 `45bd227` 生产部署健康。真实 Owner 浏览器 Login 与 Gmail offline consent 已成功，建立一个 Active Connection。新版本的成功 callback 跳转、refresh、垃圾邮箱 prepare-only/发送/revoke 仍待人工验收；旧 Google client secret 在这些验收完成前不得停用或删除。
+- 当前结果（2026-09-27）：Prod project 的两个 Web client、固定 HTTPS callbacks 和所需 scope 已配置；S1 `b68101d` 生产部署健康。真实 Owner 浏览器 Login 与 Gmail offline consent 已成功，建立一个 Active Connection。首次垃圾邮箱 smoke 完成 search/create，但 prepare-send 因 Gmail 回读 Message-ID 与本地登记值不一致而返回 `409 draft_changed`；无邮件发送。已部署 create/update 后回读并记录 Gmail 身份的修复，本地回归通过，新草稿的 prepare/send、Sent Message-ID 对账、refresh 与 revoke 仍待真实验收。旧失配草稿不自动认领或删除；Gmail 更新成功但回读失败时仍会安全拒绝后续发送，恢复该草稿需单独处理。旧 Google client secret 在这些验收完成前不得停用或删除。

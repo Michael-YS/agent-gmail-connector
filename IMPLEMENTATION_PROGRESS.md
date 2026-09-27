@@ -6,9 +6,10 @@
 
 - 工作分支：`feat/agentmail-v1`
 - 当前实现尚未全部完成。
-- S1 现运行 `agentmail:45bd227`：部署前在线 SQLite 备份成功，Compose 容器健康且 `/health/live`、`/health/ready` 均为 200。Zen 真实浏览器中的 Owner 登录、控制台样式与脚本、重启后的 session，以及账户页均已验收。
+- S1 现运行 `agentmail:b68101d`：部署前在线 SQLite 备份位于 `/var/backups/agentmail/agentmail-20260927T101441Z.db`，Compose 容器健康，内网及公网 `/health/live`、`/health/ready` 均为 200。旧镜像 `agentmail:45bd227` 保留可回退。Zen 真实浏览器中的 Owner 登录、控制台样式与脚本、重启后的 session，以及账户页均已验收。
 - 真实 Google Gmail consent 已为 Owner 创建一个 Active Connection；账户页显示 `gmail.readonly` 和 `gmail.compose`。`ea26723` 的 Google `userinfo.email/profile` scope URL 兼容修复因此获得线上验证。成功 callback 曾显示 JSON；`45bd227` 改为 303 跳转 `/control/account`，本地 callback 回归测试通过，但新版本尚未重新执行一次真实 Google callback。
-- 本轮 Windows 本地验证：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets` 一次性通过（196 library、5 HTTP、21 REST/MCP，共 222 项）。真实 refresh、垃圾邮箱 prepare/send/revoke、真实 MCP client、arm64 实机和 GitHub tag release 仍待验收；此前 Linux 测试夹具的权限/负载/分钟边界敏感性见 `TESTING_GAPS.md`。
+- 本轮 Windows 本地验证：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets` 通过（201 library、5 HTTP、21 REST/MCP，共 227 项）。限流测试曾在固定分钟边界偶发失败，已改为有界重试并通过全量复跑。真实 refresh、垃圾邮箱 prepare/send/revoke、真实 MCP client、arm64 实机和 GitHub tag release 仍待验收。
+- 首次真实垃圾邮箱 smoke 在 `drafts.create` 后，`prepare-send` 安全地返回 `409 draft_changed`：Gmail 回读的 Message-ID 长度/摘要与本地登记值不同，未发送邮件。`b68101d` 改为 create/update 后回读 Gmail 实际 Message-ID 并持久化，保留发送前严格核对；失败 create 只有在远端删除已确认后才释放幂等键。旧的失配草稿不会自动认领或发送，新的单封自发自收 smoke 待人工交互执行。
 
 ## 已提交里程碑
 
