@@ -28,6 +28,8 @@ pub enum ControlPlaneError {
     InvalidSessionLifetime,
     #[error("session is not authenticated")]
     Unauthenticated,
+    #[error("Google identity has no AgentMail account")]
+    IdentityNotAllowed,
     #[error("invitation is invalid, expired, already accepted, or email does not match")]
     InvitationNotClaimable,
     #[error(transparent)]
@@ -171,6 +173,19 @@ impl ControlPlaneService {
             .await?
         {
             return Ok(self.session_credentials(user, stored_session, session_token, csrf_token));
+        }
+        // A normal login cannot enroll an arbitrary Google identity. Only the
+        // configured initial Owner may bootstrap; all others need an invitation.
+        let verified_email =
+            normalize_email(&identity.email).map_err(|_| ControlPlaneError::IdentityNotAllowed)?;
+        if verified_email != self.expected_owner_email
+            || self
+                .repository
+                .find_user_by_email(&verified_email)
+                .await?
+                .is_some()
+        {
+            return Err(ControlPlaneError::IdentityNotAllowed);
         }
         self.bootstrap_owner_session(identity, now).await
     }
@@ -366,6 +381,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn normal_login_rejects_uninvited_and_different_subject_without_new_sessions() {
+        let (service, repository) = service().await;
+        let now = Utc::now();
+        let outsider = ValidatedOidcIdentity {
+            subject: "outsider-sub".to_owned(),
+            email: "outsider@example.com".to_owned(),
+        };
+        assert!(matches!(
+            service.login_session(&outsider, now).await,
+            Err(ControlPlaneError::IdentityNotAllowed)
+        ));
+        let owner = service
+            .bootstrap_owner_session(&identity("owner@example.com"), now)
+            .await
+            .unwrap();
+        let impostor = ValidatedOidcIdentity {
+            subject: "different-sub".to_owned(),
+            email: owner.user.email.clone(),
+        };
+        assert!(matches!(
+            service.login_session(&impostor, now).await,
+            Err(ControlPlaneError::IdentityNotAllowed)
+        ));
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!((users, sessions), (1, 1));
     }
 
     #[tokio::test]

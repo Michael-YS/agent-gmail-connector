@@ -2065,6 +2065,9 @@ fn error_response(error: ControlHttpError) -> Response {
         | ControlHttpError::InvalidTransactionCookie => {
             (StatusCode::UNAUTHORIZED, "authentication_failed")
         }
+        ControlHttpError::ControlPlane(ControlPlaneError::IdentityNotAllowed) => {
+            (StatusCode::FORBIDDEN, "authentication_failed")
+        }
         ControlHttpError::Repository(_)
         | ControlHttpError::ControlPlane(ControlPlaneError::Repository(_)) => {
             (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
@@ -3949,6 +3952,34 @@ mod tests {
         assert_eq!(owner_response.status(), StatusCode::SEE_OTHER);
         assert_eq!(owner_response.headers()[header::LOCATION], "/control");
         assert!(owner_cookie.unwrap().contains("__Host-agentmail_session="));
+
+        let uninvited = finish_login(
+            &state,
+            ValidatedOidcIdentity {
+                subject: "uninvited-sub".to_owned(),
+                email: "uninvited@example.com".to_owned(),
+            },
+            login_claim(None),
+            now,
+        )
+        .await;
+        assert!(matches!(
+            uninvited,
+            Err(ControlHttpError::ControlPlane(
+                ControlPlaneError::IdentityNotAllowed
+            ))
+        ));
+        let denied = error_response(ControlHttpError::ControlPlane(
+            ControlPlaneError::IdentityNotAllowed,
+        ));
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let denied_body = axum::body::to_bytes(denied.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&denied_body).unwrap()["error"],
+            "authentication_failed"
+        );
 
         let invitation_token = "callback-invitation-token";
         repository
