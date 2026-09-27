@@ -50,7 +50,7 @@ uuid4() {
 # http METHOD PATH [JSON-BODY] [EXTRA-HEADER] -> sets STATUS and BODY.
 http() {
   local out
-  local args=(--silent --show-error --header "Authorization: Bearer ${AGENTMAIL_ACCESS_KEY}")
+  local args=(--silent --show-error --request "$1" --header "Authorization: Bearer ${AGENTMAIL_ACCESS_KEY}")
   [[ -n ${4:-} ]] && args+=(--header "$4")
   if [[ $# -ge 3 && -n $3 ]]; then
     args+=(--header 'Content-Type: application/json' --data "$3")
