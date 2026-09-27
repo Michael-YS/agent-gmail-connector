@@ -1807,9 +1807,7 @@ mod tests {
             "_csrf=ui-test-csrf",
         )
         .await;
-        assert!(
-            start_status == StatusCode::SEE_OTHER || start_status == StatusCode::TEMPORARY_REDIRECT
-        );
+        assert_eq!(start_status, StatusCode::SEE_OTHER);
         assert!(
             start_headers
                 .get(header::LOCATION)

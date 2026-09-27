@@ -2050,7 +2050,8 @@ fn clear_cookie(name: &str) -> String {
 }
 
 fn redirect_with_cookie(location: &str, cookie: String) -> Response {
-    let mut response = Redirect::temporary(location).into_response();
+    // OAuth authorization endpoints require GET, including after our POST starts.
+    let mut response = Redirect::to(location).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&cookie).expect("cookie value"),
@@ -2804,6 +2805,35 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn gmail_post_start_switches_to_get_for_google_authorization() {
+        let (app, _repository, _user, _connection, session, csrf) =
+            key_fixture(UserRole::Member).await;
+        let (status, headers, body) = control_json(
+            &app,
+            Method::POST,
+            "/auth/google/gmail".to_owned(),
+            Some(&session),
+            Some(&csrf),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(
+            headers[header::LOCATION]
+                .to_str()
+                .unwrap()
+                .starts_with("https://accounts.google.com/")
+        );
+        assert!(
+            headers[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .starts_with("__Host-agentmail_gmail_tx=")
+        );
+        assert!(body.is_null());
     }
 
     #[tokio::test]
@@ -3810,7 +3840,7 @@ mod tests {
             json!({"token": token}),
         )
         .await;
-        assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(status, StatusCode::SEE_OTHER);
         assert_eq!(headers[header::CACHE_CONTROL], "no-store");
         assert!(!headers[header::LOCATION].to_str().unwrap().contains(&token));
         assert!(
