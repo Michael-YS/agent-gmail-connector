@@ -1719,7 +1719,7 @@ impl Repository {
         d: &ManagedDraft,
         expected: &DraftVersion,
     ) -> Result<bool, RepositoryError> {
-        let r=sqlx::query("UPDATE managed_drafts SET current_version=?,status=?,updated_at=? WHERE id=? AND current_version=? AND connection_id=?").bind(d.version.as_str()).bind(draft_status(d.state)).bind(encode_time(Utc::now())).bind(d.id.to_string()).bind(expected.as_str()).bind(d.connection_id.to_string()).execute(&self.pool).await?;
+        let r=sqlx::query("UPDATE managed_drafts SET stable_message_id=?,current_version=?,status=?,updated_at=? WHERE id=? AND current_version=? AND connection_id=?").bind(&d.message_id).bind(d.version.as_str()).bind(draft_status(d.state)).bind(encode_time(Utc::now())).bind(d.id.to_string()).bind(expected.as_str()).bind(d.connection_id.to_string()).execute(&self.pool).await?;
         Ok(r.rows_affected() == 1)
     }
     pub async fn update_draft(
@@ -3610,6 +3610,7 @@ mod tests {
         repository.insert_draft(&draft).await.unwrap();
         let mut changed = draft.clone();
         changed.update(&expected, "new body").unwrap();
+        changed.message_id = "<gmail-assigned@example.com>".into();
         assert!(
             repository
                 .update_draft_if_version(&changed, &expected)
@@ -3621,6 +3622,15 @@ mod tests {
                 .update_draft_if_version(&draft, &expected)
                 .await
                 .unwrap()
+        );
+        assert_eq!(
+            repository
+                .get_draft(draft.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .message_id,
+            changed.message_id
         );
         let now = Utc::now();
         assert_eq!(

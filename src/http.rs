@@ -1713,6 +1713,19 @@ async fn create_draft_authorized(
                 &headers,
             )
         }
+        Err(AdapterError::NotFound) => {
+            if let (Some(repository), Some(key_hash)) = (&state.repository, &idempotency) {
+                let _ = repository
+                    .abandon_draft_create_idempotency(auth.key, key_hash)
+                    .await;
+            }
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "service temporarily unavailable",
+                &headers,
+            )
+        }
         Err(e) => adapter_response(e, &headers),
     }
 }
@@ -1874,6 +1887,16 @@ async fn update_draft_authorized(
         Ok(updated) => updated,
         Err(error) => return adapter_response(error, &headers),
     };
+    if updated.id != current.gmail_draft_id || updated.stable_message_id.is_empty() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            "service temporarily unavailable",
+            &headers,
+        );
+    }
+    changed.message_id = updated.stable_message_id.clone();
+    changed.version = DraftVersion::from_content(draft_fingerprint_content(&updated));
     if let Some(repository) = &state.repository
         && repository.update_draft(&changed, &expected).await.is_err()
     {
@@ -4370,12 +4393,13 @@ mod tests {
     use axum::body::Body;
     use http::{Method, Request};
     use sqlx::Row;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tower::ServiceExt;
 
     #[derive(Default)]
     struct TimeoutThenReconcileAdapter {
         inner: FakeGmailAdapter,
+        fail_next_create: AtomicBool,
         send_calls: AtomicUsize,
         reconcile_calls: AtomicUsize,
     }
@@ -4435,6 +4459,9 @@ mod tests {
             connection: ConnectionId,
             draft: MailDraft,
         ) -> Result<MailDraft, AdapterError> {
+            if self.fail_next_create.swap(false, Ordering::SeqCst) {
+                return Err(AdapterError::NotFound);
+            }
             self.inner.create_draft(connection, draft).await
         }
         async fn update_draft(
@@ -4764,6 +4791,44 @@ mod tests {
         .await;
         assert_eq!(conflict_status, StatusCode::CONFLICT);
         assert_eq!(conflict["error"]["code"], "idempotency_key_conflict");
+    }
+
+    #[tokio::test]
+    async fn persisted_create_not_found_abandons_idempotency_claim_for_retry() {
+        let (mut state, credential, connection, _) = persisted_state().await;
+        let adapter = Arc::new(TimeoutThenReconcileAdapter {
+            inner: FakeGmailAdapter::new(),
+            fail_next_create: AtomicBool::new(true),
+            ..Default::default()
+        });
+        state.adapter = adapter.clone();
+        state.mailbox_service = MailboxReadService::new(adapter);
+
+        let app = router(state);
+        let uri = format!("/api/v1/connections/{connection}/drafts");
+        let request = json!({"subject":"retry","body":"body","to":["to@example.com"]});
+        let (failed_status, failed) = json_request_with_idempotency(
+            &app,
+            uri.clone(),
+            &credential,
+            "create-retry-after-not-found",
+            request.clone(),
+        )
+        .await;
+        assert_eq!(failed_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(failed["error"]["code"], "service_unavailable");
+
+        let (retry_status, retry) = json_request_with_idempotency(
+            &app,
+            uri,
+            &credential,
+            "create-retry-after-not-found",
+            request,
+        )
+        .await;
+        assert_eq!(retry_status, StatusCode::OK);
+        assert_eq!(retry["managed_draft"]["state"], "active");
+        assert_ne!(retry["idempotent_replay"], true);
     }
 
     #[tokio::test]
@@ -5155,21 +5220,36 @@ mod tests {
     async fn api_rate_limit_returns_retry_seconds_and_header() {
         let (state, credential, _) = AppState::test_fixture();
         let key_id = state.keys.read().await.values().next().unwrap().id;
-        let now = Utc::now();
         let bucket_key = format!("api_per_minute:{key_id}");
-        let mut bucket = RateBucket::new(&bucket_key, LimitKind::ApiPerMinute, now);
-        bucket.request_count = LimitKind::ApiPerMinute.limit();
-        state.rate_buckets.lock().await.insert(bucket_key, bucket);
-        let app = router(state);
-        let response = app
-            .oneshot(
-                Request::get("/api/v1/connections")
-                    .header("authorization", format!("Bearer {credential}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let app = router(state.clone());
+        // A fixed minute may roll over between seeding the bucket and the
+        // request. Reseed briefly in that case rather than making this flaky.
+        let mut response = None;
+        for _ in 0..3 {
+            let mut bucket = RateBucket::new(&bucket_key, LimitKind::ApiPerMinute, Utc::now());
+            bucket.request_count = LimitKind::ApiPerMinute.limit();
+            state
+                .rate_buckets
+                .lock()
+                .await
+                .insert(bucket_key.clone(), bucket);
+            let result = app
+                .clone()
+                .oneshot(
+                    Request::get("/api/v1/connections")
+                        .header("authorization", format!("Bearer {credential}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let limited = result.status() == StatusCode::TOO_MANY_REQUESTS;
+            response = Some(result);
+            if limited {
+                break;
+            }
+        }
+        let response = response.expect("at least one rate-limit request");
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(response.headers().contains_key(header::RETRY_AFTER));
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024)

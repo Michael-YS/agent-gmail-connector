@@ -115,6 +115,9 @@ pub trait GmailAdapter: Send + Sync {
         connection: ConnectionId,
         draft_id: &str,
     ) -> Result<MailDraft, AdapterError>;
+    /// On create, `NotFound` certifies that no remote draft remains (including
+    /// after a confirmed compensating delete), so the caller may release its
+    /// idempotency claim. Ambiguous writes must return another error.
     async fn create_draft(
         &self,
         connection: ConnectionId,

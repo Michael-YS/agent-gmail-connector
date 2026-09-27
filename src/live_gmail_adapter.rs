@@ -22,7 +22,6 @@ use crate::{
 use async_trait::async_trait;
 use secrecy::SecretString;
 use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
-use uuid::Uuid;
 
 const LIST_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 const LIST_FETCH_CONCURRENCY: usize = 4;
@@ -296,7 +295,7 @@ impl GmailAdapter for LiveGmailAdapter {
     async fn create_draft(
         &self,
         connection: ConnectionId,
-        mut draft: MailDraft,
+        draft: MailDraft,
     ) -> Result<MailDraft, AdapterError> {
         let (connection_record, token) = self.connection_and_access_token(connection).await?;
         let raw = build_draft_mime(&connection_record, &draft)?;
@@ -305,9 +304,34 @@ impl GmailAdapter for LiveGmailAdapter {
             .create_draft(&token, &raw, draft.thread_id.as_deref())
             .await;
         let created = self.map_gmail_result(connection, result).await?;
-        draft.id = created.id;
-        draft.thread_id = created.thread_id.or(draft.thread_id);
-        Ok(draft)
+        let observed = self
+            .map_gmail_result(connection, self.gmail.get_draft(&token, &created.id).await)
+            .await
+            .and_then(|detail| {
+                if detail.id != created.id {
+                    return Err(AdapterError::Unavailable);
+                }
+                let stored = to_mail_draft(detail.id, detail.message);
+                gmail_message_id_inner(&stored.stable_message_id)?;
+                Ok(stored)
+            });
+        match observed {
+            Ok(stored) => Ok(stored),
+            Err(_) => {
+                // The create did succeed. Only release the caller's idempotency
+                // claim after Gmail confirms the compensating delete.
+                let deleted = self
+                    .map_gmail_result(
+                        connection,
+                        self.gmail.delete_draft(&token, &created.id).await,
+                    )
+                    .await;
+                match deleted {
+                    Ok(()) | Err(AdapterError::NotFound) => Err(AdapterError::NotFound),
+                    Err(_) => Err(AdapterError::Unavailable),
+                }
+            }
+        }
     }
 
     async fn update_draft(
@@ -327,9 +351,15 @@ impl GmailAdapter for LiveGmailAdapter {
             .update_draft(&token, &draft.id, &raw, draft.thread_id.as_deref())
             .await;
         let updated = self.map_gmail_result(connection, result).await?;
-        draft.id = updated.id;
-        draft.thread_id = updated.thread_id.or(draft.thread_id);
-        Ok(draft)
+        let detail = self
+            .map_gmail_result(connection, self.gmail.get_draft(&token, &updated.id).await)
+            .await?;
+        if detail.id != updated.id || detail.id != draft.id {
+            return Err(AdapterError::Unavailable);
+        }
+        let stored = to_mail_draft(detail.id, detail.message);
+        gmail_message_id_inner(&stored.stable_message_id)?;
+        Ok(stored)
     }
 
     async fn delete_draft(
@@ -359,7 +389,7 @@ impl GmailAdapter for LiveGmailAdapter {
         connection: ConnectionId,
         stable_message_id: &str,
     ) -> Result<Option<String>, AdapterError> {
-        let inner = agentmail_message_id_inner(stable_message_id)?;
+        let inner = gmail_message_id_inner(stable_message_id)?;
         let token = self.access_token(connection).await?;
         let query = format!("in:sent rfc822msgid:{inner}");
         let list_result = self
@@ -440,15 +470,28 @@ fn is_exact_sent_match(message: &GmailMessage, stable_message_id: &str) -> bool 
             .is_some_and(|value| value.trim() == stable_message_id)
 }
 
-fn agentmail_message_id_inner(value: &str) -> Result<&str, AdapterError> {
+fn gmail_message_id_inner(value: &str) -> Result<&str, AdapterError> {
     let inner = value
         .strip_prefix('<')
         .and_then(|value| value.strip_suffix('>'))
         .ok_or(AdapterError::InvalidInput)?;
-    let Some(local) = inner.strip_suffix("@agentmail.invalid") else {
+    let Some((local, domain)) = inner.split_once('@') else {
         return Err(AdapterError::InvalidInput);
     };
-    if Uuid::parse_str(local).is_err() {
+    if local.is_empty()
+        || domain.is_empty()
+        || value.len() > 512
+        || inner.matches('@').count() != 1
+        || !inner.is_ascii()
+        || inner.bytes().any(|byte| {
+            byte.is_ascii_whitespace()
+                || byte.is_ascii_control()
+                || matches!(
+                    byte,
+                    b'<' | b'>' | b'(' | b')' | b',' | b';' | b':' | b'\\' | b'"'
+                )
+        })
+    {
         return Err(AdapterError::InvalidInput);
     }
     Ok(inner)
@@ -762,6 +805,67 @@ mod tests {
         )
     }
 
+    async fn scripted_gmail_server(
+        responses: Vec<(&'static str, u16, &'static str)>,
+    ) -> (Url, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Url::parse(&format!(
+            "http://{}/gmail/v1/",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let handle = tokio::spawn(async move {
+            for (expected_path, status, body) in responses {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                let mut content_length = 0usize;
+                let mut header_end = None;
+                loop {
+                    stream.readable().await.unwrap();
+                    match stream.try_read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            request.extend_from_slice(&buffer[..n]);
+                            if header_end.is_none()
+                                && let Some(position) =
+                                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                            {
+                                header_end = Some(position + 4);
+                                let headers = String::from_utf8_lossy(&request[..position])
+                                    .to_ascii_lowercase();
+                                content_length = headers
+                                    .lines()
+                                    .find_map(|line| line.strip_prefix("content-length:"))
+                                    .and_then(|value| value.trim().parse().ok())
+                                    .unwrap_or(0);
+                            }
+                            if let Some(position) = header_end
+                                && request.len() >= position + content_length
+                            {
+                                break;
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(error) => panic!("Gmail mock request read failed: {error}"),
+                    }
+                }
+                let request_line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                assert!(request_line.starts_with(expected_path), "{request_line}");
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.try_write(response.as_bytes());
+            }
+        });
+        (endpoint, handle)
+    }
+
     async fn seeded_connection(repository: &Repository) -> GmailConnection {
         let user = User::new(
             "owner-sub",
@@ -838,22 +942,220 @@ mod tests {
         gmail_server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn create_draft_returns_gmail_readback_message_id() {
+        let (token_endpoint, token_server) = canned_server(
+            "/token",
+            200,
+            r#"{"access_token":"access","token_type":"Bearer","expires_in":3600}"#,
+        )
+        .await;
+        let (gmail_endpoint, gmail_server) = scripted_gmail_server(vec![
+            (
+                "POST /gmail/v1/users/me/drafts ",
+                200,
+                r#"{"id":"d1","message":{"id":"create-message"}}"#,
+            ),
+            (
+                "GET /gmail/v1/users/me/drafts/d1?format=full ",
+                200,
+                r#"{"id":"d1","message":{"id":"readback-message","payload":{"mimeType":"text/plain","headers":[{"name":"Message-ID","value":"<gmail-assigned@google.test>"},{"name":"Subject","value":"identity test"},{"name":"To","value":"recipient@example.com"}],"body":{"data":"aGVsbG8"}}}}"#,
+            ),
+            (
+                "PUT /gmail/v1/users/me/drafts/d1 ",
+                200,
+                r#"{"id":"d1","message":{"id":"updated-message"}}"#,
+            ),
+            (
+                "GET /gmail/v1/users/me/drafts/d1?format=full ",
+                200,
+                r#"{"id":"d1","message":{"id":"updated-readback-message","payload":{"mimeType":"text/plain","headers":[{"name":"Message-ID","value":"<gmail-reassigned@google.test>"},{"name":"Subject","value":"identity test updated"},{"name":"To","value":"recipient@example.com"}],"body":{"data":"dXBkYXRlZA"}}}}"#,
+            ),
+        ])
+        .await;
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.migrate().await.unwrap();
+        let repository = Repository::new(&db);
+        let connection = seeded_connection(&repository).await;
+        let refresher = GoogleTokenClient::for_tests(
+            token_endpoint,
+            "client-id",
+            SecretString::from("client-secret"),
+            Url::parse("https://agentmail.example/callback").unwrap(),
+        )
+        .unwrap();
+        let credentials = Arc::new(GmailCredentialProvider::new(
+            Arc::new(repository.clone()),
+            Arc::new(refresher),
+            keyring(),
+        ));
+        let gmail = GoogleGmailClient::for_tests(gmail_endpoint).unwrap();
+        let adapter = LiveGmailAdapter::new(repository, credentials, gmail);
+        let draft = MailDraft {
+            id: String::new(),
+            stable_message_id: "<client-generated@agentmail.invalid>".into(),
+            thread_id: None,
+            subject: "identity test".into(),
+            body: "hello".into(),
+            to: vec![EmailAddress::new("recipient@example.com").unwrap()],
+            cc: vec![],
+            bcc: vec![],
+            attachments: vec![],
+            html_body: None,
+            reply_headers: None,
+            attachment_data: vec![],
+        };
+
+        let created = adapter.create_draft(connection.id, draft).await.unwrap();
+        assert_eq!(created.id, "d1");
+        assert_eq!(created.stable_message_id, "<gmail-assigned@google.test>");
+        assert_eq!(created.subject, "identity test");
+        assert_eq!(created.body, "hello");
+
+        let mut changed = created;
+        changed.subject = "identity test updated".into();
+        changed.body = "updated".into();
+        let updated = adapter.update_draft(connection.id, changed).await.unwrap();
+        assert_eq!(updated.id, "d1");
+        assert_eq!(updated.stable_message_id, "<gmail-reassigned@google.test>");
+        assert_eq!(updated.subject, "identity test updated");
+        assert_eq!(updated.body, "updated");
+
+        token_server.await.unwrap();
+        gmail_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_draft_without_readback_message_id_deletes_created_draft() {
+        let (token_endpoint, token_server) = canned_server(
+            "/token",
+            200,
+            r#"{"access_token":"access","token_type":"Bearer","expires_in":3600}"#,
+        )
+        .await;
+        let (gmail_endpoint, gmail_server) = scripted_gmail_server(vec![
+            (
+                "POST /gmail/v1/users/me/drafts ",
+                200,
+                r#"{"id":"d1","message":{"id":"create-message"}}"#,
+            ),
+            (
+                "GET /gmail/v1/users/me/drafts/d1?format=full ",
+                200,
+                r#"{"id":"d1","message":{"id":"readback-message","payload":{"mimeType":"text/plain","headers":[{"name":"Subject","value":"identity test"},{"name":"To","value":"recipient@example.com"}],"body":{"data":"aGVsbG8"}}}}"#,
+            ),
+            ("DELETE /gmail/v1/users/me/drafts/d1 ", 204, ""),
+        ])
+        .await;
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.migrate().await.unwrap();
+        let repository = Repository::new(&db);
+        let connection = seeded_connection(&repository).await;
+        let refresher = GoogleTokenClient::for_tests(
+            token_endpoint,
+            "client-id",
+            SecretString::from("client-secret"),
+            Url::parse("https://agentmail.example/callback").unwrap(),
+        )
+        .unwrap();
+        let credentials = Arc::new(GmailCredentialProvider::new(
+            Arc::new(repository.clone()),
+            Arc::new(refresher),
+            keyring(),
+        ));
+        let gmail = GoogleGmailClient::for_tests(gmail_endpoint).unwrap();
+        let adapter = LiveGmailAdapter::new(repository, credentials, gmail);
+        let draft = MailDraft {
+            id: String::new(),
+            stable_message_id: "<client-generated@agentmail.invalid>".into(),
+            thread_id: None,
+            subject: "identity test".into(),
+            body: "hello".into(),
+            to: vec![EmailAddress::new("recipient@example.com").unwrap()],
+            cc: vec![],
+            bcc: vec![],
+            attachments: vec![],
+            html_body: None,
+            reply_headers: None,
+            attachment_data: vec![],
+        };
+
+        assert_eq!(
+            adapter
+                .create_draft(connection.id, draft)
+                .await
+                .unwrap_err(),
+            AdapterError::NotFound
+        );
+
+        token_server.await.unwrap();
+        // The scripted server asserts POST, GET, and DELETE in order; joining
+        // it proves the compensation DELETE was received and answered.
+        gmail_server.await.unwrap();
+    }
+
     #[test]
-    fn sent_reconciliation_accepts_only_system_message_ids() {
+    fn sent_reconciliation_accepts_general_message_ids() {
         let valid = "<018f0d58-8e52-7b7e-a5f2-7d82a5f5f1e1@agentmail.invalid>";
         assert_eq!(
-            agentmail_message_id_inner(valid).unwrap(),
+            gmail_message_id_inner(valid).unwrap(),
             "018f0d58-8e52-7b7e-a5f2-7d82a5f5f1e1@agentmail.invalid"
         );
+        for also_valid in [
+            "<not-a-uuid@agentmail.invalid>",
+            "<gmail-assigned@google.test>",
+        ] {
+            assert!(gmail_message_id_inner(also_valid).is_ok());
+        }
         for invalid in [
             "018f0d58-8e52-7b7e-a5f2-7d82a5f5f1e1@agentmail.invalid",
-            "<not-a-uuid@agentmail.invalid>",
-            "<018f0d58-8e52-7b7e-a5f2-7d82a5f5f1e1@example.com>",
             "<018f0d58-8e52-7b7e-a5f2-7d82a5f5f1e1@agentmail.invalid> extra",
         ] {
             assert_eq!(
-                agentmail_message_id_inner(invalid),
+                gmail_message_id_inner(invalid),
                 Err(AdapterError::InvalidInput)
+            );
+        }
+    }
+
+    #[test]
+    fn gmail_message_id_validation_accepts_general_rfc_id_shape() {
+        for (value, expected) in [
+            ("<draft-42@example.test>", "draft-42@example.test"),
+            ("<local+tag@sub.example.test>", "local+tag@sub.example.test"),
+            ("<a@b>", "a@b"),
+        ] {
+            assert_eq!(gmail_message_id_inner(value).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn gmail_message_id_validation_rejects_ambiguous_or_unsafe_values() {
+        let overlong = format!("<{}@example.test>", "x".repeat(510));
+        for value in [
+            "",
+            "draft-42@example.test",
+            "<@example.test>",
+            "<draft-42@>",
+            "<draft@@example.test>",
+            "<draft id@example.test>",
+            "<draft\tid@example.test>",
+            "<draft\r\nid@example.test>",
+            "<draft(id)@example.test>",
+            "<draft,id@example.test>",
+            "<draft;id@example.test>",
+            "<draft:id@example.test>",
+            "<draft\\id@example.test>",
+            "<draft\"id@example.test>",
+            "<drafť@example.test>",
+            overlong.as_str(),
+        ] {
+            assert_eq!(
+                gmail_message_id_inner(value),
+                Err(AdapterError::InvalidInput),
+                "unexpectedly accepted Message-ID input: {value:?}"
             );
         }
     }

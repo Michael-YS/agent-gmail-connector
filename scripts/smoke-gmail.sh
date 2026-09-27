@@ -42,6 +42,7 @@ command -v jq >/dev/null 2>&1 || die 'jq is required'
 for var in AGENTMAIL_BASE_URL AGENTMAIL_ACCESS_KEY AGENTMAIL_CONNECTION_ID AGENTMAIL_SELF_ADDRESS; do
   [[ -n ${!var:-} ]] || { printf 'smoke-gmail: missing required environment variable: %s\n' "$var" >&2; usage; exit 2; }
 done
+[[ $AGENTMAIL_ACCESS_KEY =~ ^amk_[0-9A-Fa-f-]{36}\.[A-Za-z0-9_-]+$ ]] || die 'invalid Access Key format'
 
 uuid4() {
   if command -v uuidgen >/dev/null 2>&1; then uuidgen; else cat /proc/sys/kernel/random/uuid; fi
@@ -50,12 +51,15 @@ uuid4() {
 # http METHOD PATH [JSON-BODY] [EXTRA-HEADER] -> sets STATUS and BODY.
 http() {
   local out
-  local args=(--silent --show-error --request "$1" --header "Authorization: Bearer ${AGENTMAIL_ACCESS_KEY}")
+  local args=(--silent --show-error --request "$1")
   [[ -n ${4:-} ]] && args+=(--header "$4")
   if [[ $# -ge 3 && -n $3 ]]; then
-    args+=(--header 'Content-Type: application/json' --data "$3")
+    args+=(--header 'Content-Type: application/json' --data-binary @-)
   fi
-  out=$(curl "${args[@]}" --write-out $'\n%{http_code}' "$AGENTMAIL_BASE_URL$2") || die "request to $2 failed"
+  out=$(printf '%s' "${3:-}" |
+    env -u AGENTMAIL_ACCESS_KEY curl --config /dev/fd/3 "${args[@]}" \
+      --write-out $'\n%{http_code}' "$AGENTMAIL_BASE_URL$2" \
+      3< <(printf 'header = "Authorization: Bearer %s"\n' "$AGENTMAIL_ACCESS_KEY")) || die "request to $2 failed"
   STATUS=${out##*$'\n'}
   BODY=${out%$'\n'*}
 }
