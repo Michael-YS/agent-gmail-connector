@@ -1163,16 +1163,22 @@ async fn connection_primary_address(
     state: &AppState,
     connection: ConnectionId,
 ) -> Result<EmailAddress, AdapterError> {
-    if let Some(value) = state.connections.read().await.get(&connection) {
-        return EmailAddress::new(&value.email).map_err(|_| AdapterError::Unavailable);
+    if let Some(repository) = &state.repository {
+        let record = repository
+            .get_connection(connection)
+            .await
+            .map_err(|_| AdapterError::Unavailable)?
+            .ok_or(AdapterError::NotFound)?;
+        return EmailAddress::new(record.email).map_err(|_| AdapterError::Unavailable);
     }
-    let repository = state.repository.as_ref().ok_or(AdapterError::NotFound)?;
-    let record = repository
-        .get_connection(connection)
+    let email = state
+        .connections
+        .read()
         .await
-        .map_err(|_| AdapterError::Unavailable)?
+        .get(&connection)
+        .map(|record| record.email.clone())
         .ok_or(AdapterError::NotFound)?;
-    EmailAddress::new(record.email).map_err(|_| AdapterError::Unavailable)
+    EmailAddress::new(email).map_err(|_| AdapterError::Unavailable)
 }
 
 fn reply_headers_for(message: &crate::adapter::MailMessage) -> Result<ReplyHeaders, AdapterError> {
@@ -2121,16 +2127,15 @@ async fn prepare_send_authorized(
         Ok(remote) => remote,
         Err(response) => return *response,
     };
+    let sender = match connection_primary_address(state, cid).await {
+        Ok(sender) => sender,
+        Err(error) => return adapter_response(error, &headers),
+    };
     let preview = SendPreview {
         connection_id: cid,
         draft_id: id,
         version: d.version.clone(),
-        from: state
-            .connections
-            .read()
-            .await
-            .get(&cid)
-            .map(|connection| connection.email.clone()),
+        from: Some(sender.to_string()),
         to: remote.to.iter().map(ToString::to_string).collect(),
         cc: remote.cc.iter().map(ToString::to_string).collect(),
         bcc: remote.bcc.iter().map(ToString::to_string).collect(),
@@ -4610,6 +4615,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_sender_uses_database_over_stale_cache() {
+        let (state, _, connection, _) = persisted_state().await;
+        let repository = state.repository.as_ref().unwrap();
+        let mut stale = repository
+            .get_connection(connection)
+            .await
+            .unwrap()
+            .unwrap();
+        stale.email = "stale@example.com".into();
+        state.connections.write().await.insert(connection, stale);
+        let sender = connection_primary_address(&state, connection)
+            .await
+            .unwrap();
+        assert_eq!(sender.to_string(), "first@example.com");
+    }
+
+    #[tokio::test]
     async fn reauth_required_connection_is_distinct_from_denied_access() {
         let (state, credential, first, second) = persisted_state().await;
         let repository = state.repository.as_ref().unwrap();
@@ -5042,6 +5064,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(prepared["preview"]["from"], "first@example.com");
         let token = prepared["confirmation_token"].as_str().unwrap();
 
         let restarted = AppState::new(state.database.clone(), state.adapter.clone());

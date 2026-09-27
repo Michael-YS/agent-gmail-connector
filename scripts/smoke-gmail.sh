@@ -14,7 +14,8 @@ say() { printf 'smoke-gmail: %s\n' "$*"; }
 die() { printf 'smoke-gmail: %s\n' "$*" >&2; exit 1; }
 usage() {
   cat >&2 <<'EOF'
-usage: scripts/smoke-gmail.sh [--prepare-only] | [--send [--yes]] | --help
+usage: scripts/smoke-gmail.sh [--prepare-only] | [--send [--yes]]
+       scripts/smoke-gmail.sh --resume-draft UUID --run-id UUID [--prepare-only | --send [--yes]]
 required environment:
   AGENTMAIL_BASE_URL        e.g. http://127.0.0.1:18080
   AGENTMAIL_ACCESS_KEY      full amk_... credential (never echoed)
@@ -25,17 +26,30 @@ EOF
 
 mode=prepare
 assume_yes=false
+resume_draft=''
+resume_run_id=''
 while [[ $# -gt 0 ]]; do
   case $1 in
     --prepare-only) mode=prepare ;;
     --send) mode=send ;;
     --yes) assume_yes=true ;;
+    --resume-draft)
+      [[ $# -ge 2 ]] || die '--resume-draft requires a UUID'
+      resume_draft=$2; shift ;;
+    --run-id)
+      [[ $# -ge 2 ]] || die '--run-id requires a UUID'
+      resume_run_id=$2; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
   shift
 done
 [[ $mode == send || $assume_yes == false ]] || die '--yes is only valid together with --send'
+if [[ -n $resume_draft || -n $resume_run_id ]]; then
+  [[ -n $resume_draft && -n $resume_run_id ]] || die '--resume-draft and --run-id must be supplied together'
+  uuid_pattern='^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
+  [[ $resume_draft =~ $uuid_pattern && $resume_run_id =~ $uuid_pattern ]] || die 'invalid resume UUID'
+fi
 
 command -v curl >/dev/null 2>&1 || die 'curl is required'
 command -v jq >/dev/null 2>&1 || die 'jq is required'
@@ -83,16 +97,21 @@ http GET "/api/v1/connections/$cid/messages?q=in%3Ainbox&page_size=1"
 check_status 'messages.search'
 say "messages.search HTTP $STATUS (q=in:inbox, page_size=1)"
 
-run_id=$(uuid4)
+run_id=${resume_run_id:-$(uuid4)}
 subject="[AgentMail E2E ${run_id}]"
-body_text="AgentMail real-Gmail smoke draft. Run id: ${run_id}. Safe to discard."
-create_body=$(jq -nc --arg to "$AGENTMAIL_SELF_ADDRESS" --arg subject "$subject" --arg body "$body_text" \
-  '{to:[$to],subject:$subject,body:$body}')
-idem_key=$(uuid4)
-http POST "/api/v1/connections/$cid/drafts" "$create_body" "Idempotency-Key: $idem_key"
-check_status 'drafts.create'
-draft_id=$(jq -er '.managed_draft.id' <<<"$BODY") || die 'drafts.create response had no managed_draft.id'
-say "drafts.create HTTP $STATUS (idempotency-key $idem_key)"
+if [[ -n $resume_draft ]]; then
+  draft_id=$resume_draft
+  say 'resuming existing managed draft; no draft created'
+else
+  body_text="AgentMail real-Gmail smoke draft. Run id: ${run_id}. Safe to discard."
+  create_body=$(jq -nc --arg to "$AGENTMAIL_SELF_ADDRESS" --arg subject "$subject" --arg body "$body_text" \
+    '{to:[$to],subject:$subject,body:$body}')
+  idem_key=$(uuid4)
+  http POST "/api/v1/connections/$cid/drafts" "$create_body" "Idempotency-Key: $idem_key"
+  check_status 'drafts.create'
+  draft_id=$(jq -er '.managed_draft.id' <<<"$BODY") || die 'drafts.create response had no managed_draft.id'
+  say "drafts.create HTTP $STATUS (idempotency-key $idem_key)"
+fi
 
 http POST "/api/v1/connections/$cid/drafts/$draft_id/prepare-send" ''
 check_status 'prepare-send'
