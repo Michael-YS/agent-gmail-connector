@@ -2812,19 +2812,145 @@ async fn landing() -> impl IntoResponse {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AgentMail</title>
+  <title>AgentMail — Sign in</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --canvas: #edf3ef;
+      --paper: #fff;
+      --ink: #142a24;
+      --muted: #4b6259;
+      --line: #c7d9cf;
+      --accent: #176b4b;
+      --accent-ink: #fff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      min-height: 100vh;
+      margin: 0;
+      color: var(--ink);
+      background: var(--canvas);
+    }
+    .page {
+      width: min(100% - 2.5rem, 920px);
+      min-height: 100vh;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+    }
+    .brand {
+      padding: 2rem 0;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: -0.04em;
+    }
+    .brand span { color: var(--accent); }
+    main {
+      flex: 1;
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(260px, 0.8fr);
+      align-items: center;
+      gap: clamp(2rem, 7vw, 6rem);
+      padding: 3rem 0 5rem;
+    }
+    .eyebrow {
+      margin: 0 0 1rem;
+      color: var(--accent);
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+    h1 {
+      max-width: 11ch;
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(3rem, 6.7vw, 5.5rem);
+      font-weight: 400;
+      letter-spacing: -0.065em;
+      line-height: 1.02;
+    }
+    .intro { max-width: 32rem; margin: 1.5rem 0 0; color: var(--muted); font-size: 1.1rem; line-height: 1.6; }
+    .sign-in-panel {
+      padding: 2rem;
+      border: 1px solid var(--line);
+      border-radius: 0.75rem;
+      background: var(--paper);
+      box-shadow: 0 18px 50px rgb(20 42 36 / 6%);
+    }
+    .sign-in-panel::before {
+      content: "";
+      display: block;
+      width: 3rem;
+      height: 0.35rem;
+      margin-bottom: 2rem;
+      background: var(--accent);
+      transform: skewX(-28deg);
+    }
+    .sign-in-panel h2 { margin: 0 0 0.6rem; font-size: 1.25rem; letter-spacing: -0.025em; }
+    .sign-in-panel p { margin: 0 0 1.5rem; color: var(--muted); line-height: 1.5; }
+    .sign-in {
+      display: block;
+      padding: 0.9rem 1.1rem;
+      border-radius: 0.4rem;
+      background: var(--accent);
+      color: var(--accent-ink);
+      font-weight: 700;
+      text-align: center;
+      text-decoration: none;
+    }
+    .sign-in:hover { filter: brightness(1.1); }
+    a:focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; }
+    footer { padding: 1.5rem 0 2rem; border-top: 1px solid var(--line); }
+    footer nav { display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem; }
+    footer a { color: var(--muted); font-size: 0.9rem; text-underline-offset: 0.2em; }
+    footer a:hover { color: var(--accent); }
+    @media (max-width: 680px) {
+      .brand { padding: 1.5rem 0; }
+      main { grid-template-columns: 1fr; gap: 2.5rem; padding: 3rem 0 4rem; }
+      h1 { max-width: 12ch; }
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --canvas: #10201b;
+        --paper: #182c24;
+        --ink: #f1f7f2;
+        --muted: #baccc1;
+        --line: #385249;
+        --accent: #8cddb0;
+        --accent-ink: #10201b;
+      }
+      .sign-in-panel { box-shadow: none; }
+      .sign-in:hover { filter: brightness(0.9); }
+    }
+  </style>
 </head>
 <body>
-  <main>
-    <h1>AgentMail</h1>
-    <p>A privacy-first Gmail access layer for agents.</p>
-    <p><a href="/auth/google/login">Sign in with Google</a></p>
+  <div class="page">
+    <div class="brand">Agent<span>Mail</span></div>
+    <main>
+      <div>
+        <p class="eyebrow">Private Gmail access for agents</p>
+        <h1>Mail access, under your control.</h1>
+        <p class="intro">Connect your Gmail account and manage access from one place.</p>
+      </div>
+      <section class="sign-in-panel" aria-labelledby="sign-in-heading">
+        <h2 id="sign-in-heading">Open your workspace</h2>
+        <p>Sign in with your AgentMail account to continue.</p>
+        <a class="sign-in" href="/auth/google/login">Sign in with Google</a>
+      </section>
+    </main>
+    <footer>
     <nav aria-label="Legal">
       <a href="/privacy">Privacy</a>
       <a href="/terms">Terms</a>
       <a href="/data-deletion">Data deletion</a>
     </nav>
-  </main>
+    </footer>
+  </div>
 </body>
 </html>"#,
     )

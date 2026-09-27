@@ -303,6 +303,10 @@ async fn mcp_draft_writes_validate_arguments_and_charge_per_request() {
         .as_str()
         .unwrap()
         .to_owned();
+    let key = state.keys.read().await.values().next().unwrap().id;
+    let bucket_key = format!("api_per_minute:{key}");
+    let first_bucket = state.rate_buckets.lock().await[&bucket_key].clone();
+    assert_eq!(first_bucket.request_count, 1);
 
     let updated = build_router(state.clone())
         .oneshot(
@@ -334,11 +338,17 @@ async fn mcp_draft_writes_validate_arguments_and_charge_per_request() {
         updated["result"]["structuredContent"]["draft"]["subject"],
         "updated"
     );
-    let key = state.keys.read().await.values().next().unwrap().id;
-    assert_eq!(
-        state.rate_buckets.lock().await[&format!("api_per_minute:{key}")].request_count,
+    let buckets = state.rate_buckets.lock().await;
+    let updated_bucket = &buckets[&bucket_key];
+    // A minute boundary between requests starts a fresh bucket. In either
+    // window, this assertion still requires the MCP request to be charged.
+    let expected_count = if updated_bucket.window_started_at == first_bucket.window_started_at {
         2
-    );
+    } else {
+        1
+    };
+    assert_eq!(updated_bucket.request_count, expected_count);
+    drop(buckets);
 
     let invalid = build_router(state.clone())
         .oneshot(

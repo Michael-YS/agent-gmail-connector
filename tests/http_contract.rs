@@ -55,8 +55,16 @@ async fn landing_exposes_google_login_and_legal_links() {
         response.headers()["content-type"],
         "text/html; charset=utf-8"
     );
+    assert!(
+        response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("style-src 'self' 'unsafe-inline'")
+    );
     let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
     let body = std::str::from_utf8(&body).unwrap();
+    assert!(body.contains("<style>"));
+    assert!(body.contains("class=\"sign-in-panel\""));
     assert!(body.contains("href=\"/auth/google/login\""));
     assert!(body.contains("href=\"/privacy\""));
     assert!(body.contains("href=\"/terms\""));
