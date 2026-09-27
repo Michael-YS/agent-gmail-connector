@@ -2,10 +2,10 @@
 
 ## S1 beta 修复验收（2026-09-27）
 
-- S1 已部署 `agentmail:654b49d`，容器健康；Zen 真实浏览器 Owner 登录、控制台 CSP/资源加载、重启后 session 和账户页均正常。Google Gmail consent 已创建一个属于 Owner 的 Active Connection，账户页显示 `gmail.readonly` 与 `gmail.compose`；因此 scope URL 兼容修复已通过真实授权验证。
+- S1 已部署 `agentmail:0c5780e`，容器健康、内外网 live/ready 均为 200；部署前备份 `agentmail-20260927T201001Z.db` 的 SQLite `quick_check=ok`，旧镜像 `agentmail:654b49d` 保留。真实浏览器 Owner 登录与账户页正常。Google Gmail consent 曾创建一个属于 Owner 的 Active Connection，账户页显示 `gmail.readonly` 与 `gmail.compose`，随后已将其撤销；scope URL 兼容修复已通过真实授权验证。
 - 成功 Gmail callback 曾返回 JSON；`45bd227` 将它改为 303 跳转 `/control/account`，本地测试断言跳转和 `no-store`。新版本尚未再次通过真实 Google callback 验证跳转；不可刷新已消费的旧 callback。
 - 待执行：真实 refresh、Google 端 revoke 状态核对、撤销后重新授权 callback，以及真实 MCP client。单封垃圾邮箱自发自收、Sent/Inbox 只读核对、临时 Key 与 Connection 的本地撤销已完成；不要再次发送，也不要复制 callback URL、authorization code 或 token 到日志/文档。
-- 撤销后点击 Connect Gmail 暴露 POST→Google 307 重定向：Nginx 收到表单请求并返回 307，浏览器未到授权页。工作区已改成 303 并补测试，用户报告全量测试和严格 Clippy 均通过；部署和真实 Google callback 尚未验证。
+- 撤销后点击 Connect Gmail 暴露 POST→Google 307 重定向：Nginx 收到表单请求并返回 307，浏览器未到授权页。`0c5780e` 已改成 303 并补测试；用户报告全量测试和严格 Clippy 均通过，S1 构建与健康部署已完成，真实 Google callback 尚未验证。
 - 本机测试环境注意：默认 `umask 022` 会使 `config::tests::google_client_secret_files_use_size_permission_and_exclusivity_rules` 的空文件先触发权限错误；默认测试并发叠加编译负载时，Connection revoke 压力测试曾触发 SQLite `PoolTimedOut`。复跑使用 `umask 077` 和 `--test-threads=2`；测试夹具对权限/负载的敏感性仍未在代码中修正，本轮没有放宽生产权限校验或测试超时。
 - `mcp_draft_writes_validate_arguments_and_charge_per_request` 要求 REST create 和 MCP update 后当前分钟桶计数为 2，跨分钟时可能为 1。低并发全量和首次单测复跑失败，随后 19:39:21–19:39:35 UTC 的独立复跑通过；仍需将该测试与真实墙钟边界解耦，不能把分次通过描述为全量命令一次通过。
 
@@ -82,4 +82,4 @@
 - 前置条件：Dev/Prod Cloud Projects、测试 Gmail、正确 OAuth clients/scopes/callbacks、明确的测试收件 allowlist。
 - 方法：完成 A1-A6 后登录、连接 Gmail，运行 `scripts/smoke-gmail.sh`（默认 prepare-only，创建带 `[AgentMail E2E <run-id>]` 的单个 managed draft）；人工核对 preview 后用 `--send` 交互确认发送到测试账号自身。
 - 期望：只产生一个预期草稿/邮件，不改既有标签或已读状态；token 加密入库；所有 revoke 立即切断本地权限。
-- 当前结果（2026-09-27）：Prod project 的两个 Web client、固定 HTTPS callbacks 和所需 scope 已配置；S1 `654b49d` 生产部署健康。真实 Owner 浏览器 Login 与 Gmail offline consent 已成功。首次垃圾邮箱草稿因 Message-ID 不一致在 `prepare-send` 返回 `409 draft_changed`，没有发送；旧失配草稿不自动认领或删除。修正 Gmail 身份持久化和重启后的 sender preview 后，新的单封自发自收 smoke 的 search/create/prepare/send 全部返回 HTTP 200；发送结果为 `Sent`、`replayed=false`，且已持久化。同一 Gmail message ID 在 Sent 与 Inbox 的只读搜索均返回 HTTP 200、`message_present=true`。控制台随后显示临时 Access Key 为 `Revoked`、Connection 列表为空、本地凭证已移除；HTML 入口没有显示 Google 端 token revoke 的结果，因此不能宣称远端已确认。refresh、撤销后重新授权的真实 callback 跳转仍待验收。Gmail 更新成功但回读失败时仍会安全拒绝后续发送，恢复该草稿需单独处理。旧 Google client secret 在这些验收完成前不得停用或删除。
+- 当前结果（2026-09-27）：Prod project 的两个 Web client、固定 HTTPS callbacks 和所需 scope 已配置；S1 `0c5780e` 生产部署健康。真实 Owner 浏览器 Login 与 Gmail offline consent 已成功。首次垃圾邮箱草稿因 Message-ID 不一致在 `prepare-send` 返回 `409 draft_changed`，没有发送；旧失配草稿不自动认领或删除。修正 Gmail 身份持久化和重启后的 sender preview 后，新的单封自发自收 smoke 的 search/create/prepare/send 全部返回 HTTP 200；发送结果为 `Sent`、`replayed=false`，且已持久化。同一 Gmail message ID 在 Sent 与 Inbox 的只读搜索均返回 HTTP 200、`message_present=true`。控制台随后显示临时 Access Key 为 `Revoked`、Connection 列表为空、本地凭证已移除；HTML 入口没有显示 Google 端 token revoke 的结果，因此不能宣称远端已确认。refresh、撤销后重新授权的真实 callback 跳转仍待验收。Gmail 更新成功但回读失败时仍会安全拒绝后续发送，恢复该草稿需单独处理。旧 Google client secret 在这些验收完成前不得停用或删除。
