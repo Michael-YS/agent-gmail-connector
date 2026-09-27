@@ -1,11 +1,10 @@
 # 未完成测试与测试方法
 
-## S1 beta 修复验收（2026-09-23）
+## S1 beta 修复验收（2026-09-27）
 
-- 只读核对：S1 仍运行 `agentmail:692ab15`，公网响应仍返回缺少 `style-src`/`script-src` 的旧 CSP。本地 `419b89c` 已修正 HTTP header 和模板 meta，Firefox 142 测试夹具验证了内联 CSS、同源脚本可用且内联脚本被阻止；真实登录页面仍需部署后验收。
-- Gmail callback 的 scope 兼容修复接受 Google 的完整 `userinfo.email/profile` URL，并规范化、去重。它解释了合法 token response 被映射为 `authentication_failed` 的机制，但尚未通过真实 Google 授权验证该次线上失败的具体原因。
-- 待执行：部署包含本轮修复的版本，重新从 `/control/account` 发起 Gmail 授权（失败回调的 transaction 已消费，不能刷新旧 callback 重试）；使用同一 Owner Google 账号完成 consent，确认只新增自己的 Connection，再验证 refresh。不要复制 callback URL、authorization code 或 token 到日志/文档。
-- 生产未在本轮修改；真实 Google consent/refresh、邮件发送与 revoke 仍为 pending。历史本地/部署验收背景如下，最新本地门禁结果见 `IMPLEMENTATION_PROGRESS.md`。
+- S1 已部署 `agentmail:45bd227`，容器健康；Zen 真实浏览器 Owner 登录、控制台 CSP/资源加载、重启后 session 和账户页均正常。Google Gmail consent 已创建一个属于 Owner 的 Active Connection，账户页显示 `gmail.readonly` 与 `gmail.compose`；因此 scope URL 兼容修复已通过真实授权验证。
+- 成功 Gmail callback 曾返回 JSON；`45bd227` 将它改为 303 跳转 `/control/account`，本地测试断言跳转和 `no-store`。新版本尚未再次通过真实 Google callback 验证跳转；不可刷新已消费的旧 callback。
+- 待执行：真实 refresh、垃圾邮箱加明确 allowlist 的 prepare-only/send/revoke，以及真实 MCP client。当前连接为 Owner 个人邮箱，不应直接用于垃圾邮箱 smoke。不要复制 callback URL、authorization code 或 token 到日志/文档。
 - 本机测试环境注意：默认 `umask 022` 会使 `config::tests::google_client_secret_files_use_size_permission_and_exclusivity_rules` 的空文件先触发权限错误；默认测试并发叠加编译负载时，Connection revoke 压力测试曾触发 SQLite `PoolTimedOut`。复跑使用 `umask 077` 和 `--test-threads=2`；测试夹具对权限/负载的敏感性仍未在代码中修正，本轮没有放宽生产权限校验或测试超时。
 - `mcp_draft_writes_validate_arguments_and_charge_per_request` 要求 REST create 和 MCP update 后当前分钟桶计数为 2，跨分钟时可能为 1。低并发全量和首次单测复跑失败，随后 19:39:21–19:39:35 UTC 的独立复跑通过；仍需将该测试与真实墙钟边界解耦，不能把分次通过描述为全量命令一次通过。
 
@@ -15,7 +14,7 @@
 
 ### A1. Google OIDC 登录与邀请制 control plane
 
-- 已实现：真实 RS256/JWKS verifier、flow-scoped 单次 callback、Owner/Member session、邀请 API/HTML、Member Connection/Access Key HTML、账号自删与 Owner revoke、JSON reauthorize 入口（`POST /control/api/connections/{id}/reauthorize`）。管理 JSON API 使用 `/control/api/...`，HTML 使用 `/control/...`。剩余外部缺口：真实 Google 浏览器登录、连接/重新授权和账号撤销 smoke。
+- 已实现：真实 RS256/JWKS verifier、flow-scoped 单次 callback、Owner/Member session、邀请 API/HTML、Member Connection/Access Key HTML、账号自删与 Owner revoke、JSON reauthorize 入口（`POST /control/api/connections/{id}/reauthorize`）。管理 JSON API 使用 `/control/api/...`，HTML 使用 `/control/...`。Owner 真实 Google 浏览器登录已通过；邀请制 Member 登录和账号撤销仍待外部 smoke。
 - 实现后测试：用 fake OIDC server 覆盖成功、错误 state/nonce、错误 issuer/audience、过期 token、未验证 email、邀请 email 不一致、邀请重放、session idle/absolute expiry 和 CSRF；再用 Dev Project 浏览器登录。
 - 命令目标：`cargo test --test oidc_contract --all-features`。
 - 通过标准：所有失败在创建用户/session 前被拒绝；数据库和日志不出现 authorization code、state、nonce、access token 或 ID token。
@@ -82,4 +81,4 @@
 - 前置条件：Dev/Prod Cloud Projects、测试 Gmail、正确 OAuth clients/scopes/callbacks、明确的测试收件 allowlist。
 - 方法：完成 A1-A6 后登录、连接 Gmail，运行 `scripts/smoke-gmail.sh`（默认 prepare-only，创建带 `[AgentMail E2E <run-id>]` 的单个 managed draft）；人工核对 preview 后用 `--send` 交互确认发送到测试账号自身。
 - 期望：只产生一个预期草稿/邮件，不改既有标签或已读状态；token 加密入库；所有 revoke 立即切断本地权限。
-- 当前结果（2026-09-22）：Prod project 已发布为 External / In Production，Gmail API、`openid email profile gmail.readonly gmail.compose` scopes、Login/Gmail 两个 Web client 与固定 HTTPS callbacks 已配置。S1 生产部署、证书与 Cloudflare 公网入口已就绪；公网 Login start 生成 Google authorize endpoint、精确生产 callback、`openid email profile`、S256 PKCE、state/nonce 与 `select_account`。真实浏览器 Login、Gmail offline consent/refresh、prepare-only、发送与 revoke 仍待人工验收；旧 Google client secret 在这些验收完成前不得停用或删除。
+- 当前结果（2026-09-27）：Prod project 的两个 Web client、固定 HTTPS callbacks 和所需 scope 已配置；S1 `45bd227` 生产部署健康。真实 Owner 浏览器 Login 与 Gmail offline consent 已成功，建立一个 Active Connection。新版本的成功 callback 跳转、refresh、垃圾邮箱 prepare-only/发送/revoke 仍待人工验收；旧 Google client secret 在这些验收完成前不得停用或删除。

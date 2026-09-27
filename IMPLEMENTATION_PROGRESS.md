@@ -1,14 +1,14 @@
 # AgentMail v1 实现进度
 
-更新时间：2026-09-23
+更新时间：2026-09-27
 
 ## 当前状态
 
 - 工作分支：`feat/agentmail-v1`
 - 当前实现尚未全部完成。
-- S1 beta 在 2026-09-23 只读检查时仍运行 `agentmail:692ab15`；公网响应仍为旧的 default-deny CSP。本地已提交的 `419b89c`（CSP）与 `213a1d1`（安全 OAuth 错误分类日志）尚未体现在该运行版本。代码验证与线上验收必须分别记录。
-- Gmail scope 兼容修复：将 Google `userinfo.email/profile` 完整 URL 规范化为 OIDC 名称，保持 Gmail 双 scope 和未知权限拒绝规则。新增 scope 与同 Owner callback 回归测试；修复前已复现 `InvalidScope` 和 HTTP 400，修复后 8 项相关测试全部通过。真实 Google consent/refresh 仍待外部验收。
-- 本轮验证：`cargo fmt --check`、`git diff --check` 和严格全目标/全特性 Clippy 通过；OAuth 端点校验仅做等价布尔表达式简化以兼容当前 Clippy，7 项 Google token-client 测试通过。`umask 077` 下以 `--test-threads=2` 运行全目标/全特性测试，196 项 library、5 项 HTTP、20/21 项 REST/MCP 通过；余下限流计数测试在同一分钟内单独复跑通过。共 222 项测试均有通过记录，但全量命令没有一次性全绿，权限、负载和分钟边界敏感性仍见 `TESTING_GAPS.md`。
+- S1 现运行 `agentmail:45bd227`：部署前在线 SQLite 备份成功，Compose 容器健康且 `/health/live`、`/health/ready` 均为 200。Zen 真实浏览器中的 Owner 登录、控制台样式与脚本、重启后的 session，以及账户页均已验收。
+- 真实 Google Gmail consent 已为 Owner 创建一个 Active Connection；账户页显示 `gmail.readonly` 和 `gmail.compose`。`ea26723` 的 Google `userinfo.email/profile` scope URL 兼容修复因此获得线上验证。成功 callback 曾显示 JSON；`45bd227` 改为 303 跳转 `/control/account`，本地 callback 回归测试通过，但新版本尚未重新执行一次真实 Google callback。
+- 本轮 Windows 本地验证：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets` 一次性通过（196 library、5 HTTP、21 REST/MCP，共 222 项）。真实 refresh、垃圾邮箱 prepare/send/revoke、真实 MCP client、arm64 实机和 GitHub tag release 仍待验收；此前 Linux 测试夹具的权限/负载/分钟边界敏感性见 `TESTING_GAPS.md`。
 
 ## 已提交里程碑
 
