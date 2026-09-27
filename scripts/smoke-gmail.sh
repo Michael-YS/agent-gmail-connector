@@ -98,6 +98,10 @@ all_recipients_match_self=$(jq -r --arg self "$AGENTMAIL_SELF_ADDRESS" \
   '([.preview.to[], .preview.cc[], .preview.bcc[]] | length == 1) and
    ([.preview.to[], .preview.cc[], .preview.bcc[]][] | ascii_downcase == ($self | ascii_downcase))' \
   <<<"$BODY")
+sender_matches_self=$(jq -r --arg self "$AGENTMAIL_SELF_ADDRESS" \
+  '(.preview.from // "" | ascii_downcase) == ($self | ascii_downcase)' <<<"$BODY")
+subject_matches_run=$(jq -r --arg subject "$subject" \
+  '.preview.subject == $subject' <<<"$BODY")
 # Security boundary: message bodies (and their summaries) must never reach
 # logs or CI output. Only metadata — presence and length — is reported.
 body_len=$(jq -r '(.preview.body_summary // "") | length' <<<"$BODY")
@@ -118,6 +122,10 @@ fi
 # Hard allowlist: refuse to send to anything but the single self address.
 [[ "$all_recipients_match_self" == true ]] \
   || die 'allowlist violation: preview recipients are not exactly one configured self address'
+[[ "$sender_matches_self" == true ]] \
+  || die 'allowlist violation: preview sender is not the configured self address'
+[[ "$subject_matches_run" == true && "$attachment_count" == 0 ]] \
+  || die 'preview changed: subject or attachments differ from this smoke run'
 
 if [[ $assume_yes == false ]]; then
   [[ -t 0 ]] || die 'stdin is not a TTY; rerun with --send --yes to confirm non-interactively'
