@@ -2,9 +2,9 @@
 
 ## S1 beta 修复验收（2026-09-27）
 
-- 已补首次注册 token 页面（未部署）：任意未登记但已验证的 Google 身份可以进入该页面，没有有效同邮箱邀请不得创建用户/session；已有账号直接登录。待注册状态五分钟过期、单次提交且重启失效。格式与 diff 检查通过，用户运行全量测试及严格 Clippy 后报告 all pass；尚待部署和真实浏览器注册验收，Owner 更换与旧账号连接撤销尚未执行。
+- 已补首次注册 token 页面并部署 `agentmail:353d67d`：任意未登记但已验证的 Google 身份可以进入该页面，没有有效同邮箱邀请不得创建用户/session；已有账号直接登录。待注册状态五分钟过期、单次提交且重启失效。格式与 diff 检查通过，用户运行全量测试及严格 Clippy 后报告 all pass。新容器健康、内外网 live/ready 与公网首页 200，匿名 GET `/auth/register` 为 303 `/auth/google/login`；备份 `agentmail-20260928T043442Z.db` 的只读 `quick_check=ok`，旧镜像 `44193e1` 保留。真实浏览器注册验收、Owner 更换与旧账号连接撤销尚未执行。
 
-- S1 已部署 `agentmail:44193e1`，容器健康、容器内及公网 live/ready 均通过；部署前备份 `agentmail-20260928T005333Z.db` 的 SQLite `quick_check=ok`，旧镜像 `agentmail:88fbe8a` 保留。此前真实浏览器 Owner 登录与账户页正常。Google Gmail consent 曾创建一个属于 Owner 的 Active Connection，账户页显示 `gmail.readonly` 与 `gmail.compose`，随后已将其撤销；scope URL 兼容修复已通过真实授权验证。
+- 此前部署 `agentmail:44193e1` 时容器健康、容器内及公网 live/ready 均通过；备份 `agentmail-20260928T005333Z.db` 的 SQLite `quick_check=ok`。此前真实浏览器 Owner 登录与账户页正常。Google Gmail consent 曾创建一个属于 Owner 的 Active Connection，账户页显示 `gmail.readonly` 与 `gmail.compose`，随后已将其撤销；scope URL 兼容修复已通过真实授权验证。
 - 成功 Gmail callback 曾返回 JSON；`45bd227` 将它改为 303 跳转 `/control/account`，本地测试断言跳转和 `no-store`。新版本尚未再次通过真实 Google callback 验证跳转；不可刷新已消费的旧 callback。
 - 待执行：真实 refresh、Google 端 revoke 状态核对、撤销后重新授权 callback，以及真实 MCP client。单封垃圾邮箱自发自收、Sent/Inbox 只读核对、临时 Key 与 Connection 的本地撤销已完成；不要再次发送，也不要复制 callback URL、authorization code 或 token 到日志/文档。
 - 撤销后点击 Connect Gmail 暴露 POST→Google 307 重定向：Nginx 收到表单请求并返回 307，浏览器未到授权页。`0c5780e` 已改成 303 并补测试；用户报告全量测试和严格 Clippy 均通过，S1 构建与健康部署已完成，真实 Google callback 尚未验证。
