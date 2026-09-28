@@ -513,6 +513,7 @@ async fn rmcp_streamable_http_negotiates_and_lists_tools() {
             "drafts.delete",
             "drafts.prepare_send",
             "drafts.send",
+            "connections.list",
         ]
     );
     assert!(
@@ -527,7 +528,7 @@ async fn rmcp_streamable_http_negotiates_and_lists_tools() {
     ));
     assert_eq!(
         streamable_digest,
-        "6e6e92ee7c3b3d505976de163d175cbc8be5bc79a925581f3111382807302d31"
+        "12644e7460c424907459661d4ace862877bf3c24ef9dfd1e99ee76f8275b822b"
     );
 
     let call = build_router(state)
@@ -555,6 +556,370 @@ async fn rmcp_streamable_http_negotiates_and_lists_tools() {
         call["result"]["structuredContent"]["connection_id"],
         connection.to_string()
     );
+}
+
+#[tokio::test]
+async fn connections_list_matches_rest_in_memory_and_persistent_and_is_strict() {
+    let (memory_state, memory_credential, _) = AppState::test_fixture();
+    let rest = build_router(memory_state.clone())
+        .oneshot(
+            Request::get("/api/v1/connections")
+                .header("authorization", format!("Bearer {memory_credential}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rest.status(), StatusCode::OK);
+    let rest_json = response_json(rest).await;
+    for path in ["/mcp", "/mcp-streamable", "/mcp-compat"] {
+        let response = build_router(memory_state.clone())
+            .oneshot(
+                Request::post(path)
+                    .header("authorization", format!("Bearer {memory_credential}"))
+                    .header("host", "localhost")
+                    .header("accept", "application/json, text/event-stream")
+                    .header("content-type", "application/json")
+                    .body(mcp_request(
+                        "tools/call",
+                        77,
+                        json!({"name":"connections.list", "arguments":{}}),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let value = response_json(response).await;
+        assert_eq!(
+            rest_json["connections"], value["result"]["structuredContent"]["connections"],
+            "{path}"
+        );
+    }
+
+    let (state, credential, granted_connection) = persisted_fixture().await;
+    let repository = state.repository.as_ref().unwrap();
+    let granted_record = repository
+        .get_connection(granted_connection)
+        .await
+        .unwrap()
+        .unwrap();
+    let owner = repository
+        .get_user(granted_record.owner_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let ungranted = GmailConnection::new(
+        owner.id,
+        "ungranted-sub",
+        "ungranted@example.com",
+        vec![GMAIL_READONLY_SCOPE.into(), GMAIL_COMPOSE_SCOPE.into()],
+    )
+    .unwrap();
+    repository
+        .insert_connection(&ungranted, None)
+        .await
+        .unwrap();
+    let inactive = GmailConnection::new(
+        owner.id,
+        "inactive-sub",
+        "inactive@example.com",
+        vec![GMAIL_READONLY_SCOPE.into(), GMAIL_COMPOSE_SCOPE.into()],
+    )
+    .unwrap();
+    repository.insert_connection(&inactive, None).await.unwrap();
+    let mut inactive = inactive;
+    inactive.status = ConnectionStatus::ReauthRequired;
+    repository.update_connection(&inactive).await.unwrap();
+    let foreign_owner = User::new(
+        "foreign-sub",
+        "foreign-owner@example.com",
+        UserRole::Member,
+        chrono::Utc::now(),
+    )
+    .unwrap();
+    repository.insert_user(&foreign_owner).await.unwrap();
+    let foreign = GmailConnection::new(
+        foreign_owner.id,
+        "foreign-gmail-sub",
+        "foreign@example.com",
+        vec![GMAIL_READONLY_SCOPE.into(), GMAIL_COMPOSE_SCOPE.into()],
+    )
+    .unwrap();
+    repository.insert_connection(&foreign, None).await.unwrap();
+    let public_id = agentmail::domain::access::parse_credential(&credential)
+        .unwrap()
+        .public_id;
+    let key_id: String = sqlx::query_scalar("SELECT id FROM access_keys WHERE public_prefix=?")
+        .bind(public_id.to_string())
+        .fetch_one(state.database.as_ref().unwrap().pool())
+        .await
+        .unwrap();
+    // Simulate corrupt legacy data that bypassed same-owner grant validation.
+    sqlx::query(
+        "INSERT INTO access_key_grants (access_key_id,connection_id,created_at) VALUES (?,?,?)",
+    )
+    .bind(key_id)
+    .bind(foreign.id.to_string())
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(state.database.as_ref().unwrap().pool())
+    .await
+    .unwrap();
+    let key_id: String = sqlx::query_scalar("SELECT id FROM access_keys WHERE public_prefix=?")
+        .bind(public_id.to_string())
+        .fetch_one(state.database.as_ref().unwrap().pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO access_key_grants (access_key_id,connection_id,created_at) VALUES (?,?,?)",
+    )
+    .bind(key_id)
+    .bind(inactive.id.to_string())
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(state.database.as_ref().unwrap().pool())
+    .await
+    .unwrap();
+    let rest = build_router(state.clone())
+        .oneshot(
+            Request::get("/api/v1/connections")
+                .header("authorization", format!("Bearer {credential}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rest.status(), StatusCode::OK);
+    let rest_json = response_json(rest).await;
+    assert_eq!(rest_json["connections"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        rest_json["connections"][0]["connection_id"],
+        granted_connection.to_string()
+    );
+    let fields: Vec<&str> = rest_json["connections"][0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        fields,
+        vec!["connection_id", "email", "granted_scopes", "status"]
+    );
+    let mcp = build_router(state.clone())
+        .oneshot(
+            Request::post("/mcp-compat")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(mcp_request(
+                    "tools/call",
+                    78,
+                    json!({"name":"connections.list", "arguments":{}}),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mcp.status(), StatusCode::OK);
+    let mcp_json = response_json(mcp).await;
+    assert_eq!(
+        rest_json["connections"],
+        mcp_json["result"]["structuredContent"]["connections"]
+    );
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_events WHERE operation='connections.list' AND connection_id IS NULL",
+    )
+    .fetch_one(state.database.as_ref().unwrap().pool())
+    .await
+    .unwrap();
+    assert_eq!(audit_count, 1, "MCP emits one metadata-only list audit");
+
+    let omitted_arguments = build_router(state.clone())
+        .oneshot(
+            Request::post("/mcp-compat")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(mcp_request(
+                    "tools/call",
+                    83,
+                    json!({"name":"connections.list"}),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(omitted_arguments.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(omitted_arguments).await["result"]["structuredContent"]["connections"],
+        rest_json["connections"]
+    );
+
+    let malicious_target = build_router(state.clone())
+        .oneshot(
+            Request::post("/mcp-compat")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(mcp_request(
+                    "tools/call",
+                    84,
+                    json!({"name":"connections.list", "arguments":{"connection_id":granted_connection}}),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response_json(malicious_target).await["error"]["code"],
+        -32602
+    );
+    let targeted_audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_events WHERE operation='connections.list' AND connection_id IS NOT NULL",
+    )
+    .fetch_one(state.database.as_ref().unwrap().pool())
+    .await
+    .unwrap();
+    assert_eq!(targeted_audits, 0);
+    let invalid_call_audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_events WHERE operation='connections.list' AND result_category='error' AND connection_id IS NULL",
+    )
+    .fetch_one(state.database.as_ref().unwrap().pool())
+    .await
+    .unwrap();
+    assert_eq!(invalid_call_audits, 1);
+
+    for arguments in [json!({"extra":true}), Value::Null, json!([])] {
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::post("/mcp-compat")
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("content-type", "application/json")
+                    .body(mcp_request(
+                        "tools/call",
+                        79,
+                        json!({"name":"connections.list", "arguments":arguments}),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["error"]["code"], -32602);
+    }
+
+    let denied = build_router(state)
+        .oneshot(
+            Request::post("/mcp-compat")
+                .header("content-type", "application/json")
+                .body(mcp_request(
+                    "tools/call",
+                    80,
+                    json!({"name":"connections.list", "arguments":{}}),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn connections_list_charges_api_quota_once_on_each_mcp_route() {
+    for path in ["/mcp", "/mcp-streamable", "/mcp-compat"] {
+        let (state, credential, _) = persisted_fixture().await;
+        let public_id = agentmail::domain::access::parse_credential(&credential)
+            .unwrap()
+            .public_id;
+        let key_id: String = sqlx::query_scalar("SELECT id FROM access_keys WHERE public_prefix=?")
+            .bind(public_id.to_string())
+            .fetch_one(state.database.as_ref().unwrap().pool())
+            .await
+            .unwrap();
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::post(path)
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("host", "localhost")
+                    .header("accept", "application/json, text/event-stream")
+                    .header("content-type", "application/json")
+                    .body(mcp_request(
+                        "tools/call",
+                        85,
+                        json!({"name":"connections.list", "arguments":{}}),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let bucket_key = format!("api_per_minute:{key_id}");
+        let request_count: i64 =
+            sqlx::query_scalar("SELECT request_count FROM rate_limit_buckets WHERE bucket_key=?")
+                .bind(bucket_key)
+                .fetch_one(state.database.as_ref().unwrap().pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            request_count, 1,
+            "{path} charges the authenticated list once"
+        );
+    }
+}
+
+#[tokio::test]
+async fn connections_list_returns_empty_for_ungranted_key_and_rejects_revoked_key() {
+    let (state, credential, connection) = persisted_fixture().await;
+    let repository = state.repository.as_ref().unwrap();
+    let connection_record = repository
+        .get_connection(connection)
+        .await
+        .unwrap()
+        .unwrap();
+    let ungranted = AccessKey::generate(connection_record.owner_id, "no-grants", []).unwrap();
+    let ungranted_credential = ungranted.credential.clone();
+    repository.insert_access_key(&ungranted).await.unwrap();
+    let empty = build_router(state.clone())
+        .oneshot(
+            Request::post("/mcp-compat")
+                .header("authorization", format!("Bearer {ungranted_credential}"))
+                .header("content-type", "application/json")
+                .body(mcp_request(
+                    "tools/call",
+                    81,
+                    json!({"name":"connections.list", "arguments":{}}),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(empty).await["result"]["structuredContent"]["connections"],
+        json!([])
+    );
+
+    let public_id = agentmail::domain::access::parse_credential(&credential)
+        .unwrap()
+        .public_id;
+    let changed = sqlx::query("UPDATE access_keys SET status='revoked' WHERE public_prefix=?")
+        .bind(public_id.to_string())
+        .execute(state.database.as_ref().unwrap().pool())
+        .await
+        .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+    let revoked = build_router(state)
+        .oneshot(
+            Request::post("/mcp-compat")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(mcp_request(
+                    "tools/call",
+                    82,
+                    json!({"name":"connections.list", "arguments":{}}),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -945,7 +1310,7 @@ async fn mcp_tools_schema_snapshot_is_stable() {
     ));
     assert_eq!(
         digest,
-        "6e6e92ee7c3b3d505976de163d175cbc8be5bc79a925581f3111382807302d31"
+        "12644e7460c424907459661d4ace862877bf3c24ef9dfd1e99ee76f8275b822b"
     );
 }
 

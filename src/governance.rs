@@ -200,6 +200,8 @@ pub enum AuditOperation {
     ConnectionCreate,
     #[serde(rename = "connection.revoke")]
     ConnectionRevoke,
+    #[serde(rename = "connections.list")]
+    ConnectionsList,
     #[serde(rename = "connection.reauthorize")]
     ConnectionReauthorize,
     #[serde(rename = "account.revoke")]
@@ -243,6 +245,7 @@ impl AuditOperation {
             Self::DraftSend => "draft.send",
             Self::ConnectionCreate => "connection.create",
             Self::ConnectionRevoke => "connection.revoke",
+            Self::ConnectionsList => "connections.list",
             Self::ConnectionReauthorize => "connection.reauthorize",
             Self::AccountRevoke => "account.revoke",
             Self::AccessKeyCreate => "access_key.create",
