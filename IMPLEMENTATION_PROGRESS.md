@@ -6,13 +6,13 @@
 
 - 工作分支：`feat/agentmail-v1`
 - 当前实现尚未全部完成。
-- S1 现运行 `agentmail:88fbe8a`：部署前在线 SQLite 备份位于 `/var/backups/agentmail/agentmail-20260927T220545Z.db`（只读 `quick_check=ok`），Compose 容器健康、仍只绑定 `127.0.0.1:18080`，容器内及公网 `/health/live`、`/health/ready` 均通过。旧镜像 `agentmail:0c5780e` 保留可回退。此前真实浏览器 Owner 登录与账户页可用；本次登录错误映射修复尚待真实浏览器回归。
+- S1 现运行 `agentmail:44193e1`：部署前在线 SQLite 备份位于 `/var/backups/agentmail/agentmail-20260928T005333Z.db`（只读 `quick_check=ok`），Compose 容器健康、仍只绑定 `127.0.0.1:18080`，容器内及公网 `/health/live`、`/health/ready` 均通过。旧镜像 `agentmail:88fbe8a` 保留可回退。此前真实浏览器 Owner 登录与账户页可用；登录错误映射修复尚待真实浏览器回归。
 - 真实 Google Gmail consent 曾为 Owner 创建一个 Active Connection，账户页显示 `gmail.readonly` 和 `gmail.compose`，随后该测试 Connection 已撤销。`ea26723` 的 Google `userinfo.email/profile` scope URL 兼容修复因此获得线上验证。成功 Gmail callback 曾显示 JSON；`45bd227` 改为 303 跳转 `/control/account`，本地 callback 回归测试通过，但新版本尚未重新执行一次真实 Gmail callback。
 - 本轮 Windows 本地验证：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets` 已通过；最新 `654b49d` 的全量门禁由用户运行并报告全 pass。限流测试曾在固定分钟边界偶发失败，已改为有界重试并通过全量复跑。真实 refresh、revoke、真实 MCP client、arm64 实机和 GitHub tag release 仍待验收。
 - 首次真实垃圾邮箱 smoke 在 `drafts.create` 后，`prepare-send` 安全地返回 `409 draft_changed`，未发送；旧失配草稿不自动认领或删除。`b68101d` 修正 Gmail 实际 Message-ID 持久化，`654b49d` 修正服务重启后 `prepare-send` 的 sender preview。随后只对新 managed draft 执行一次自发自收：`drafts.send` 返回 HTTP 200、`Sent`、`replayed=false`；只读 SQLite 核对其状态为 `sent` 且有一条持久化发送结果。`scripts/verify-self-send.sh` 用同一 Gmail message ID 只读搜索，Sent 与 Inbox 均返回 HTTP 200、`message_present=true`。控制台随后显示临时 Access Key 为 `Revoked`、Connection 列表为空，并提示本地凭证已移除；HTML 入口不呈现 Google 端 revoke 的确认状态。不要重复发送。
 - 撤销后重新连接 Gmail 暴露出 OAuth start 的 POST→Google 307 重定向；Nginx 确认表单 POST 到达并返回 307，但浏览器未到授权页。`0c5780e` 已把该重定向改为 303，并收紧 POST 入口回归断言；用户运行 `cargo test --all-targets` 与严格 Clippy 后报告全部通过，S1 构建与健康部署已完成，真实 Gmail callback 仍待验收。
 - 另一 Google 账号尝试普通 Panel 登录时，Login callback 错把“未获准的身份”映射为 HTTP 503。S1 只登记测试邮箱 Owner、没有该账号的 Member；失败的 Login 事务已消费，不能刷新重放。`88fbe8a` 让未登记身份得到通用 HTTP 403 `authentication_failed`，并断言不会新增用户或 session；用户报告全量测试和严格 Clippy 均通过，S1 已健康部署，真实浏览器回归仍待执行。是否邀请该账号需 Owner 单独决定。
-- 登录前公开首页此前没有 CSS；当前工作区已补内联响应式明暗样式，保留原有登录与法律链接及 CSP 安全边界。验证期间暴露的 MCP 计数测试分钟边界误失败已用窗口感知断言修正，生产限流不变。用户复跑全量测试与严格 Clippy 后报告全 pass；首页样式尚待构建部署和浏览器视觉验收。
+- 登录前公开首页此前没有 CSS；`44193e1` 补内联响应式明暗样式，保留原有登录与法律链接及 CSP 安全边界。验证期间暴露的 MCP 计数测试分钟边界误失败已用窗口感知断言修正，生产限流不变。用户复跑全量测试与严格 Clippy 后报告全 pass，S1 已健康部署；公网首页含新样式，浏览器刷新后的窄屏深色视图已核对标题、登录按钮和法律链接，无明显溢出，未点击登录。
 
 ## 已提交里程碑
 
