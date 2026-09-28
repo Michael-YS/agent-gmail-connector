@@ -185,6 +185,7 @@ REST 错误格式通常为 `{"error":{"code":"...","message":"...","request_id":
 | --- | --- |
 | 401 / invalid key | 停止，请用户检查 key 是否过期、轮换或撤销；不向聊天索取 key |
 | 403 `forbidden` | 权限/owner/grant/状态不满足；不枚举其他 ID，不自行扩大授权 |
+| MCP 403 `Host header is not allowed` | 实例的 MCP Host 白名单与入口域名不匹配；请管理员核对 `PUBLIC_BASE_URL` 和代理 Host 转发。不要伪造 Host、关闭 Host 校验或切换到旧式 SSE 绕过 |
 | 403 `reauth_required` | 请人类在 Panel 重新授权 Gmail；agent 不接管 OAuth callback |
 | 409 `draft_changed` / conflict | 重新只读核对当前草稿；内容变化必须重新确认，不强行覆盖 |
 | `invalid_confirmation` | Token 无效、过期或绑定已改变；先核对是否已有发送记录，不直接重发 |

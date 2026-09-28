@@ -2,6 +2,8 @@
 
 ## S1 beta 修复验收（2026-09-27）
 
+- Hermes 首次真实 MCP 连接被 rmcp 默认 Host 白名单拒绝（403），非 SSE transport 选错：线上 Nginx 的固定公网 Host 未包含在默认 loopback 名单中。已补生产 `PUBLIC_BASE_URL` authority 接线与公网域名正向/未知 Host 负向回归（未部署），保留 loopback 默认、Bearer 鉴权及非默认端口/IPv6 语义；格式与 diff 检查通过，用户运行全量测试与严格 Clippy 后报告全过，尚待部署及真实 Hermes initialize/tools/list。不要为此关闭 Host 校验或让客户端伪造 Host。
+
 - 已补首次注册 token 页面并部署 `agentmail:353d67d`：任意未登记但已验证的 Google 身份可以进入该页面，没有有效同邮箱邀请不得创建用户/session；已有账号直接登录。待注册状态五分钟过期、单次提交且重启失效。格式与 diff 检查通过，用户运行全量测试及严格 Clippy 后报告 all pass。新容器健康、内外网 live/ready 与公网首页 200，匿名 GET `/auth/register` 为 303 `/auth/google/login`；备份 `agentmail-20260928T043442Z.db` 的只读 `quick_check=ok`，旧镜像 `44193e1` 保留。用户完成真实浏览器邀请注册，数据库确认 Active Member、Google 绑定和有效 session。
 - Owner 更换与旧账号本地退出已完成：操作前备份 `agentmail-20260928T054101Z.db` 的只读 `quick_check=ok`；内存副本演练和停服事务保留目标身份/session，原 Owner 的一条已消费邀请需先清理以免 `invited_by` 外键阻塞账号删除。启动恢复走现有 token revoke/本地清理流程；核对仅一个目标 Active Owner，旧账号、两个 Connection、Key 与旧邀请均移除，目标 session 保留、外键零问题，容器 healthy/零 restart、内外网健康 200。`OWNER_EMAIL` 已同步新 Owner。仍待新 Owner 页面刷新验收、Google 端撤销结果独立核验；没有删除 Gmail 邮件或草稿，本地备份不能回滚 Google 端 revoke。
 

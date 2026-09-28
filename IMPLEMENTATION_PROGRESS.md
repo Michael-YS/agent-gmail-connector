@@ -5,6 +5,7 @@
 ## 当前状态
 
 - 工作分支：`feat/agentmail-v1`
+- 本轮已补 Hermes 公网 MCP 连接的 `403 Host header is not allowed` 修复（未部署）：线上 rmcp 使用默认 loopback 白名单，而 Nginx 正确转发公网域名。生产启动显式传入已验证 `PUBLIC_BASE_URL` 的 authority（保留 IPv6 括号和非默认端口），保留本机白名单、Bearer 鉴权与未知 Host 拒绝，不从请求 Host/Forwarded 推导信任配置。原路由构造入口仍保留 loopback 默认行为；无 schema 变更。已补公网域名 initialize/tools/list、别名、本机、缺失鉴权、Forwarded 伪造和非默认端口回归；格式与 diff 检查通过，用户运行全量测试与严格 Clippy 后报告全过。尚待部署和真实 Hermes 验收，生产仍为 `353d67d`。
 - 本轮已补首次注册的浏览器入口并部署 `353d67d`：未登记 Google 身份认证后只进入邀请 token 页面；有效同邮箱、单次使用邀请才创建 Member 和 session，已有账号仍直接登录。待注册状态仅在服务端内存保存，五分钟过期、单次提交且重启失效；无新 schema。格式与 diff 检查通过，用户运行全量测试及严格 Clippy 后报告 all pass。用户随后完成真实浏览器邀请注册，只读核对目标成为 Google-bound Active Member 且有有效 session；新 Owner 权限页面仍待用户刷新验收。
 - Owner 更换及旧账号退出已完成：先在数据库内存副本演练，确认目标身份/session 与外键不受损；操作前在线备份 `/var/backups/agentmail/agentmail-20260928T054101Z.db` 的只读 `quick_check=ok`。短暂停服后原子将原 Owner 改为 revoking Member、将已验证目标提升为唯一 Active Owner，保留目标 ID/Google 绑定/session，并更新生产 `OWNER_EMAIL`。旧 Owner 的一条已消费邀请因 `invited_by` 限制外键需同步清理，未改写邀请发行者；恢复启动复用现有凭证撤销流程。只读验收：仅一个 Active Owner、目标 session 保留，旧账号及原有两个 Connection、本地凭证、一个已撤销 Key 和邀请均移除，外键零问题、容器 healthy 且零 restart，内外网 live/ready 与首页 200。没有删除 Gmail 邮件或草稿；Google 端 token revoke 的最终结果未独立核验，数据库备份也不能撤销已完成的 Google 端 revoke。
 - 当前实现尚未全部完成。

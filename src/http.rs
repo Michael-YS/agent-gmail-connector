@@ -4363,7 +4363,15 @@ async fn request_context(mut req: Request<axum::body::Body>, next: Next) -> Resp
     response
 }
 pub fn router(state: AppState) -> Router {
-    let streamable_router = crate::mcp_rmcp::streamable_router(state.clone());
+    router_with_public_base_url(state, None)
+}
+
+pub(crate) fn router_with_public_base_url(
+    state: AppState,
+    public_base_url: Option<&url::Url>,
+) -> Router {
+    let streamable_router =
+        crate::mcp_rmcp::streamable_router_with_public_base_url(state.clone(), public_base_url);
     Router::new()
         .route("/", get(landing))
         .route("/privacy", get(privacy))
@@ -4502,7 +4510,9 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 .layer(middleware::from_fn(request_context));
             let control_ui_router = crate::control_ui::router(control_state)
                 .layer(middleware::from_fn(request_context));
-            let app = router(state).merge(control_router).merge(control_ui_router);
+            let app = router_with_public_base_url(state, Some(&config.public_base_url))
+                .merge(control_router)
+                .merge(control_ui_router);
             let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".into());
             let port = std::env::var("PORT")
                 .ok()
