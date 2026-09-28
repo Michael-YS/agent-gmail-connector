@@ -6,6 +6,7 @@
 {% if flash_token_is_some %}
 <div class="flash {{ flash_css_class }}"><p>{{ flash_label }} new invitation token: <code>{{ flash_token }}</code></p>
 <p class="muted">This token is shown only once. Closing or refreshing this page removes it.</p>
+<p>Give the token to the invitee through a secure channel. They should sign in with Google at this instance, then enter the token on the invitation page. AgentMail does not send an invitation email automatically.</p>
 </div>
 {% else %}
 <div class="flash {{ flash_css_class }}"><p>{{ flash_message }}</p></div>

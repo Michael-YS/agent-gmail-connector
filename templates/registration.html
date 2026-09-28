@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Invitation required · AgentMail{% endblock %}
+{% block content %}
+{% if has_error %}
+<h1>Registration not completed</h1>
+<section class="card">
+<p>The invitation could not be accepted, or this sign-in attempt has expired. No account was created by this attempt.</p>
+<p>Ask your administrator for a valid invitation for your Google account, then sign in again.</p>
+<a class="button" href="/auth/google/login">Sign in again</a>
+</section>
+{% else %}
+<h1>Invitation required</h1>
+<section class="card" aria-labelledby="invitation-heading">
+<h2 id="invitation-heading">Finish creating your account</h2>
+<p>Google has verified <strong>{{ verified_email }}</strong>. You are not yet signed in to AgentMail.</p>
+<p>Enter the invitation token issued for this email address. Without a valid invitation, you cannot create an account or open the Panel.</p>
+<form method="post" action="/auth/register" autocomplete="off">
+<input type="hidden" name="_csrf" value="{{ csrf }}">
+<label class="field" for="invitation-token">Invitation token</label>
+<input id="invitation-token" type="password" name="token" required maxlength="128" autocomplete="off" autocapitalize="none" spellcheck="false">
+<p><button type="submit">Accept invitation</button></p>
+</form>
+<p class="muted">This step expires after five minutes. The token is used once and must match this Google account. Creating an AgentMail account does not connect or grant access to Gmail.</p>
+<p><a href="/auth/google/login">Use another Google account</a></p>
+</section>
+{% endif %}
+{% endblock %}

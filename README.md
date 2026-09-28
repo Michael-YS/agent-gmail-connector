@@ -27,6 +27,8 @@ agentmail serve
 
 ## Google Cloud 准备
 
+Panel 首次注册流程：未登记账号先完成 Google 身份认证，再在 `/auth/register` 输入 Owner 为该邮箱生成的邀请 token；只有有效、未过期且未使用的同邮箱邀请才创建 Member 和 session。Owner 创建邀请后需安全转交 token，系统不自动发送邀请邮件。待注册页面不是 Panel 登录成功，不赋予 Gmail 权限；短时状态过期或服务重启后需重新 Google 登录。已有 Owner/Member 登录不再要求邀请 token，首次 Owner bootstrap 仍由 `OWNER_EMAIL` 限定。
+
 最终 v1 需要两个 Google Cloud Project（Dev Testing、Prod In Production），每个项目建立两个 Web OAuth Client：
 
 - Login Client：`openid email profile`，回调 `https://agentmail.michaelsun.top/auth/google/callback`。

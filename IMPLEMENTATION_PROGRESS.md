@@ -1,10 +1,11 @@
 # AgentMail v1 实现进度
 
-更新时间：2026-09-27
+更新时间：2026-09-28
 
 ## 当前状态
 
 - 工作分支：`feat/agentmail-v1`
+- 本轮已补首次注册的浏览器入口（尚待部署）：未登记 Google 身份认证后只进入邀请 token 页面；有效同邮箱、单次使用邀请才创建 Member 和 session，已有账号仍直接登录。待注册状态仅在服务端内存保存，五分钟过期、单次提交且重启失效；无新 schema。格式与 diff 检查通过，用户运行全量测试及严格 Clippy 后报告 all pass。Owner 更换及旧账号/连接撤销尚未执行。
 - 当前实现尚未全部完成。
 - S1 现运行 `agentmail:44193e1`：部署前在线 SQLite 备份位于 `/var/backups/agentmail/agentmail-20260928T005333Z.db`（只读 `quick_check=ok`），Compose 容器健康、仍只绑定 `127.0.0.1:18080`，容器内及公网 `/health/live`、`/health/ready` 均通过。旧镜像 `agentmail:88fbe8a` 保留可回退。此前真实浏览器 Owner 登录与账户页可用；登录错误映射修复尚待真实浏览器回归。
 - 真实 Google Gmail consent 曾为 Owner 创建一个 Active Connection，账户页显示 `gmail.readonly` 和 `gmail.compose`，随后该测试 Connection 已撤销。`ea26723` 的 Google `userinfo.email/profile` scope URL 兼容修复因此获得线上验证。成功 Gmail callback 曾显示 JSON；`45bd227` 改为 303 跳转 `/control/account`，本地 callback 回归测试通过，但新版本尚未重新执行一次真实 Gmail callback。

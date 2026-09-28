@@ -5,10 +5,11 @@
 //! then nests [`router`] under its public router. Request `Host` and forwarded
 //! headers are never used to construct OAuth URLs.
 
+use askama::Template;
 use async_trait::async_trait;
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Form, Path, Query, State},
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
@@ -19,7 +20,11 @@ use chrono::{DateTime, Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::json;
-use std::{fmt, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, Mutex},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -48,8 +53,13 @@ use crate::{
 
 const LOGIN_TRANSACTION_COOKIE: &str = "__Host-agentmail_login_tx";
 const GMAIL_TRANSACTION_COOKIE: &str = "__Host-agentmail_gmail_tx";
+const REGISTRATION_COOKIE: &str = "__Host-agentmail_registration";
+const REGISTRATION_CSRF_COOKIE: &str = "__Host-agentmail_registration_csrf";
 const OAUTH_TRANSACTION_MAX_AGE: i64 = 600;
 const MAX_OAUTH_QUERY_VALUE_BYTES: usize = 4096;
+const PENDING_REGISTRATION_MAX_AGE: i64 = 300;
+const PENDING_REGISTRATION_CAPACITY: usize = 1024;
+const MAX_REGISTRATION_FORM_BYTES: usize = 4096;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ControlHttpError {
@@ -129,6 +139,7 @@ where
     pub oidc_verifier: Arc<V>,
     pub login_token_exchanger: Arc<E>,
     pub gmail_token_exchanger: Arc<E>,
+    pending_registrations: Arc<Mutex<HashMap<String, PendingRegistration>>>,
 }
 
 impl<V, E> Clone for ControlHttpState<V, E>
@@ -144,6 +155,7 @@ where
             oidc_verifier: Arc::clone(&self.oidc_verifier),
             login_token_exchanger: Arc::clone(&self.login_token_exchanger),
             gmail_token_exchanger: Arc::clone(&self.gmail_token_exchanger),
+            pending_registrations: Arc::clone(&self.pending_registrations),
         }
     }
 }
@@ -161,6 +173,7 @@ where
             .field("oidc_verifier", &"[adapter]")
             .field("login_token_exchanger", &"[adapter]")
             .field("gmail_token_exchanger", &"[adapter]")
+            .field("pending_registrations", &"[redacted]")
             .finish()
     }
 }
@@ -185,6 +198,7 @@ where
             oidc_verifier: Arc::new(oidc_verifier),
             login_token_exchanger: Arc::new(login_token_exchanger),
             gmail_token_exchanger: Arc::new(gmail_token_exchanger),
+            pending_registrations: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -194,6 +208,45 @@ pub struct SessionContext {
     pub user_id: UserId,
     pub token_hash: String,
     pub csrf_token_hash: String,
+}
+
+#[derive(Clone)]
+struct PendingRegistration {
+    identity: ValidatedOidcIdentity,
+    csrf_hash: String,
+    expires_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for PendingRegistration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingRegistration")
+            .field("identity", &"[redacted]")
+            .field("csrf_hash", &"[redacted]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+#[derive(Template)]
+#[template(path = "registration.html")]
+struct RegistrationTemplate<'a> {
+    show_dashboard: bool,
+    show_invitations: bool,
+    show_members: bool,
+    show_capacity: bool,
+    session_email_is_some: bool,
+    session_email: &'a str,
+    verified_email: &'a str,
+    csrf: &'a str,
+    has_error: bool,
+}
+
+#[derive(Deserialize)]
+struct RegistrationForm {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    _csrf: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,6 +272,14 @@ where
         .route(
             "/auth/invitations/accept",
             post(invitation_accept_start::<V, E>),
+        )
+        .route(
+            "/auth/register",
+            get(registration_page::<V, E>)
+                .post(registration_submit::<V, E>)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    MAX_REGISTRATION_FORM_BYTES,
+                )),
         )
         .route(LOGIN_CALLBACK_PATH, get(login_callback::<V, E>))
         .route(GMAIL_CALLBACK_PATH, get(gmail_callback::<V, E>))
@@ -318,6 +379,8 @@ fn control_audit_operation(method: &axum::http::Method, path: &str) -> Option<Au
 
     match (method, path) {
         (&Method::GET, "/auth/google/login") => Some(AuditOperation::AuthLogin),
+        (&Method::GET, "/auth/register") => Some(AuditOperation::AuthLogin),
+        (&Method::POST, "/auth/register") => Some(AuditOperation::InvitationAccept),
         (&Method::POST, "/auth/invitations/accept") => Some(AuditOperation::InvitationAccept),
         (&Method::GET, LOGIN_CALLBACK_PATH) => Some(AuditOperation::AuthLogin),
         (&Method::GET, GMAIL_CALLBACK_PATH) | (&Method::POST, "/auth/google/gmail") => {
@@ -957,6 +1020,203 @@ where
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+async fn registration_page<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    headers: HeaderMap,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let Some(handle) = cookie_value(&headers, REGISTRATION_COOKIE) else {
+        return Redirect::to("/auth/google/login").into_response();
+    };
+    let Some(csrf) = cookie_value(&headers, REGISTRATION_CSRF_COOKIE) else {
+        return Redirect::to("/auth/google/login").into_response();
+    };
+    let Ok(pending) = state.pending_registrations.lock() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(record) = pending.get(&hash_token(handle)) else {
+        return Redirect::to("/auth/google/login").into_response();
+    };
+    if record.expires_at <= Utc::now() || !verify_token(csrf, &record.csrf_hash).unwrap_or(false) {
+        return Redirect::to("/auth/google/login").into_response();
+    }
+    render_registration_page(&record.identity.email, csrf, false)
+}
+
+async fn registration_submit<V, E>(
+    State(state): State<ControlHttpState<V, E>>,
+    headers: HeaderMap,
+    Form(form): Form<RegistrationForm>,
+) -> Response
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let Some(handle) = cookie_value(&headers, REGISTRATION_COOKIE) else {
+        return registration_failure();
+    };
+    let Some(csrf_cookie) = cookie_value(&headers, REGISTRATION_CSRF_COOKIE) else {
+        return registration_failure();
+    };
+    let pending_key = hash_token(handle);
+    let pending_record = {
+        let Ok(mut pending) = state.pending_registrations.lock() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let Some(record) = pending.get(&pending_key) else {
+            return registration_failure();
+        };
+        if record.expires_at <= Utc::now() {
+            return registration_failure();
+        }
+        if !verify_token(csrf_cookie, &record.csrf_hash).unwrap_or(false)
+            || !verify_token(&form._csrf, &record.csrf_hash).unwrap_or(false)
+        {
+            return registration_csrf_failure();
+        }
+        pending.remove(&pending_key)
+    };
+    let Some(record) = pending_record else {
+        return registration_failure();
+    };
+    if record.expires_at <= Utc::now() {
+        return registration_failure();
+    }
+    let token_is_well_formed = URL_SAFE_NO_PAD
+        .decode(form.token.as_bytes())
+        .is_ok_and(|token| token.len() == 32);
+    if !token_is_well_formed {
+        return registration_failure();
+    }
+    match state
+        .control_plane
+        .accept_invitation_session(&hash_token(&form.token), &record.identity, Utc::now())
+        .await
+    {
+        Ok(credentials) => {
+            let location = match credentials.user.role {
+                UserRole::Owner => "/control",
+                UserRole::Member => "/control/account",
+            };
+            let mut response = Redirect::to(location).into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response.headers_mut().append(
+                header::SET_COOKIE,
+                HeaderValue::from_str(&crate::control_ui::csrf_cookie_value(
+                    &credentials.csrf_token,
+                ))
+                .expect("cookie value"),
+            );
+            response.headers_mut().append(
+                header::SET_COOKIE,
+                HeaderValue::from_str(&session_cookie(
+                    &credentials.cookie,
+                    &credentials.session_token,
+                ))
+                .expect("cookie value"),
+            );
+            clear_registration_cookies(&mut response);
+            response
+        }
+        Err(_) => registration_failure(),
+    }
+}
+
+fn render_registration_page(email: &str, csrf: &str, has_error: bool) -> Response {
+    let template = RegistrationTemplate {
+        show_dashboard: false,
+        show_invitations: false,
+        show_members: false,
+        show_capacity: false,
+        session_email_is_some: false,
+        session_email: "",
+        verified_email: email,
+        csrf,
+        has_error,
+    };
+    match template.render() {
+        Ok(body) => {
+            let mut response =
+                (StatusCode::OK, [(header::CACHE_CONTROL, "no-store")], body).into_response();
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            response
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+fn registration_failure() -> Response {
+    let mut response = render_registration_page("", "", true);
+    if response.status() == StatusCode::OK {
+        *response.status_mut() = StatusCode::FORBIDDEN;
+    }
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    clear_registration_cookies(&mut response);
+    response
+}
+
+fn registration_csrf_failure() -> Response {
+    let mut response = render_registration_page("", "", true);
+    if response.status() == StatusCode::OK {
+        *response.status_mut() = StatusCode::FORBIDDEN;
+    }
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn clear_registration_cookies(response: &mut Response) {
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear_cookie(REGISTRATION_COOKIE)).expect("cookie value"),
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear_cookie(REGISTRATION_CSRF_COOKIE)).expect("cookie value"),
+    );
+}
+
+fn issue_pending_registration<V, E>(
+    state: &ControlHttpState<V, E>,
+    identity: ValidatedOidcIdentity,
+    now: DateTime<Utc>,
+) -> Result<(String, String), ControlHttpError>
+where
+    V: OidcTokenVerifier,
+    E: OAuthCodeExchanger,
+{
+    let handle = crate::domain::access::random_secret();
+    let csrf = crate::domain::access::random_secret();
+    let mut pending = state
+        .pending_registrations
+        .lock()
+        .map_err(|_| ControlHttpError::InvalidRequest)?;
+    pending.retain(|_, record| record.expires_at > now);
+    if pending.len() >= PENDING_REGISTRATION_CAPACITY {
+        return Err(ControlHttpError::InvalidRequest);
+    }
+    pending.insert(
+        hash_token(&handle),
+        PendingRegistration {
+            identity,
+            csrf_hash: hash_token(&csrf),
+            expires_at: now + Duration::seconds(PENDING_REGISTRATION_MAX_AGE),
+        },
+    );
+    Ok((handle, csrf))
 }
 
 pub async fn login_start<V, E>(State(state): State<ControlHttpState<V, E>>) -> Response
@@ -1813,7 +2073,38 @@ where
             .accept_invitation_session(&invitation_token_hash, &identity, now)
             .await?
     } else {
-        state.control_plane.login_session(&identity, now).await?
+        match state.control_plane.login_session(&identity, now).await {
+            Ok(credentials) => credentials,
+            Err(ControlPlaneError::IdentityNotAllowed) => {
+                let (handle, csrf) = issue_pending_registration(state, identity, now)?;
+                let mut response = Redirect::to("/auth/register").into_response();
+                response
+                    .headers_mut()
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                response.headers_mut().append(
+                    header::SET_COOKIE,
+                    HeaderValue::from_str(&registration_cookie(REGISTRATION_COOKIE, &handle))
+                        .expect("cookie value"),
+                );
+                response.headers_mut().append(
+                    header::SET_COOKIE,
+                    HeaderValue::from_str(&registration_cookie(REGISTRATION_CSRF_COOKIE, &csrf))
+                        .expect("cookie value"),
+                );
+                response.headers_mut().append(
+                    header::SET_COOKIE,
+                    HeaderValue::from_str(&clear_cookie(SessionCookiePolicy::default().name))
+                        .expect("cookie value"),
+                );
+                response.headers_mut().append(
+                    header::SET_COOKIE,
+                    HeaderValue::from_str(&clear_cookie(crate::control_ui::CSRF_COOKIE))
+                        .expect("cookie value"),
+                );
+                return Ok((response, None));
+            }
+            Err(error) => return Err(error.into()),
+        }
     };
     let location = match credentials.user.role {
         UserRole::Owner => "/control",
@@ -2026,6 +2317,12 @@ pub(crate) fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a
 fn oauth_transaction_cookie(name: &str, id: Uuid) -> String {
     format!(
         "{name}={id}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={OAUTH_TRANSACTION_MAX_AGE}"
+    )
+}
+
+fn registration_cookie(name: &str, token: &str) -> String {
+    format!(
+        "{name}={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={PENDING_REGISTRATION_MAX_AGE}"
     )
 }
 
@@ -3963,23 +4260,53 @@ mod tests {
             now,
         )
         .await;
-        assert!(matches!(
-            uninvited,
-            Err(ControlHttpError::ControlPlane(
-                ControlPlaneError::IdentityNotAllowed
-            ))
-        ));
-        let denied = error_response(ControlHttpError::ControlPlane(
-            ControlPlaneError::IdentityNotAllowed,
-        ));
-        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
-        let denied_body = axum::body::to_bytes(denied.into_body(), usize::MAX)
+        let (pending_response, no_session_cookie) = uninvited.unwrap();
+        assert_eq!(pending_response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            pending_response.headers()[header::LOCATION],
+            "/auth/register"
+        );
+        assert!(no_session_cookie.is_none());
+        let set_cookies: Vec<_> = pending_response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        assert!(
+            set_cookies
+                .iter()
+                .any(|value| value.starts_with("__Host-agentmail_registration="))
+        );
+        assert!(
+            set_cookies
+                .iter()
+                .any(|value| value.starts_with("__Host-agentmail_registration_csrf="))
+        );
+        assert!(
+            set_cookies
+                .iter()
+                .any(|value| value.starts_with("__Host-agentmail_session=;"))
+        );
+        assert!(
+            set_cookies
+                .iter()
+                .any(|value| value.starts_with("__Host-agentmail_csrf=;"))
+        );
+        assert!(
+            set_cookies
+                .iter()
+                .all(|value| !value.contains("uninvited@example.com"))
+        );
+        let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(repository.pool())
             .await
             .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&denied_body).unwrap()["error"],
-            "authentication_failed"
-        );
+        let session_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!((user_count, session_count), (2, 2));
 
         let invitation_token = "callback-invitation-token";
         repository
@@ -4026,6 +4353,329 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((members, sessions), (2, 3));
+    }
+
+    #[tokio::test]
+    async fn registration_requires_pending_identity_csrf_and_matching_single_use_invitation() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        database.migrate().await.unwrap();
+        let repository = Repository::new(&database);
+        let now = Utc::now();
+        let owner = User::new("owner-sub", "owner@example.com", UserRole::Owner, now).unwrap();
+        repository.insert_user(&owner).await.unwrap();
+        let state = ControlHttpState::new(
+            test_config(),
+            repository.clone(),
+            UnusedVerifier,
+            UnusedExchanger,
+            UnusedExchanger,
+        )
+        .unwrap();
+        let invite_token = URL_SAFE_NO_PAD.encode([31_u8; 32]);
+        repository
+            .create_invitation(&crate::repository::NewInvitation {
+                id: crate::domain::identity::InvitationId::new(),
+                target_email: "registrant@example.com".to_owned(),
+                token_hash: hash_token(&invite_token),
+                invited_by: owner.id,
+                expires_at: now + Duration::hours(1),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+
+        let (callback, _) = finish_login(
+            &state,
+            ValidatedOidcIdentity {
+                subject: "registrant-sub".to_owned(),
+                email: "Registrant@example.com".to_owned(),
+            },
+            login_claim(None),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(callback.headers()[header::LOCATION], "/auth/register");
+        let cookies: Vec<_> = callback
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        let handle = cookies
+            .iter()
+            .find_map(|value| value.strip_prefix("__Host-agentmail_registration="))
+            .and_then(|value| value.split(';').next())
+            .unwrap();
+        let csrf = cookies
+            .iter()
+            .find_map(|value| value.strip_prefix("__Host-agentmail_registration_csrf="))
+            .and_then(|value| value.split(';').next())
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{REGISTRATION_COOKIE}={handle}; {REGISTRATION_CSRF_COOKIE}={csrf}"
+            ))
+            .unwrap(),
+        );
+        let page = registration_page(State(state.clone()), headers.clone()).await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let page_body = axum::body::to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&page_body).contains("Registrant@example.com"));
+
+        let csrf_rejected = registration_submit(
+            State(state.clone()),
+            headers.clone(),
+            Form(RegistrationForm {
+                token: invite_token.clone(),
+                _csrf: "incorrect-csrf".to_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(csrf_rejected.status(), StatusCode::FORBIDDEN);
+        assert!(
+            state
+                .pending_registrations
+                .lock()
+                .unwrap()
+                .contains_key(&hash_token(handle))
+        );
+
+        let first_claim = registration_submit(
+            State(state.clone()),
+            headers.clone(),
+            Form(RegistrationForm {
+                token: invite_token.clone(),
+                _csrf: csrf.to_owned(),
+            }),
+        );
+        let concurrent_claim = registration_submit(
+            State(state.clone()),
+            headers.clone(),
+            Form(RegistrationForm {
+                token: invite_token.clone(),
+                _csrf: csrf.to_owned(),
+            }),
+        );
+        let (first_response, concurrent_response) = tokio::join!(first_claim, concurrent_claim);
+        let accepted = if first_response.status() == StatusCode::SEE_OTHER {
+            assert_eq!(concurrent_response.status(), StatusCode::FORBIDDEN);
+            first_response
+        } else {
+            assert_eq!(first_response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(concurrent_response.status(), StatusCode::SEE_OTHER);
+            concurrent_response
+        };
+        assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
+        assert_eq!(accepted.headers()[header::LOCATION], "/control/account");
+        assert!(
+            accepted
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|value| value.starts_with("__Host-agentmail_session="))
+        );
+        let replay = registration_submit(
+            State(state.clone()),
+            headers,
+            Form(RegistrationForm {
+                token: invite_token,
+                _csrf: csrf.to_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+        let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role='member'")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!((members, sessions), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn registration_wrong_email_malformed_token_and_expired_pending_create_no_account() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        database.migrate().await.unwrap();
+        let repository = Repository::new(&database);
+        let now = Utc::now();
+        let owner = User::new("owner-sub", "owner@example.com", UserRole::Owner, now).unwrap();
+        repository.insert_user(&owner).await.unwrap();
+        let state = ControlHttpState::new(
+            test_config(),
+            repository.clone(),
+            UnusedVerifier,
+            UnusedExchanger,
+            UnusedExchanger,
+        )
+        .unwrap();
+        let token = URL_SAFE_NO_PAD.encode([37_u8; 32]);
+        let expired_invite_token = URL_SAFE_NO_PAD.encode([38_u8; 32]);
+        repository
+            .create_invitation(&crate::repository::NewInvitation {
+                id: crate::domain::identity::InvitationId::new(),
+                target_email: "other@example.com".to_owned(),
+                token_hash: hash_token(&token),
+                invited_by: owner.id,
+                expires_at: now + Duration::hours(1),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        repository
+            .create_invitation(&crate::repository::NewInvitation {
+                id: crate::domain::identity::InvitationId::new(),
+                target_email: "expired@example.com".to_owned(),
+                token_hash: hash_token(&expired_invite_token),
+                invited_by: owner.id,
+                expires_at: now - Duration::seconds(1),
+                created_at: now - Duration::minutes(1),
+            })
+            .await
+            .unwrap();
+        let issue = |identity: ValidatedOidcIdentity, timestamp| {
+            issue_pending_registration(&state, identity, timestamp).unwrap()
+        };
+        let identity = ValidatedOidcIdentity {
+            subject: "new-sub".to_owned(),
+            email: "new@example.com".to_owned(),
+        };
+        let missing_cookie = registration_page(State(state.clone()), HeaderMap::new()).await;
+        assert_eq!(missing_cookie.status(), StatusCode::SEE_OTHER);
+        let (expired_handle, expired_csrf) = issue(identity.clone(), now - Duration::minutes(10));
+        let expired_headers = registration_headers(&expired_handle, &expired_csrf);
+        let expired = registration_page(State(state.clone()), expired_headers).await;
+        assert_eq!(expired.status(), StatusCode::SEE_OTHER);
+
+        let (tampered_handle, tampered_csrf) = issue(identity.clone(), now);
+        let tampered_cookie_page = registration_page(
+            State(state.clone()),
+            registration_headers("tampered-handle", &tampered_csrf),
+        )
+        .await;
+        assert_eq!(tampered_cookie_page.status(), StatusCode::SEE_OTHER);
+        let tampered_csrf_page = registration_page(
+            State(state.clone()),
+            registration_headers(&tampered_handle, "tampered-csrf"),
+        )
+        .await;
+        assert_eq!(tampered_csrf_page.status(), StatusCode::SEE_OTHER);
+
+        let (missing_token_handle, missing_token_csrf) = issue(identity.clone(), now);
+        let missing_token = registration_submit(
+            State(state.clone()),
+            registration_headers(&missing_token_handle, &missing_token_csrf),
+            Form(RegistrationForm {
+                token: String::new(),
+                _csrf: missing_token_csrf,
+            }),
+        )
+        .await;
+        assert_eq!(missing_token.status(), StatusCode::FORBIDDEN);
+
+        let (bad_handle, bad_csrf) = issue(identity.clone(), now);
+        let bad_headers = registration_headers(&bad_handle, &bad_csrf);
+        let malformed = registration_submit(
+            State(state.clone()),
+            bad_headers,
+            Form(RegistrationForm {
+                token: "not-a-token".to_owned(),
+                _csrf: bad_csrf,
+            }),
+        )
+        .await;
+        assert_eq!(malformed.status(), StatusCode::FORBIDDEN);
+
+        let (wrong_handle, wrong_csrf) = issue(identity, now);
+        let wrong_email = registration_submit(
+            State(state.clone()),
+            registration_headers(&wrong_handle, &wrong_csrf),
+            Form(RegistrationForm {
+                token,
+                _csrf: wrong_csrf,
+            }),
+        )
+        .await;
+        assert_eq!(wrong_email.status(), StatusCode::FORBIDDEN);
+
+        let expired_identity = ValidatedOidcIdentity {
+            subject: "expired-sub".to_owned(),
+            email: "expired@example.com".to_owned(),
+        };
+        let (expired_invite_handle, expired_invite_csrf) = issue(expired_identity, now);
+        let expired_invite = registration_submit(
+            State(state.clone()),
+            registration_headers(&expired_invite_handle, &expired_invite_csrf),
+            Form(RegistrationForm {
+                token: expired_invite_token,
+                _csrf: expired_invite_csrf,
+            }),
+        )
+        .await;
+        assert_eq!(expired_invite.status(), StatusCode::FORBIDDEN);
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let accepted: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM invitations WHERE accepted_at IS NOT NULL")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        assert_eq!((users, sessions, accepted), (1, 0, 0));
+
+        let (missing_handle, missing_csrf) = issue_pending_registration(
+            &state,
+            ValidatedOidcIdentity {
+                subject: "missing-token-sub".to_owned(),
+                email: "new@example.com".to_owned(),
+            },
+            now,
+        )
+        .unwrap();
+        let app = router(state);
+        let missing_cookie_request = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/register")
+            .header(header::COOKIE, format!("{REGISTRATION_COOKIE}={missing_handle}; {REGISTRATION_CSRF_COOKIE}={missing_csrf}"))
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!("_csrf={missing_csrf}")))
+            .unwrap();
+        let missing_token_response = app.clone().oneshot(missing_cookie_request).await.unwrap();
+        assert_eq!(missing_token_response.status(), StatusCode::FORBIDDEN);
+
+        let oversized_request = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/register")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("x".repeat(MAX_REGISTRATION_FORM_BYTES + 1)))
+            .unwrap();
+        let oversized_response = app.oneshot(oversized_request).await.unwrap();
+        assert_eq!(oversized_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    fn registration_headers(handle: &str, csrf: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{REGISTRATION_COOKIE}={handle}; {REGISTRATION_CSRF_COOKIE}={csrf}"
+            ))
+            .unwrap(),
+        );
+        headers
     }
 
     #[tokio::test]

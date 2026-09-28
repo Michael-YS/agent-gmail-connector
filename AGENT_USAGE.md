@@ -15,7 +15,7 @@
 
 ## 2. 人类先完成的准备
 
-1. 在 Panel 登录 AgentMail。普通 Google 登录只建立 Panel 会话，不自动授予 Gmail 访问权。未受邀的账号不能凭 Google 登录自动加入实例。
+1. 在 Panel 使用 Google 登录。已登记账号正常进入 Panel；未登记账号先进入邀请 token 页面，只有有效且匹配该 Google 邮箱的邀请才能创建账户和 session。邀请由 Owner 生成并安全转交，不会自动发邮件。没有 token 不能继续注册。Panel 登录本身不自动授予 Gmail 访问权。
 2. 在 `/control/account` 连接 Gmail，完成 Google 授权。
 3. 创建 Access Key，并只给它所需 Connection 的 grant。创建/轮换时明文只显示一次。
 4. 通过 agent 客户端的 secret store 或受保护的运行时环境注入 Access Key；不要把真实 key 粘进 prompt 或配置示例。
