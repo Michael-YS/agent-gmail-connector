@@ -40,7 +40,7 @@ async fn authenticate(
 ) -> Response {
     let context = match auth(request.headers(), request.uri().query(), &state, true).await {
         Ok(context) => context,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     request.extensions_mut().insert(context);
     next.run(request).await

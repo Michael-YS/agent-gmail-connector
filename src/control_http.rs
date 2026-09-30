@@ -544,7 +544,7 @@ where
 {
     let owner = match require_owner_session(&state, &headers, false).await {
         Ok(owner) => owner,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     match state.repository.list_invitations(owner.user_id).await {
         Ok(invitations) => (
@@ -569,11 +569,11 @@ where
 {
     let owner = match require_owner_session(&state, &headers, true).await {
         Ok(owner) => owner,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let owner = match active_owner(&state, owner.user_id).await {
         Ok(owner) => owner,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let issued = match InviteService::new(state.repository.clone())
         .issue(&owner, &request.target_email, Utc::now())
@@ -605,7 +605,7 @@ where
 {
     let owner = match require_owner_session(&state, &headers, true).await {
         Ok(owner) => owner,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     match state
         .repository
@@ -629,11 +629,11 @@ where
 {
     let owner = match require_owner_session(&state, &headers, true).await {
         Ok(owner) => owner,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let owner_user = match active_owner(&state, owner.user_id).await {
         Ok(owner) => owner,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let invitation_id = InvitationId::from_uuid(invitation_id);
     let existing = match state.repository.list_invitations(owner.user_id).await {
@@ -678,7 +678,7 @@ where
 async fn active_owner<V, E>(
     state: &ControlHttpState<V, E>,
     user_id: UserId,
-) -> Result<User, Response>
+) -> Result<User, Box<Response>>
 where
     V: OidcTokenVerifier,
     E: OAuthCodeExchanger,
@@ -687,10 +687,13 @@ where
         .repository
         .get_user(user_id)
         .await
-        .map_err(|error| error_response(error.into()))?
-        .ok_or_else(|| control_api_error(StatusCode::FORBIDDEN, "forbidden"))?;
+        .map_err(|error| Box::new(error_response(error.into())))?
+        .ok_or_else(|| Box::new(control_api_error(StatusCode::FORBIDDEN, "forbidden")))?;
     if !user.can_manage_owner_ui() {
-        return Err(control_api_error(StatusCode::FORBIDDEN, "forbidden"));
+        return Err(Box::new(control_api_error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+        )));
     }
     Ok(user)
 }
@@ -705,7 +708,7 @@ where
 {
     let principal = match require_authenticated_session(&state, &headers, false).await {
         Ok(principal) => principal,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     match state.repository.list_access_keys(principal.user_id).await {
         Ok(keys) => (
@@ -730,7 +733,7 @@ where
 {
     let principal = match require_authenticated_session(&state, &headers, true).await {
         Ok(principal) => principal,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let connections = request
         .connection_ids
@@ -762,7 +765,7 @@ where
 {
     let principal = match require_authenticated_session(&state, &headers, true).await {
         Ok(principal) => principal,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let key_id = AccessKeyId::from_uuid(key_id);
     match state
@@ -788,7 +791,7 @@ where
 {
     let principal = match require_authenticated_session(&state, &headers, true).await {
         Ok(principal) => principal,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let key_id = AccessKeyId::from_uuid(key_id);
     let existing = match state
@@ -860,7 +863,7 @@ where
 {
     let principal = match require_authenticated_session(state, headers, true).await {
         Ok(principal) => principal,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let key_id = AccessKeyId::from_uuid(key_id);
     match state
@@ -890,36 +893,43 @@ async fn require_owner_session<V, E>(
     state: &ControlHttpState<V, E>,
     headers: &HeaderMap,
     require_csrf: bool,
-) -> Result<SessionContext, Response>
+) -> Result<SessionContext, Box<Response>>
 where
     V: OidcTokenVerifier,
     E: OAuthCodeExchanger,
 {
-    let token_hash = session_token_hash(headers).map_err(error_response)?;
+    let token_hash =
+        session_token_hash(headers).map_err(|error| Box::new(error_response(error)))?;
     let session = state
         .control_plane
         .authenticate_session(&token_hash, Utc::now())
         .await
-        .map_err(|error| error_response(error.into()))?;
+        .map_err(|error| Box::new(error_response(error.into())))?;
     let user = state
         .repository
         .get_user(session.user_id)
         .await
-        .map_err(|error| error_response(error.into()))?
-        .ok_or_else(|| control_api_error(StatusCode::FORBIDDEN, "forbidden"))?;
+        .map_err(|error| Box::new(error_response(error.into())))?
+        .ok_or_else(|| Box::new(control_api_error(StatusCode::FORBIDDEN, "forbidden")))?;
     if user.role != UserRole::Owner {
-        return Err(control_api_error(StatusCode::FORBIDDEN, "forbidden"));
+        return Err(Box::new(control_api_error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+        )));
     }
     if require_csrf {
         let presented = headers
             .get("x-csrf-token")
             .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| control_api_error(StatusCode::BAD_REQUEST, "invalid_csrf"))?;
+            .ok_or_else(|| Box::new(control_api_error(StatusCode::BAD_REQUEST, "invalid_csrf")))?;
         if !state
             .control_plane
             .verify_csrf(&session.csrf_token_hash, presented)
         {
-            return Err(control_api_error(StatusCode::BAD_REQUEST, "invalid_csrf"));
+            return Err(Box::new(control_api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_csrf",
+            )));
         }
     }
     Ok(SessionContext {
@@ -1569,7 +1579,7 @@ where
 {
     let session = match require_authenticated_session(&state, &headers, true).await {
         Ok(session) => session,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let state_for_task = state.clone();
     let operation = tokio::spawn(async move {
@@ -1598,7 +1608,7 @@ where
 {
     let owner = match require_owner_session(&state, &headers, true).await {
         Ok(session) => session,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let user_id = UserId::from_uuid(user_id);
     let state_for_task = state.clone();
@@ -1636,27 +1646,31 @@ async fn require_authenticated_session<V, E>(
     state: &ControlHttpState<V, E>,
     headers: &HeaderMap,
     require_csrf: bool,
-) -> Result<SessionContext, Response>
+) -> Result<SessionContext, Box<Response>>
 where
     V: OidcTokenVerifier,
     E: OAuthCodeExchanger,
 {
-    let token_hash = session_token_hash(headers).map_err(error_response)?;
+    let token_hash =
+        session_token_hash(headers).map_err(|error| Box::new(error_response(error)))?;
     let session = state
         .control_plane
         .authenticate_session(&token_hash, Utc::now())
         .await
-        .map_err(|error| error_response(error.into()))?;
+        .map_err(|error| Box::new(error_response(error.into())))?;
     if require_csrf {
         let presented = headers
             .get("x-csrf-token")
             .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| control_api_error(StatusCode::BAD_REQUEST, "invalid_csrf"))?;
+            .ok_or_else(|| Box::new(control_api_error(StatusCode::BAD_REQUEST, "invalid_csrf")))?;
         if !state
             .control_plane
             .verify_csrf(&session.csrf_token_hash, presented)
         {
-            return Err(control_api_error(StatusCode::BAD_REQUEST, "invalid_csrf"));
+            return Err(Box::new(control_api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_csrf",
+            )));
         }
     }
     Ok(SessionContext {

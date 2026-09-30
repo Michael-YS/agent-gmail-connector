@@ -455,7 +455,7 @@ fn decode_token_hash_hex(value: &str) -> Result<[u8; 32], ()> {
         return Err(());
     }
     let mut hash = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         hash[index] = std::str::from_utf8(pair)
             .ok()
             .and_then(|pair| u8::from_str_radix(pair, 16).ok())

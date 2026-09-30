@@ -218,17 +218,19 @@ async fn reserve_limits(
     headers: &HeaderMap,
     limits: &[(String, LimitKind)],
     now: chrono::DateTime<Utc>,
-) -> Result<RateReservation, Response> {
+) -> Result<RateReservation, Box<Response>> {
     if let Some(repository) = &state.repository {
         return match repository.charge_rate_limits(limits, now).await {
             Ok(charges) => Ok(RateReservation::Persistent(charges)),
-            Err(RateChargeError::Exceeded(error)) => Err(rate_limit_response(error, headers)),
-            Err(RateChargeError::Repository(_)) => Err(error_response(
+            Err(RateChargeError::Exceeded(error)) => {
+                Err(Box::new(rate_limit_response(error, headers)))
+            }
+            Err(RateChargeError::Repository(_)) => Err(Box::new(error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "service_unavailable",
                 "service temporarily unavailable",
                 headers,
-            )),
+            ))),
         };
     }
     let mut buckets = state.rate_buckets.lock().await;
@@ -246,7 +248,7 @@ async fn reserve_limits(
                         bucket.refund(&mut receipt, now);
                     }
                 }
-                return Err(rate_limit_response(error, headers));
+                return Err(Box::new(rate_limit_response(error, headers)));
             }
         }
     }
@@ -258,7 +260,7 @@ async fn refund_limits(
     headers: &HeaderMap,
     reservation: RateReservation,
     now: chrono::DateTime<Utc>,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     match reservation {
         RateReservation::Persistent(charges) => state
             .repository
@@ -268,12 +270,12 @@ async fn refund_limits(
             .await
             .map(|_| ())
             .map_err(|_| {
-                error_response(
+                Box::new(error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "service_unavailable",
                     "service temporarily unavailable",
                     headers,
-                )
+                ))
             }),
         RateReservation::Memory(charges) => {
             let mut buckets = state.rate_buckets.lock().await;
@@ -421,7 +423,7 @@ pub(crate) async fn auth(
     query: Option<&str>,
     state: &AppState,
     charge_api: bool,
-) -> Result<AuthContext, Response> {
+) -> Result<AuthContext, Box<Response>> {
     if query.is_some_and(|q| {
         q.split('&').any(|p| {
             matches!(
@@ -435,7 +437,8 @@ pub(crate) async fn auth(
             "unauthorized",
             "authentication required",
             headers,
-        ));
+        )
+        .into());
     }
     let Some(value) = headers
         .get(header::AUTHORIZATION)
@@ -446,7 +449,8 @@ pub(crate) async fn auth(
             "unauthorized",
             "authentication required",
             headers,
-        ));
+        )
+        .into());
     };
     let Some(credential) = value.strip_prefix("Bearer ") else {
         return Err(error_response(
@@ -454,35 +458,36 @@ pub(crate) async fn auth(
             "unauthorized",
             "authentication required",
             headers,
-        ));
+        )
+        .into());
     };
     let parsed = parse_credential(credential).map_err(|_| {
-        error_response(
+        Box::new(error_response(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
             "authentication required",
             headers,
-        )
+        ))
     })?;
     if let Some(repository) = &state.repository {
         let key = repository
             .authenticate_access_key(credential)
             .await
             .map_err(|_| {
-                error_response(
+                Box::new(error_response(
                     StatusCode::UNAUTHORIZED,
                     "unauthorized",
                     "authentication required",
                     headers,
-                )
+                ))
             })?
             .ok_or_else(|| {
-                error_response(
+                Box::new(error_response(
                     StatusCode::UNAUTHORIZED,
                     "unauthorized",
                     "authentication required",
                     headers,
-                )
+                ))
             })?;
         let context = AuthContext {
             key: key.id,
@@ -502,20 +507,20 @@ pub(crate) async fn auth(
     }
     let keys = state.keys.read().await;
     let key = keys.get(&parsed.public_id).ok_or_else(|| {
-        error_response(
+        Box::new(error_response(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
             "authentication required",
             headers,
-        )
+        ))
     })?;
     let valid = key.verify_credential(credential).map_err(|_| {
-        error_response(
+        Box::new(error_response(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
             "authentication required",
             headers,
-        )
+        ))
     })?;
     if !valid {
         return Err(error_response(
@@ -523,7 +528,8 @@ pub(crate) async fn auth(
             "unauthorized",
             "authentication required",
             headers,
-        ));
+        )
+        .into());
     }
     let context = AuthContext {
         key: key.id,
@@ -547,7 +553,7 @@ async fn authorize(
     query: Option<&str>,
     state: &AppState,
     connection: ConnectionId,
-) -> Result<AuthContext, Response> {
+) -> Result<AuthContext, Box<Response>> {
     let ctx = auth(headers, query, state, true).await?;
     authorize_context(headers, state, connection, ctx).await
 }
@@ -557,15 +563,15 @@ pub(crate) async fn authorize_context(
     state: &AppState,
     connection: ConnectionId,
     ctx: AuthContext,
-) -> Result<AuthContext, Response> {
+) -> Result<AuthContext, Box<Response>> {
     if let Some(repository) = &state.repository {
         let user = repository.get_user(ctx.user).await.map_err(|_| {
-            error_response(
+            Box::new(error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "service_unavailable",
                 "service temporarily unavailable",
                 headers,
-            )
+            ))
         })?;
         if !user.is_some_and(|u| u.status.accepts_requests()) {
             return Err(error_response(
@@ -573,15 +579,16 @@ pub(crate) async fn authorize_context(
                 "forbidden",
                 "access denied",
                 headers,
-            ));
+            )
+            .into());
         }
         let connection_record = repository.get_connection(connection).await.map_err(|_| {
-            error_response(
+            Box::new(error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "service_unavailable",
                 "service temporarily unavailable",
                 headers,
-            )
+            ))
         })?;
         let Some(connection_record) = connection_record else {
             return Err(error_response(
@@ -589,7 +596,8 @@ pub(crate) async fn authorize_context(
                 "forbidden",
                 "access denied",
                 headers,
-            ));
+            )
+            .into());
         };
         if connection_record.owner_id != ctx.user {
             return Err(error_response(
@@ -597,18 +605,19 @@ pub(crate) async fn authorize_context(
                 "forbidden",
                 "access denied",
                 headers,
-            ));
+            )
+            .into());
         }
         if !repository
             .access_key_grant_exists(ctx.key, connection)
             .await
             .map_err(|_| {
-                error_response(
+                Box::new(error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "service_unavailable",
                     "service temporarily unavailable",
                     headers,
-                )
+                ))
             })?
         {
             return Err(error_response(
@@ -616,7 +625,8 @@ pub(crate) async fn authorize_context(
                 "forbidden",
                 "access denied",
                 headers,
-            ));
+            )
+            .into());
         }
         if !connection_record.status.accepts_requests() {
             return Err(
@@ -629,7 +639,8 @@ pub(crate) async fn authorize_context(
                     )
                 } else {
                     error_response(StatusCode::FORBIDDEN, "forbidden", "access denied", headers)
-                },
+                }
+                .into(),
             );
         }
         return Ok(ctx);
@@ -639,27 +650,26 @@ pub(crate) async fn authorize_context(
         .get(&ctx.user)
         .is_some_and(|u| u.status.accepts_requests())
     {
-        return Err(error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "access denied",
-            headers,
-        ));
+        return Err(
+            error_response(StatusCode::FORBIDDEN, "forbidden", "access denied", headers).into(),
+        );
     }
     let conns = state.connections.read().await;
     let conn = conns.get(&connection).ok_or_else(|| {
-        error_response(StatusCode::FORBIDDEN, "forbidden", "access denied", headers)
-    })?;
-    if conn.owner_id != ctx.user {
-        return Err(error_response(
+        Box::new(error_response(
             StatusCode::FORBIDDEN,
             "forbidden",
             "access denied",
             headers,
-        ));
+        ))
+    })?;
+    if conn.owner_id != ctx.user {
+        return Err(
+            error_response(StatusCode::FORBIDDEN, "forbidden", "access denied", headers).into(),
+        );
     }
     if !conn.status.accepts_requests() {
-        return Err(if conn.status == ConnectionStatus::ReauthRequired {
+        return Err((if conn.status == ConnectionStatus::ReauthRequired {
             error_response(
                 StatusCode::FORBIDDEN,
                 "reauth_required",
@@ -668,7 +678,8 @@ pub(crate) async fn authorize_context(
             )
         } else {
             error_response(StatusCode::FORBIDDEN, "forbidden", "access denied", headers)
-        });
+        })
+        .into());
     }
     drop(conns);
     let keys = state.keys.read().await;
@@ -686,7 +697,8 @@ pub(crate) async fn authorize_context(
                 "forbidden",
                 "access denied",
                 headers,
-            ));
+            )
+            .into());
         }
     }
     Ok(ctx)
@@ -744,7 +756,7 @@ async fn list_connections(
 ) -> Response {
     let ctx = match auth(&headers, uri.query(), &state, true).await {
         Ok(c) => c,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     list_connections_for_context(&state, ctx, &headers).await
 }
@@ -819,7 +831,7 @@ async fn list_messages(
     let cid = ConnectionId::from_uuid(cid);
     let context = match authorize(&headers, uri.query(), &state, cid).await {
         Ok(context) => context,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let response = match state
         .mailbox_service
@@ -867,7 +879,7 @@ async fn get_message(
     let cid = ConnectionId::from_uuid(cid);
     let context = match authorize(&headers, uri.query(), &state, cid).await {
         Ok(context) => context,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let html = match wants_html(&query) {
         Ok(value) => value,
@@ -918,7 +930,7 @@ async fn list_drafts(
     let cid = ConnectionId::from_uuid(cid);
     let context = match authorize(&headers, uri.query(), &state, cid).await {
         Ok(context) => context,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let response = match draft_list_payload(&state, cid).await {
         Ok(payload) => ok_json(payload, &headers),
@@ -945,7 +957,7 @@ async fn get_draft(
     let cid = ConnectionId::from_uuid(cid);
     let context = match authorize(&headers, uri.query(), &state, cid).await {
         Ok(context) => context,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let response = match draft_get_payload(&state, cid, &did).await {
         Ok(payload) => ok_json(payload, &headers),
@@ -1383,10 +1395,10 @@ async fn create_draft(
     let cid = ConnectionId::from_uuid(cid);
     let auth = match auth(&headers, uri.query(), &state, true).await {
         Ok(context) => context,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if let Err(response) = authorize_context(&headers, &state, cid, auth).await {
-        return response;
+        return *response;
     }
     let response = create_draft_authorized(&state, headers.clone(), cid, auth, input).await;
     audit_response(
@@ -1754,10 +1766,10 @@ async fn update_draft(
     let cid = ConnectionId::from_uuid(cid);
     let auth = match auth(&headers, uri.query(), &state, true).await {
         Ok(context) => context,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if let Err(response) = authorize_context(&headers, &state, cid, auth).await {
-        return response;
+        return *response;
     }
     let response = update_draft_authorized(&state, headers.clone(), cid, did, input).await;
     audit_response(
@@ -1938,10 +1950,10 @@ async fn delete_draft(
     let cid = ConnectionId::from_uuid(cid);
     let auth = match auth(&headers, uri.query(), &state, true).await {
         Ok(context) => context,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if let Err(response) = authorize_context(&headers, &state, cid, auth).await {
-        return response;
+        return *response;
     }
     let response = delete_draft_authorized(&state, headers.clone(), cid, did, query).await;
     audit_response(
@@ -2069,7 +2081,7 @@ async fn prepare_send(
     let cid = ConnectionId::from_uuid(cid);
     let ctx = match authorize(&headers, uri.query(), &state, cid).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     prepare_send_authorized(&state, headers, cid, did, ctx).await
 }
@@ -2097,7 +2109,7 @@ async fn prepare_send_authorized(
             Some(cid),
             AuditOperation::DraftPrepare,
             started,
-            response,
+            *response,
         )
         .await;
     }
@@ -2214,10 +2226,10 @@ async fn send_draft(
     let cid = ConnectionId::from_uuid(cid);
     let ctx = match authorize(&headers, uri.query(), &state, cid).await {
         Ok(context) => context,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if let Err(response) = authorize_context(&headers, &state, cid, ctx).await {
-        return response;
+        return *response;
     }
     send_draft_authorized(&state, headers, cid, did, ctx, req).await
 }
@@ -2305,7 +2317,7 @@ async fn send_draft_authorized(
     .await
     {
         Ok(reservation) => Some(reservation),
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let mut confirmation = match state.confirmations.read().await.get(&token_id).cloned() {
         Some(confirmation) => confirmation,
@@ -2318,7 +2330,7 @@ async fn send_draft_authorized(
             )
             .await
             {
-                return response;
+                return *response;
             }
             return error_response(
                 StatusCode::UNAUTHORIZED,
@@ -2344,7 +2356,7 @@ async fn send_draft_authorized(
             )
             .await
             {
-                return response;
+                return *response;
             }
             if let Some(repository) = &state.repository
                 && repository
@@ -2374,7 +2386,7 @@ async fn send_draft_authorized(
             )
             .await
             {
-                return response;
+                return *response;
             }
             return error_response(
                 StatusCode::UNAUTHORIZED,
@@ -2437,7 +2449,7 @@ async fn send_draft_authorized(
         )
         .await
     {
-        return response;
+        return *response;
     }
     let result = match confirmation.complete(&mut draft, outcome) {
         Ok(result) => result,
@@ -2529,7 +2541,7 @@ async fn send_draft_durable(
     .await
     {
         Ok(reservation) => Some(reservation),
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let digest = SendConfirmation::token_digest_hex(token);
     let claim = match repository
@@ -2546,7 +2558,7 @@ async fn send_draft_durable(
             )
             .await
             {
-                return response;
+                return *response;
             }
             return error_response(
                 StatusCode::UNAUTHORIZED,
@@ -2564,7 +2576,7 @@ async fn send_draft_durable(
             )
             .await
             {
-                return response;
+                return *response;
             }
             return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2584,7 +2596,7 @@ async fn send_draft_durable(
             )
             .await
             {
-                return response;
+                return *response;
             }
             return ok_json(
                 json!({"connection_id":connection_id,"draft_id":draft_id,"outcome":outcome,"replayed":true}),
@@ -2622,7 +2634,7 @@ async fn send_draft_durable(
             )
             .await
             {
-                return response;
+                return *response;
             }
             let outcome = reconcile_sent_outcome(state, connection_id, &draft.message_id).await;
             (confirmation, draft, outcome)
@@ -2639,7 +2651,7 @@ async fn send_draft_durable(
         )
         .await
     {
-        return response;
+        return *response;
     }
     let result = match confirmation.complete(&mut draft, outcome) {
         Ok(result) => result,
@@ -3172,7 +3184,7 @@ async fn get_thread(
     let cid = ConnectionId::from_uuid(cid);
     let context = match authorize(&headers, uri.query(), &state, cid).await {
         Ok(context) => context,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let html = match wants_html(&query) {
         Ok(value) => value,
@@ -3218,7 +3230,7 @@ async fn get_attachment(
     let cid = ConnectionId::from_uuid(cid);
     let context = match authorize(&headers, uri.query(), &state, cid).await {
         Ok(context) => context,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let response = match state.mailbox_service.get_attachment(cid, &mid, &aid).await {
         Ok(attachment) => {
@@ -3562,10 +3574,12 @@ async fn mcp_authorized(
     request_id: Value,
     cid: ConnectionId,
     auth: AuthContext,
-) -> Result<AuthContext, Response> {
+) -> Result<AuthContext, Box<Response>> {
     match authorize_context(headers, state, cid, auth).await {
         Ok(context) => Ok(context),
-        Err(response) => Err(mcp_http_response(request_id, response, headers).await),
+        Err(response) => Err(Box::new(
+            mcp_http_response(request_id, *response, headers).await,
+        )),
     }
 }
 
@@ -3754,7 +3768,7 @@ async fn mcp_dispatch(
 ) -> Response {
     let auth = match auth(&headers, uri.query(), &state, false).await {
         Ok(auth) => auth,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let payload: Value = match serde_json::from_slice(&body) {
         Ok(payload) => payload,
@@ -3777,7 +3791,7 @@ async fn mcp_dispatch(
         )
         .await
     {
-        return response;
+        return *response;
     }
     match request.method.as_str() {
         "initialize" => mcp_result(
@@ -3820,7 +3834,7 @@ async fn mcp_dispatch(
                 if let Err(response) =
                     mcp_authorized(&state, &headers, request_id.clone(), cid, auth).await
                 {
-                    return response;
+                    return *response;
                 }
                 let html = match args.format.as_deref().unwrap_or("text") {
                     "text" => false,
@@ -3888,7 +3902,7 @@ async fn mcp_dispatch(
                 if let Err(response) =
                     mcp_authorized(&state, &headers, request_id.clone(), cid, auth).await
                 {
-                    return response;
+                    return *response;
                 }
                 let html = match args.format.as_deref().unwrap_or("text") {
                     "text" => false,
@@ -3950,7 +3964,7 @@ async fn mcp_dispatch(
                 if let Err(response) =
                     mcp_authorized(&state, &headers, request_id.clone(), cid, auth).await
                 {
-                    return response;
+                    return *response;
                 }
                 return match state
                     .mailbox_service
@@ -4027,7 +4041,7 @@ async fn mcp_dispatch(
                 if let Err(response) =
                     mcp_authorized(&state, &headers, request_id.clone(), cid, auth).await
                 {
-                    return response;
+                    return *response;
                 }
                 let attachments =
                     match resolve_mcp_draft_attachments(&state, cid, args.attachments).await {
@@ -4087,7 +4101,7 @@ async fn mcp_dispatch(
                 if let Err(response) =
                     mcp_authorized(&state, &headers, request_id.clone(), cid, auth).await
                 {
-                    return response;
+                    return *response;
                 }
                 return match draft_list_payload(&state, cid).await {
                     Ok(payload) => {
@@ -4129,7 +4143,7 @@ async fn mcp_dispatch(
                 if let Err(response) =
                     mcp_authorized(&state, &headers, request_id.clone(), cid, auth).await
                 {
-                    return response;
+                    return *response;
                 }
                 return match draft_get_payload(&state, cid, &args.draft_id).await {
                     Ok(payload) => {
@@ -4182,7 +4196,7 @@ async fn mcp_dispatch(
                         if let Err(response) =
                             mcp_authorized(&state, &headers, request_id.clone(), cid, auth).await
                         {
-                            return response;
+                            return *response;
                         }
                         let attachments = match resolve_mcp_draft_attachments(
                             &state,
@@ -4226,7 +4240,7 @@ async fn mcp_dispatch(
                         if let Err(response) =
                             mcp_authorized(&state, &headers, request_id.clone(), cid, auth).await
                         {
-                            return response;
+                            return *response;
                         }
                         let response = delete_draft_authorized(
                             &state,
@@ -4257,7 +4271,7 @@ async fn mcp_dispatch(
                         if let Err(response) =
                             mcp_authorized(&state, &headers, request_id.clone(), cid, auth).await
                         {
-                            return response;
+                            return *response;
                         }
                         let response = prepare_send_authorized(
                             &state,
@@ -4286,7 +4300,7 @@ async fn mcp_dispatch(
                         if let Err(response) =
                             mcp_authorized(&state, &headers, request_id.clone(), cid, auth).await
                         {
-                            return response;
+                            return *response;
                         }
                         let response = send_draft_authorized(
                             &state,
@@ -4314,7 +4328,7 @@ async fn mcp_dispatch(
             if let Err(response) =
                 mcp_authorized(&state, &headers, request_id.clone(), cid, auth).await
             {
-                return response;
+                return *response;
             }
             match state
                 .mailbox_service

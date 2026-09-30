@@ -2576,7 +2576,7 @@ fn draft_from_row(r: sqlx::sqlite::SqliteRow) -> Result<ManagedDraft, Repository
 fn decode_token_hash(value: String) -> Result<[u8; 32], RepositoryError> {
     validate_token_hash(&value, "send confirmation token hash")?;
     let mut hash = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         hash[index] = std::str::from_utf8(pair)
             .ok()
             .and_then(|pair| u8::from_str_radix(pair, 16).ok())
