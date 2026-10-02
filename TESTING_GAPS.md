@@ -3,7 +3,7 @@
 ## 前端样式部署验收（2026-10-02）
 
 - `agentmail:3d85c3f` 已部署 S1，来源为已合并并推送的 `main` 提交 `3d85c3f`；13 项控制台、5 项 HTTP、24 项 REST/MCP 契约、格式及严格 Clippy 通过，七页的桌面/窄屏/深色浏览器检查通过。服务 healthy/零 restart，源站 HTTPS live/ready、首页样式/CSP、匿名 MCP 401 和匿名控制台 303 已验证。备份 `agentmail-20261002T185031Z.db` 的只读 integrity/foreign key 检查通过，旧镜像 `b38f8c2` 保留。
-- Cloudflare 公网路径仍返回 525，旧镜像也复现；s1 的有效证书、TLS 1.2/1.3、本机源站及从本机直连 `149.28.206.57` 的 HTTPS 均通过。尚需核对 Cloudflare 的 A/AAAA origin、Origin Rule/端口等设置；当前证据只能定位到 Cloudflare 到源站路径，不能断言具体 DNS 配置错误。未关闭 TLS 验证或修改 Nginx。真实登录后页面与真实 MCP client 尚未重新验收。
+- Cloudflare 525 已修复：S1 Nginx 默认站点为 `ssl_prefer_server_ciphers off`，AgentMail 原继承全局 `on`，TLS 1.3 retry 可复现 `bad cipher`；隔离 A/B 验证后，经用户授权统一全局与 AgentMail 为 `off`，并更新 HTTP/2 语法。完整 `nginx -t` 无警告通过并 restart，七站点 TLS 1.2/1.3/retry 与证书/hostname 校验通过；其他六站点源站/公网状态未变。AgentMail 公网首页/live/ready 为 200、匿名 MCP 401、匿名控制台 303，外部 Cloudflare 首页也为 200。配置备份 `/var/backups/nginx/agentmail-tls-20261002T204209Z/`；真实登录后页面与真实 MCP client 尚未重新验收。
 - 全量单测在当前沙箱中为 187 通过/22 失败；mock listener 被网络沙箱拒绝，默认 umask 导致空 secret 文件先被权限规则拒绝，隔离的 connection revoke 压力测试仍触发 SQLite `PoolTimedOut`。私有 `umask 077` 权限测试及允许 loopback 的 UI/HTTP/REST/MCP 契约复跑通过。本轮保留后端安全校验与原有测试超时，不能据此声明全量门禁通过。
 
 ## S1 beta 修复验收（2026-09-27）
