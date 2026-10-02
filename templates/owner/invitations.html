@@ -1,7 +1,9 @@
 {% extends "base.html" %}
 {% block title %}Invitations · AgentMail{% endblock %}
+{% block nav_invitations %}aria-current="page"{% endblock %}
 {% block content %}
 <h1>Invitations</h1>
+<p class="page-intro">Invite a specific Google account with a one-time token.</p>
 {% if flash_is_some %}
 {% if flash_token_is_some %}
 <div class="flash {{ flash_css_class }}"><p>{{ flash_label }} new invitation token: <code>{{ flash_token }}</code></p>
@@ -25,8 +27,9 @@
 <section class="card">
 <h2>Existing invitations</h2>
 {% if invitations_empty %}
-<p class="muted">No invitations have been issued yet.</p>
+<p class="empty-state">No invitations yet. Issue an invitation above to add a member.</p>
 {% else %}
+<div class="table-scroll" role="region" aria-label="Invitations records" tabindex="0">
 <table>
 <thead>
 <tr><th>Target email</th><th>Status</th><th>Expires</th><th>Actions</th></tr>
@@ -35,7 +38,7 @@
 {% for inv in invitations %}
 <tr>
 <td>{{ inv.target_email }}</td>
-<td>{{ inv.status_label }}</td>
+<td><span class="status">{{ inv.status_label }}</span></td>
 <td>{{ inv.expires_at }}{% if inv.has_accepted_at %} <span class="muted">(accepted {{ inv.accepted_at_display }})</span>{% endif %}</td>
 <td>
 {% if inv.is_pending %}
@@ -47,6 +50,7 @@
 {% endfor %}
 </tbody>
 </table>
+</div>
 {% endif %}
 </section>
 {% endblock %}

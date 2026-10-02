@@ -11,3 +11,10 @@
 /.migrate.lock
 /backups/
 /secrets/
+
+# Local agent/browser tooling; the application UI is rendered by Rust.
+/node_modules/
+/PROMPT.md
+/codex-*.log
+/package.json
+/pnpm-lock.yaml

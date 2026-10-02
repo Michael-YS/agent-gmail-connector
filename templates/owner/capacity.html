@@ -1,7 +1,9 @@
 {% extends "base.html" %}
 {% block title %}Personal Use capacity · AgentMail{% endblock %}
+{% block nav_capacity %}aria-current="page"{% endblock %}
 {% block content %}
 <h1>Personal Use capacity</h1>
+<p class="page-intro">Track the authorization limit for this AgentMail instance.</p>
 {% if flash_is_some %}
 {% if flash_token_is_some %}
 <div class="flash {{ flash_css_class }}"><p>{{ flash_label }} new invitation token: <code>{{ flash_token }}</code></p>

@@ -2836,139 +2836,89 @@ async fn landing() -> impl IntoResponse {
   <style>
     :root {
       color-scheme: light dark;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      --canvas: #edf3ef;
-      --paper: #fff;
-      --ink: #142a24;
-      --muted: #4b6259;
-      --line: #c7d9cf;
-      --accent: #176b4b;
-      --accent-ink: #fff;
+      font-family: "Avenir Next", Avenir, "Trebuchet MS", sans-serif;
+      --canvas: #eff5f9; --paper: #ffffff; --ink: #18354b;
+      --muted: #52697a; --line: #cbdbe7; --accent: #175d9a;
+      --soft: #e7f0f8; --accent-ink: #ffffff;
     }
     * { box-sizing: border-box; }
-    body {
-      min-height: 100vh;
-      margin: 0;
-      color: var(--ink);
-      background: var(--canvas);
-    }
-    .page {
-      width: min(100% - 2.5rem, 920px);
-      min-height: 100vh;
-      margin: 0 auto;
-      display: flex;
-      flex-direction: column;
-    }
-    .brand {
-      padding: 2rem 0;
-      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-      font-size: 1rem;
-      font-weight: 700;
-      letter-spacing: -0.04em;
-    }
-    .brand span { color: var(--accent); }
-    main {
-      flex: 1;
-      display: grid;
-      grid-template-columns: minmax(0, 1.35fr) minmax(260px, 0.8fr);
-      align-items: center;
-      gap: clamp(2rem, 7vw, 6rem);
-      padding: 3rem 0 5rem;
-    }
-    .eyebrow {
-      margin: 0 0 1rem;
-      color: var(--accent);
-      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-      font-size: 0.75rem;
-      font-weight: 700;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-    }
-    h1 {
-      max-width: 11ch;
-      margin: 0;
-      font-family: Georgia, "Times New Roman", serif;
-      font-size: clamp(3rem, 6.7vw, 5.5rem);
-      font-weight: 400;
-      letter-spacing: -0.065em;
-      line-height: 1.02;
-    }
-    .intro { max-width: 32rem; margin: 1.5rem 0 0; color: var(--muted); font-size: 1.1rem; line-height: 1.6; }
-    .sign-in-panel {
-      padding: 2rem;
-      border: 1px solid var(--line);
-      border-radius: 0.75rem;
-      background: var(--paper);
-      box-shadow: 0 18px 50px rgb(20 42 36 / 6%);
-    }
-    .sign-in-panel::before {
-      content: "";
-      display: block;
-      width: 3rem;
-      height: 0.35rem;
-      margin-bottom: 2rem;
-      background: var(--accent);
-      transform: skewX(-28deg);
-    }
-    .sign-in-panel h2 { margin: 0 0 0.6rem; font-size: 1.25rem; letter-spacing: -0.025em; }
-    .sign-in-panel p { margin: 0 0 1.5rem; color: var(--muted); line-height: 1.5; }
-    .sign-in {
-      display: block;
-      padding: 0.9rem 1.1rem;
-      border-radius: 0.4rem;
-      background: var(--accent);
-      color: var(--accent-ink);
-      font-weight: 700;
-      text-align: center;
-      text-decoration: none;
-    }
-    .sign-in:hover { filter: brightness(1.1); }
-    a:focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; }
-    footer { padding: 1.5rem 0 2rem; border-top: 1px solid var(--line); }
-    footer nav { display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem; }
-    footer a { color: var(--muted); font-size: 0.9rem; text-underline-offset: 0.2em; }
+    body { margin: 0; color: var(--ink); background: var(--canvas); line-height: 1.6; }
+    .page { width: min(100% - 4rem, 1120px); min-height: 100svh; margin: auto; display: flex; flex-direction: column; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1.75rem 0; border-bottom: 1px solid var(--line); }
+    .brand { display: inline-flex; align-items: center; gap: 0.7rem; color: var(--ink); font-size: 1.3rem; font-weight: 700; letter-spacing: -0.05em; text-decoration: none; }
+    .mail-mark { position: relative; width: 1.7rem; height: 1.3rem; border: 2px solid var(--accent); border-radius: 3px; overflow: hidden; }
+    .mail-mark::after { content: ""; position: absolute; width: 1.05rem; height: 1.05rem; border-right: 2px solid var(--accent); border-bottom: 2px solid var(--accent); transform: rotate(45deg); top: -0.65rem; left: 0.17rem; }
+    .header-note { color: var(--muted); font-size: 0.85rem; }
+    main { flex: 1; display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(290px, 0.85fr); gap: clamp(2rem, 6vw, 5rem); align-items: center; padding: 5rem 0; }
+    .introduction { position: relative; }
+    h1 { max-width: 13ch; margin: 0; font-size: clamp(3rem, 5.8vw, 5rem); font-weight: 600; letter-spacing: -0.065em; line-height: 1.06; }
+    .intro { max-width: 38ch; margin: 1.5rem 0 2.5rem; color: var(--muted); font-size: 1.1rem; }
+    .access-path { display: flex; flex-wrap: wrap; align-items: center; gap: 0.65rem; font-size: 0.8rem; color: var(--muted); }
+    .access-path span { padding: 0.35rem 0.7rem; border: 1px solid var(--line); border-radius: 4px; background: var(--paper); }
+    .access-path i { width: 1.2rem; height: 1px; background: var(--line); }
+    .entry { position: relative; padding-top: 3rem; }
+    .entry::before { content: ""; position: absolute; inset: 0 0 auto; height: 9rem; background: var(--accent); clip-path: polygon(0 34%, 50% 0, 100% 34%, 100% 100%, 0 100%); }
+    .sign-in-panel { position: relative; background: var(--paper); border: 1px solid var(--line); border-radius: 8px; padding: 2.5rem 2rem 2rem; box-shadow: 0 10px 0 -4px var(--soft), 0 11px 0 -4px var(--line); }
+    .sign-in-panel h2 { margin: 0 0 0.75rem; font-size: 1.5rem; font-weight: 600; letter-spacing: -0.04em; line-height: 1.3; }
+    .sign-in-panel p { margin: 0 0 1.75rem; color: var(--muted); font-size: 0.95rem; }
+    .sign-in { display: flex; align-items: center; justify-content: center; gap: 0.7rem; min-height: 48px; padding: 0.85rem 1rem; border-radius: 5px; background: var(--accent); color: var(--accent-ink); font-size: 0.9rem; font-weight: 700; text-decoration: none; }
+    .sign-in:hover { filter: brightness(1.12); }
+    .google-mark { font-family: Arial, sans-serif; font-size: 1.15rem; font-weight: 700; }
+    .sign-in-panel .invitation-note { margin: 1.25rem 0 0; padding-top: 1.25rem; border-top: 1px solid var(--line); font-size: 0.8rem; }
+    a:focus-visible { outline: 3px solid var(--accent); outline-offset: 5px; }
+    footer { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 1rem; padding: 1.5rem 0 2rem; border-top: 1px solid var(--line); }
+    footer p { margin: 0; color: var(--muted); font-size: 0.8rem; }
+    footer nav { display: flex; flex-wrap: wrap; gap: 1.25rem; }
+    footer a { color: var(--muted); font-size: 0.8rem; text-underline-offset: 0.25em; }
     footer a:hover { color: var(--accent); }
-    @media (max-width: 680px) {
-      .brand { padding: 1.5rem 0; }
+    @media (max-width: 760px) {
+      .page { width: min(100% - 2.5rem, 540px); }
+      header { padding: 1.25rem 0; }
       main { grid-template-columns: 1fr; gap: 2.5rem; padding: 3rem 0 4rem; }
-      h1 { max-width: 12ch; }
+      h1 { font-size: clamp(2.8rem, 10vw, 4.5rem); }
+      .intro { margin-bottom: 1.5rem; }
+      .entry { max-width: 420px; width: 100%; }
+      .sign-in-panel { padding: 2rem 1.5rem 1.5rem; }
+      .access-path { gap: 0.4rem; font-size: 0.75rem; }
+      .access-path span { padding: 0.35rem 0.5rem; }
+      .access-path i { width: 0.5rem; }
+      .header-note { max-width: 12ch; text-align: right; font-size: 0.75rem; }
     }
     @media (prefers-color-scheme: dark) {
-      :root {
-        --canvas: #10201b;
-        --paper: #182c24;
-        --ink: #f1f7f2;
-        --muted: #baccc1;
-        --line: #385249;
-        --accent: #8cddb0;
-        --accent-ink: #10201b;
-      }
-      .sign-in-panel { box-shadow: none; }
-      .sign-in:hover { filter: brightness(0.9); }
+      :root { --canvas: #152738; --paper: #1d3246; --ink: #e2edf6; --muted: #b0c4d5; --line: #3d566b; --accent: #8ac7fb; --soft: #263e54; --accent-ink: #152738; }
     }
   </style>
 </head>
 <body>
   <div class="page">
-    <div class="brand">Agent<span>Mail</span></div>
+    <header>
+      <a class="brand" href="/" aria-label="AgentMail home"><span class="mail-mark" aria-hidden="true"></span>AgentMail</a>
+      <span class="header-note">Gmail access for agents</span>
+    </header>
     <main>
-      <div>
-        <p class="eyebrow">Private Gmail access for agents</p>
+      <div class="introduction">
         <h1>Mail access, under your control.</h1>
-        <p class="intro">Connect your Gmail account and manage access from one place.</p>
+        <p class="intro">Connect Gmail, create an Access Key, and choose which connections your agents can use.</p>
+        <div class="access-path" aria-label="Access flows from your Gmail account through AgentMail to your agent">
+          <span>Your Gmail</span><i aria-hidden="true"></i><span>AgentMail</span><i aria-hidden="true"></i><span>Your agent</span>
+        </div>
       </div>
-      <section class="sign-in-panel" aria-labelledby="sign-in-heading">
-        <h2 id="sign-in-heading">Open your workspace</h2>
-        <p>Sign in with your AgentMail account to continue.</p>
-        <a class="sign-in" href="/auth/google/login">Sign in with Google</a>
-      </section>
+      <div class="entry">
+        <section class="sign-in-panel" aria-labelledby="sign-in-heading">
+          <h2 id="sign-in-heading">Open your workspace</h2>
+          <p>Manage your Gmail connections and Access Keys in one place.</p>
+          <a class="sign-in" href="/auth/google/login"><span class="google-mark" aria-hidden="true">G</span>Sign in with Google</a>
+          <p class="invitation-note">New here? Have your invitation token ready. Signing in does not grant access to Gmail.</p>
+        </section>
+      </div>
     </main>
     <footer>
-    <nav aria-label="Legal">
-      <a href="/privacy">Privacy</a>
-      <a href="/terms">Terms</a>
-      <a href="/data-deletion">Data deletion</a>
-    </nav>
+      <p>Your connections. Your access decisions.</p>
+      <nav aria-label="Legal">
+        <a href="/privacy">Privacy</a>
+        <a href="/terms">Terms</a>
+        <a href="/data-deletion">Data deletion</a>
+      </nav>
     </footer>
   </div>
 </body>

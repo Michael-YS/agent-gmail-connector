@@ -13,3 +13,9 @@ secrets
 backups
 plan.md
 README.md
+
+# Local agent/browser tooling is not part of the application image.
+node_modules
+PROMPT.md
+package.json
+pnpm-lock.yaml
