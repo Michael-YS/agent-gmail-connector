@@ -1,8 +1,14 @@
 # 未完成测试与测试方法
 
+## 前端样式部署验收（2026-10-02）
+
+- `agentmail:3d85c3f` 已部署 S1，来源为已合并并推送的 `main` 提交 `3d85c3f`；13 项控制台、5 项 HTTP、24 项 REST/MCP 契约、格式及严格 Clippy 通过，七页的桌面/窄屏/深色浏览器检查通过。服务 healthy/零 restart，源站 HTTPS live/ready、首页样式/CSP、匿名 MCP 401 和匿名控制台 303 已验证。备份 `agentmail-20261002T185031Z.db` 的只读 integrity/foreign key 检查通过，旧镜像 `b38f8c2` 保留。
+- Cloudflare 公网路径仍返回 525，旧镜像也复现；s1 的有效证书、TLS 1.2/1.3、本机源站及从本机直连 `149.28.206.57` 的 HTTPS 均通过。尚需核对 Cloudflare 的 A/AAAA origin、Origin Rule/端口等设置；当前证据只能定位到 Cloudflare 到源站路径，不能断言具体 DNS 配置错误。未关闭 TLS 验证或修改 Nginx。真实登录后页面与真实 MCP client 尚未重新验收。
+- 全量单测在当前沙箱中为 187 通过/22 失败；mock listener 被网络沙箱拒绝，默认 umask 导致空 secret 文件先被权限规则拒绝，隔离的 connection revoke 压力测试仍触发 SQLite `PoolTimedOut`。私有 `umask 077` 权限测试及允许 loopback 的 UI/HTTP/REST/MCP 契约复跑通过。本轮保留后端安全校验与原有测试超时，不能据此声明全量门禁通过。
+
 ## S1 beta 修复验收（2026-09-27）
 
-- 本轮 MCP `connections.list` 已部署 `agentmail:b38f8c2`：回归覆盖 REST/MCP 结果一致、三个 MCP 入口、空列表、跨所有者与未授权/非 active 连接隔离、无效参数、鉴权、单次计费与元数据审计，并更新工具 schema snapshot。格式与 diff 检查通过，用户运行全量测试与严格 Clippy 后报告 all pass；用户完成 S1 amd64 构建，部署前备份 `agentmail-20260928T083917Z.db` 只读 `quick_check=ok`、外键问题 0，新容器 healthy/零 restart、内外网 live/ready 与首页 200、匿名 MCP initialize 401，旧镜像 `c08553a` 保留。仍需真实 MCP 客户端刷新工具列表，用 `{}` 调用并核对只出现当前 Key 的可用连接，不发送邮件。代码已本地提交，Git push 待用户明确允许向 origin 推送。
+- 本轮 MCP `connections.list` 已部署 `agentmail:b38f8c2`：回归覆盖 REST/MCP 结果一致、三个 MCP 入口、空列表、跨所有者与未授权/非 active 连接隔离、无效参数、鉴权、单次计费与元数据审计，并更新工具 schema snapshot。格式与 diff 检查通过，用户运行全量测试与严格 Clippy 后报告 all pass；用户完成 S1 amd64 构建，部署前备份 `agentmail-20260928T083917Z.db` 只读 `quick_check=ok`、外键问题 0，新容器 healthy/零 restart、内外网 live/ready 与首页 200、匿名 MCP initialize 401，旧镜像 `c08553a` 保留。仍需真实 MCP 客户端刷新工具列表，用 `{}` 调用并核对只出现当前 Key 的可用连接，不发送邮件。相关提交已于 2026-10-02 随 `main` 推送至 origin。
 - Hermes 首次真实 MCP 连接被 rmcp 默认 Host 白名单拒绝（403），非 SSE transport 选错：线上 Nginx 的固定公网 Host 未包含在默认 loopback 名单中。修复 `c08553a` 已部署，生产 `PUBLIC_BASE_URL` authority 接线与公网域名正向/未知 Host 负向回归已补，保留 loopback 默认、Bearer 鉴权及非默认端口/IPv6 语义。格式与 diff 检查通过，用户运行全量测试与严格 Clippy 后报告全过；新容器 healthy/零 restart、内外网 live/ready 与首页 200，匿名 MCP initialize 为 401。备份 `agentmail-20260928T071146Z.db` 的只读 `quick_check=ok`，旧镜像 `353d67d` 保留。真实 Hermes 重连 initialize/tools/list 仍待用户验收；不要关闭 Host 校验或让客户端伪造 Host。
 
 - 已补首次注册 token 页面并部署 `agentmail:353d67d`：任意未登记但已验证的 Google 身份可以进入该页面，没有有效同邮箱邀请不得创建用户/session；已有账号直接登录。待注册状态五分钟过期、单次提交且重启失效。格式与 diff 检查通过，用户运行全量测试及严格 Clippy 后报告 all pass。新容器健康、内外网 live/ready 与公网首页 200，匿名 GET `/auth/register` 为 303 `/auth/google/login`；备份 `agentmail-20260928T043442Z.db` 的只读 `quick_check=ok`，旧镜像 `44193e1` 保留。用户完成真实浏览器邀请注册，数据库确认 Active Member、Google 绑定和有效 session。
