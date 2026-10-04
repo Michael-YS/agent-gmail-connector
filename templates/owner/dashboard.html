@@ -1,7 +1,9 @@
 {% extends "base.html" %}
 {% block title %}Owner dashboard · AgentMail{% endblock %}
+{% block nav_dashboard %}aria-current="page"{% endblock %}
 {% block content %}
 <h1>Owner dashboard</h1>
+<p class="page-intro">Manage who can join AgentMail and keep track of Gmail authorization capacity.</p>
 {% if flash_is_some %}
 {% if flash_token_is_some %}
 <div class="flash {{ flash_css_class }}"><p>{{ flash_label }} new invitation token: <code>{{ flash_token }}</code></p>
@@ -22,10 +24,10 @@
 </section>
 <section class="card">
 <h2>Owner shortcuts</h2>
-<ul>
-<li><a href="/control/invitations">Manage invitations</a> — issue, revoke, or regenerate one-time links.</li>
-<li><a href="/control/members">View members</a> — read-only directory of active and revoked accounts.</li>
-<li><a href="/control/capacity">Personal Use capacity</a> — current usage and remaining quota.</li>
+<ul class="shortcut-list">
+<li><a href="/control/invitations">Manage invitations</a><p class="muted">Issue, revoke, or regenerate one-time tokens.</p></li>
+<li><a href="/control/members">View members</a><p class="muted">Review active and revoked accounts.</p></li>
+<li><a href="/control/capacity">Personal Use capacity</a><p class="muted">Check current usage and remaining quota.</p></li>
 </ul>
 </section>
 {% endblock %}

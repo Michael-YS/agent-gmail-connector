@@ -122,6 +122,8 @@ Google 两个 client secret 请从 Cloud Console 下载后手工写入同一目�
 
 ## Nginx
 
+模板使用 Nginx 1.25.1+ 的 `http2 on` 语法。共享 HTTPS listener 的默认站点、各虚拟主机与 `http` 全局配置应统一使用 `ssl_prefer_server_ciphers off;`；S1 曾因默认站点为 `off`、AgentMail 继承 `on`，在 TLS 1.3 key-exchange retry 时出现 `bad cipher`，导致 Cloudflare 525。新增站点时检查这一配置的一致性。
+
 ```sh
 sudo install -m 0644 deploy/nginx-agentmail.conf /etc/nginx/sites-available/agentmail.conf
 sudo ln -s /etc/nginx/sites-available/agentmail.conf /etc/nginx/sites-enabled/agentmail.conf
