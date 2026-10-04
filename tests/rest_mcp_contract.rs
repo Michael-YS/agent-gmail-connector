@@ -1161,7 +1161,10 @@ async fn openapi_describes_every_rest_route_and_write_contract() {
         )
         .await
         .unwrap();
-    let document = response_json(response).await;
+    let mut document = response_json(response).await;
+    assert_eq!(document["info"]["version"], env!("CARGO_PKG_VERSION"));
+    // Keep the contract snapshot stable across package version bumps.
+    document["info"]["version"] = json!("0.1.0");
     let openapi_digest = hex::encode(Sha256::digest(
         serde_json::to_vec(&document).expect("OpenAPI document serializes"),
     ));

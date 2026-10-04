@@ -4,6 +4,8 @@
 
 ## 当前状态
 
+- 2026-10-04 发布修正 `v0.1.2`：`v0.1.1` 的 [Release #2](https://github.com/Michael-YS/agent-gmail-connector/actions/runs/37231908556) 双架构均在 OpenAPI 全文快照测试失败：快照包含包版本，升级版本即改变哈希。测试现独立断言实际版本与 Cargo 一致，仅将快照中的版本归一化至原基线 0.1.0，保留其余契约严格比较；生产接口未修改。保留失败标签，Cargo/锁文件同步 0.1.2，新标签发布与签名待 Actions 验收，未部署生产。
+
 - 2026-10-04 发布修正 `v0.1.1`：`v0.1.0` 的 [Release #1](https://github.com/Michael-YS/agent-gmail-connector/actions/runs/37230125008) 已通过 amd64/arm64 原生完整测试、审计、镜像构建、启动 smoke 和本地镜像零漏洞扫描，且两架构 digest 已推送；但 arm64 远端索引扫描因 Trivy 默认选择 linux/amd64 而失败，多架构版本索引及签名未发布。已为两个扫描步骤显式设置 `TRIVY_PLATFORM=linux/${{ matrix.arch }}`；同一失败 arm64 digest 在本地显式平台复测为零漏洞，actionlint 通过。保留失败标签、不移动或复用；Cargo/锁文件同步 0.1.1，最终版本与签名验收以新标签 Actions 为准，未部署生产。
 - 2026-10-04 发布准备：修复提交 `4d4f714` 的 [CI #36](https://github.com/Michael-YS/agent-gmail-connector/actions/runs/37228538106) 已全绿。首个版本计划为 `v0.1.0`（Cargo 0.1.0）；release workflow 改为 amd64/arm64 原生验证和构建、双架构严格 Trivy 扫描及启动 smoke、精确已发布 digest 再扫描，然后生成多架构版本索引、SBOM/provenance 和 keyless 签名/验签。静态 actionlint 校验已通过；真实标签发布和签名结果以对应 Actions 运行记录为准，未部署生产。
 - 2026-10-04 CI 运行时漏洞修复：Dockerfile 改用官方、摘要固定的 Rust 1.97 Alpine 构建与 Alpine 3.24.2 运行时，以 musl 编译，移除应用不需要的 Debian 包；保留 UID/GID 10001、CA、完整 wget、原数据/备份路径及 HEALTHCHECK。新增 `scripts/container-smoke.sh` 验证非 root 身份、SQLite 迁移/status、只读启动、live/ready 和在线备份，使用独立临时 volume 与临时测试配置，退出清理。最终 amd64 镜像本地构建、上述 smoke、DNS/HTTPS 证书验证均通过；Trivy v0.75.0 同强度扫描最终镜像为零漏洞。CI 延长至 60 分钟以覆盖首次 musl release 编译，漏洞门禁、未修复漏洞和所有严重级别均保留；完整 GitHub CI 以本分支最新运行记录为准，未合并或部署。
