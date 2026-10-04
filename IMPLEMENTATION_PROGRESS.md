@@ -4,6 +4,7 @@
 
 ## 当前状态
 
+- 2026-10-04 GitHub CI #30（`cd83896`）已通过 fmt/check/clippy/test，随后 `cargo audit` 发现 `rustls 0.23.43` 的 `RUSTSEC-2026-0285`，阻止镜像构建。已定向更新锁文件至修复版本 `0.23.45`，未新增审计例外；本地 locked 全目标/全特性测试（238 项）、`cargo audit --ignore RUSTSEC-2023-0071` 和 `cargo deny check` 通过。升级后的 GitHub CI 完整验收待完成，本轮未部署。
 - 2026-10-04 CI 测试夹具修复：`google_client_secret_files_use_size_permission_and_exclusivity_rules` 的空文件在 Unix 上显式设为 `0600`，避免默认 `umask 022` 先触发权限错误；生产 secret 文件校验未改。分支 `codex/fix-secret-file-test-permissions` 本地 `cargo fmt --check`、严格全目标/全特性 Clippy 和 locked 全目标/全特性测试均通过（238 项）；WSL Ubuntu 24.04 在 `umask 022` 下的原失败精确测试通过。GitHub Actions 验收待完成，本轮未部署。
 - 本轮只读 MCP `connections.list` 已提交并部署 `b38f8c2`：与 REST `GET /api/v1/connections` 共用当前 Key 的 active、same-owner grant 过滤，不请求 Gmail、不返回凭证；空对象参数（或省略 arguments）返回 Connection 元数据，非空对象、null 和数组被拒绝。新增无 Connection target 的元数据审计、三个 MCP 入口的契约回归与更新后的工具 schema snapshot，Agent 使用说明已同步。独立源码复核未发现实现问题，格式与 diff 检查通过；用户运行全量测试与严格 Clippy 后报告 all pass。用户完成 S1 amd64 构建后已健康切换，真实 Hermes 刷新工具列表并调用 `{}` 尚待验收；Git push 被安全审核拦截，待用户明确允许向 origin 推送。
 - 工作分支：`feat/agentmail-v1`
