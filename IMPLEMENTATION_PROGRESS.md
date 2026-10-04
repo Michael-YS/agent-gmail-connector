@@ -4,6 +4,7 @@
 
 ## 当前状态
 
+- 2026-10-04 发布准备：修复提交 `4d4f714` 的 [CI #36](https://github.com/Michael-YS/agent-gmail-connector/actions/runs/37228538106) 已全绿。首个版本计划为 `v0.1.0`（Cargo 0.1.0）；release workflow 改为 amd64/arm64 原生验证和构建、双架构严格 Trivy 扫描及启动 smoke、精确已发布 digest 再扫描，然后生成多架构版本索引、SBOM/provenance 和 keyless 签名/验签。静态 actionlint 校验已通过；真实标签发布和签名结果以对应 Actions 运行记录为准，未部署生产。
 - 2026-10-04 CI 运行时漏洞修复：Dockerfile 改用官方、摘要固定的 Rust 1.97 Alpine 构建与 Alpine 3.24.2 运行时，以 musl 编译，移除应用不需要的 Debian 包；保留 UID/GID 10001、CA、完整 wget、原数据/备份路径及 HEALTHCHECK。新增 `scripts/container-smoke.sh` 验证非 root 身份、SQLite 迁移/status、只读启动、live/ready 和在线备份，使用独立临时 volume 与临时测试配置，退出清理。最终 amd64 镜像本地构建、上述 smoke、DNS/HTTPS 证书验证均通过；Trivy v0.75.0 同强度扫描最终镜像为零漏洞。CI 延长至 60 分钟以覆盖首次 musl release 编译，漏洞门禁、未修复漏洞和所有严重级别均保留；完整 GitHub CI 以本分支最新运行记录为准，未合并或部署。
 - 2026-10-04 历史 GitHub CI #35（`0b98f8a`，[运行记录](https://github.com/Michael-YS/agent-gmail-connector/actions/runs/37203076186)）通过格式/check/严格 Clippy、238 项测试、依赖审计、amd64 镜像构建和 UID/GID smoke；完整 CI 仍因 Trivy 漏洞门禁失败。运行时包升级消除了 #34 的 `libpcre2-8-0` 与 `tzdata` 两项可修复记录；Debian 12.15 镜像剩余 256 项（1 Unknown、80 Low、115 Medium、56 High、4 Critical），扫描报告全部未列出修复版本。Critical 涉及 `perl-base` 的 CVE-2026-13221、CVE-2026-42496、CVE-2026-8376，以及 `zlib1g` 的 CVE-2023-45853。仍保留所有严重级别及未修复漏洞的失败门禁；零漏洞验收未完成，下一步需评估运行时镜像及漏洞适用性，未新增忽略、未合并或部署。
 - 2026-10-04 镜像扫描配置补齐：Docker Scout 官方 action 文档要求 Docker Hub 登录，而当前 CI 未配置此凭证；CI 改用固定 SHA 的 Trivy action 与固定 `v0.75.0` 工具版本，只扫描漏洞，覆盖 OS/library、所有严重级别及未修复漏洞，发现漏洞仍返回非零。未创建凭证、未新增漏洞忽略；最终完整 CI 待验收，release workflow 未改。

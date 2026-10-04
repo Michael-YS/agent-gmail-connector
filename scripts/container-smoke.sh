@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 image=${1:-agentmail:ci}
+expected_arch=${2:-amd64}
 name="agentmail-smoke-${RANDOM}-$$"
 volume="$name-data"
 cleanup() {
@@ -10,7 +11,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-test "$(docker image inspect "$image" --format '{{.Architecture}}')" = amd64
+test "$(docker image inspect "$image" --format '{{.Architecture}}')" = "$expected_arch"
 test "$(docker run --rm --entrypoint /usr/bin/id "$image" -u)" = 10001
 test "$(docker run --rm --entrypoint /usr/bin/id "$image" -g)" = 10001
 
