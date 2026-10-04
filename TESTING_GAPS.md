@@ -13,7 +13,7 @@
 - 待执行：真实 refresh、Google 端 revoke 状态核对、撤销后重新授权 callback，以及真实 MCP client。单封垃圾邮箱自发自收、Sent/Inbox 只读核对、临时 Key 与 Connection 的本地撤销已完成；不要再次发送，也不要复制 callback URL、authorization code 或 token 到日志/文档。
 - 撤销后点击 Connect Gmail 暴露 POST→Google 307 重定向：Nginx 收到表单请求并返回 307，浏览器未到授权页。`0c5780e` 已改成 303 并补测试；用户报告全量测试和严格 Clippy 均通过，S1 构建与健康部署已完成，真实 Google callback 尚未验证。
 - 非 Owner 且尚未受邀的另一 Google 账号尝试 Panel 登录，Login callback 返回了误导性的 HTTP 503；只读核对表明 S1 仅有一个有效 Owner，没有该账号的 Member。`88fbe8a` 已将此情况改为 HTTP 403 `authentication_failed`，不创建账号或 session；用户报告全量测试和严格 Clippy 均通过，S1 已健康部署，真实浏览器回归仍待执行。已消费的旧 callback 不可刷新重放。
-- 本机测试环境注意：默认 `umask 022` 会使 `config::tests::google_client_secret_files_use_size_permission_and_exclusivity_rules` 的空文件先触发权限错误；默认测试并发叠加编译负载时，Connection revoke 压力测试曾触发 SQLite `PoolTimedOut`。复跑使用 `umask 077` 和 `--test-threads=2`；测试夹具对权限/负载的敏感性仍未在代码中修正，本轮没有放宽生产权限校验或测试超时。
+- 测试夹具修复：`config::tests::google_client_secret_files_use_size_permission_and_exclusivity_rules` 的空文件现在在 Unix 上显式设置 `0600`，避免默认 `umask 022` 创建的 `0644` 权限先触发权限错误；生产权限校验未改。默认测试并发叠加编译负载时，Connection revoke 压力测试曾触发 SQLite `PoolTimedOut`，必要时使用 `--test-threads=2`；此负载敏感性仍未修正，测试超时未放宽。
 - `mcp_draft_writes_validate_arguments_and_charge_per_request` 曾固定要求两次请求后的分钟桶计数为 2，跨分钟时会误失败。当前测试先断言 REST create 计费一次，再按 MCP update 前后窗口是否相同断言计数为 2 或 1，仍能发现第二次请求未计费；生产限流逻辑未改。用户复跑全量测试与严格 Clippy 后报告全 pass。
 - 登录前公开首页此前没有任何 CSS；`44193e1` 补内联响应式明暗样式，并断言首页样式、CSP 和原有登录/法律链接。用户报告全量测试与严格 Clippy 全 pass，S1 已健康部署；公网首页含新样式，真实浏览器窄屏深色视图的标题、登录按钮和法律链接已核对，无明显溢出，未点击登录。本轮未单独截图验证宽屏和浅色视图。
 

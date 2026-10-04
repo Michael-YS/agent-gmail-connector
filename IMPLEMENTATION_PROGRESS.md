@@ -1,9 +1,10 @@
 # AgentMail v1 实现进度
 
-更新时间：2026-09-28
+更新时间：2026-10-04
 
 ## 当前状态
 
+- 2026-10-04 CI 测试夹具修复：`google_client_secret_files_use_size_permission_and_exclusivity_rules` 的空文件在 Unix 上显式设为 `0600`，避免默认 `umask 022` 先触发权限错误；生产 secret 文件校验未改。分支 `codex/fix-secret-file-test-permissions` 本地 `cargo fmt --check`、严格全目标/全特性 Clippy 和 locked 全目标/全特性测试均通过（238 项）；WSL Ubuntu 24.04 在 `umask 022` 下的原失败精确测试通过。GitHub Actions 验收待完成，本轮未部署。
 - 本轮只读 MCP `connections.list` 已提交并部署 `b38f8c2`：与 REST `GET /api/v1/connections` 共用当前 Key 的 active、same-owner grant 过滤，不请求 Gmail、不返回凭证；空对象参数（或省略 arguments）返回 Connection 元数据，非空对象、null 和数组被拒绝。新增无 Connection target 的元数据审计、三个 MCP 入口的契约回归与更新后的工具 schema snapshot，Agent 使用说明已同步。独立源码复核未发现实现问题，格式与 diff 检查通过；用户运行全量测试与严格 Clippy 后报告 all pass。用户完成 S1 amd64 构建后已健康切换，真实 Hermes 刷新工具列表并调用 `{}` 尚待验收；Git push 被安全审核拦截，待用户明确允许向 origin 推送。
 - 工作分支：`feat/agentmail-v1`
 - 本轮 Hermes 公网 MCP 连接的 `403 Host header is not allowed` 修复 `c08553a` 已部署：线上 rmcp 原先使用默认 loopback 白名单，而 Nginx 正确转发公网域名。生产启动显式传入已验证 `PUBLIC_BASE_URL` 的 authority（保留 IPv6 括号和非默认端口），保留本机白名单、Bearer 鉴权与未知 Host 拒绝，不从请求 Host/Forwarded 推导信任配置。原路由构造入口仍保留 loopback 默认行为；无 schema 变更。公网域名 initialize/tools/list、别名、本机、缺失鉴权、Forwarded 伪造和非默认端口已有回归；格式与 diff 检查通过，用户运行全量测试与严格 Clippy 后报告全过。新容器健康、内外网 live/ready 和首页 200，匿名 MCP initialize 仍为 401；真实 Hermes 重连与 tools/list 尚待用户验收。

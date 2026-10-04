@@ -653,6 +653,11 @@ mod tests {
 
         let empty = dir.path().join("empty");
         std::fs::write(&empty, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let mut values = map();
         values.remove("LOGIN_CLIENT_SECRET");
         values.insert(
