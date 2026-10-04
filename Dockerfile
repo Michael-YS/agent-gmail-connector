@@ -11,6 +11,7 @@ RUN touch src/main.rs && cargo build --release --locked
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 ENV RUST_BACKTRACE=1
 RUN apt-get update \
+    && apt-get upgrade --no-install-recommends --yes \
     && apt-get install --no-install-recommends --yes ca-certificates wget \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 agentmail \
