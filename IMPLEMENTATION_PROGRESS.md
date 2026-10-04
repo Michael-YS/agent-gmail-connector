@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- 2026-10-04 GitHub CI #34（`7385cd6`）已通过完整 Rust 检查/测试、依赖审计、amd64 镜像构建和 UID/GID smoke；Trivy 扫描正常运行，但 Debian 12.15 镜像有 258 项记录（4 Critical、57 High），门禁失败。报告仅 `libpcre2-8-0` 与 `tzdata` 两项有修复版本，4 项 Critical 均未提供修复版本；Dockerfile 增加运行时包升级以纳入已发布修复，仍保留所有严重级别及未修复漏洞的失败门禁。后续 CI 结果待核对，未合并或部署。
+- 2026-10-04 最终 GitHub CI #35（`0b98f8a`，[运行记录](https://github.com/Michael-YS/agent-gmail-connector/actions/runs/37203076186)）通过格式/check/严格 Clippy、238 项测试、依赖审计、amd64 镜像构建和 UID/GID smoke；完整 CI 仍因 Trivy 漏洞门禁失败。运行时包升级消除了 #34 的 `libpcre2-8-0` 与 `tzdata` 两项可修复记录；Debian 12.15 镜像剩余 256 项（1 Unknown、80 Low、115 Medium、56 High、4 Critical），扫描报告全部未列出修复版本。Critical 涉及 `perl-base` 的 CVE-2026-13221、CVE-2026-42496、CVE-2026-8376，以及 `zlib1g` 的 CVE-2023-45853。仍保留所有严重级别及未修复漏洞的失败门禁；零漏洞验收未完成，下一步需评估运行时镜像及漏洞适用性，未新增忽略、未合并或部署。
 - 2026-10-04 镜像扫描配置补齐：Docker Scout 官方 action 文档要求 Docker Hub 登录，而当前 CI 未配置此凭证；CI 改用固定 SHA 的 Trivy action 与固定 `v0.75.0` 工具版本，只扫描漏洞，覆盖 OS/library、所有严重级别及未修复漏洞，发现漏洞仍返回非零。未创建凭证、未新增漏洞忽略；最终完整 CI 待验收，release workflow 未改。
 - 2026-10-04 GitHub CI #31（`d001c0e`）通过测试、依赖审计与 amd64 镜像构建，随后容器 smoke 失败：`id --user` 输出数字 UID，旧脚本错误比较完整 `id` 文本。CI 现分别断言 UID/GID 都为 10001；漏洞扫描复用 release workflow 固定 SHA 的 Docker Scout action，保持 `exit-code: true`。已整合远端 `main`（`26ab695`），整合后本地 238 项测试、格式和严格 Clippy 通过；最终 CI 验收仍待完成，README 原有未提交修改保留，本轮未部署。
 - 2026-10-04 GitHub CI #30（`cd83896`）已通过 fmt/check/clippy/test，随后 `cargo audit` 发现 `rustls 0.23.43` 的 `RUSTSEC-2026-0285`，阻止镜像构建。已定向更新锁文件至修复版本 `0.23.45`，未新增审计例外；本地 locked 全目标/全特性测试（238 项）、`cargo audit --ignore RUSTSEC-2023-0071` 和 `cargo deny check` 通过。升级后的 GitHub CI 完整验收待完成，本轮未部署。
