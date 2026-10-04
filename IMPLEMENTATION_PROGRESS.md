@@ -4,6 +4,7 @@
 
 ## 当前状态
 
+- 2026-10-04 镜像扫描配置补齐：Docker Scout 官方 action 文档要求 Docker Hub 登录，而当前 CI 未配置此凭证；CI 改用固定 SHA 的 Trivy action 与固定 `v0.75.0` 工具版本，只扫描漏洞，覆盖 OS/library、所有严重级别及未修复漏洞，发现漏洞仍返回非零。未创建凭证、未新增漏洞忽略；最终完整 CI 待验收，release workflow 未改。
 - 2026-10-04 GitHub CI #31（`d001c0e`）通过测试、依赖审计与 amd64 镜像构建，随后容器 smoke 失败：`id --user` 输出数字 UID，旧脚本错误比较完整 `id` 文本。CI 现分别断言 UID/GID 都为 10001；漏洞扫描复用 release workflow 固定 SHA 的 Docker Scout action，保持 `exit-code: true`。已整合远端 `main`（`26ab695`），整合后本地 238 项测试、格式和严格 Clippy 通过；最终 CI 验收仍待完成，README 原有未提交修改保留，本轮未部署。
 - 2026-10-04 GitHub CI #30（`cd83896`）已通过 fmt/check/clippy/test，随后 `cargo audit` 发现 `rustls 0.23.43` 的 `RUSTSEC-2026-0285`，阻止镜像构建。已定向更新锁文件至修复版本 `0.23.45`，未新增审计例外；本地 locked 全目标/全特性测试（238 项）、`cargo audit --ignore RUSTSEC-2023-0071` 和 `cargo deny check` 通过。升级后的 GitHub CI 完整验收待完成，本轮未部署。
 - 2026-10-04 CI 测试夹具修复：`google_client_secret_files_use_size_permission_and_exclusivity_rules` 的空文件在 Unix 上显式设为 `0600`，避免默认 `umask 022` 先触发权限错误；生产 secret 文件校验未改。分支 `codex/fix-secret-file-test-permissions` 本地 `cargo fmt --check`、严格全目标/全特性 Clippy 和 locked 全目标/全特性测试均通过（238 项）；WSL Ubuntu 24.04 在 `umask 022` 下的原失败精确测试通过。GitHub Actions 验收待完成，本轮未部署。
