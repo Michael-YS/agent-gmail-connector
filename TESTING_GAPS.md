@@ -2,6 +2,8 @@
 
 ## 人工发送草稿对账（2026-10-20）
 
+- 已部署 `agentmail:6b8eb92`：241 项自动测试、格式、严格 Clippy、amd64 容器 smoke、生产备份完整性/外键/原始 checksum 和新二进制备份副本 migration 验证通过；源站/公网健康及新 OpenAPI 契约已确认，匿名鉴权正常。保留 `3d85c3f` 回退，真实人工发送仍按下述方法待验收。
+
 - 已实现按需识别：managed draft 消失后，精确 Sent 匹配则 `sent`，无唯一匹配则 `send_state_unknown`；查询错误不改变状态，绝不因草稿消失重建或重发。无后台同步。
 - 自动回归：五种操作触发对账、未知后再次只读确认、未登记草稿 404、跨 Connection 拒绝、上游查询失败不改变状态、草稿消失后的已 claim 重启恢复和 timeout/404 重放不重发均通过；本轮全目标/全特性 locked 测试共 241 项通过。
 - 待执行真实 Gmail 验收：仅使用垃圾邮箱与明确 allowlist，创建一个 managed draft，人工在 Gmail 审核并发送一次；用原 Gmail draft ID 读取，核对 `draft: null` 和 `managed_draft.state=sent`，之后只做读取，不能为验收再次调用发送。另用一个可丢弃草稿确认删除后返回未知；若 Gmail 编辑改变 Message-ID，应安全保留未知。该流程未在本轮自动执行。
