@@ -7,9 +7,7 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src && printf 'fn main() {}\n' > src/main.rs
 RUN cargo build --release --locked
 COPY . .
-# Match historical production SQLx checksums even when archives contain CRLF.
-RUN perl -pi -e 's/\r\n/\n/g' migrations/*.sql \
-    && touch src/main.rs && cargo build --release --locked
+RUN touch src/main.rs && cargo build --release --locked
 
 FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS runtime-base
 ENV RUST_BACKTRACE=1

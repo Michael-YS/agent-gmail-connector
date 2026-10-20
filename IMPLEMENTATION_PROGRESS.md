@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- 2026-10-20 人工发送草稿对账：读取已登记 Gmail draft ID 或操作 managed draft 时，若 Gmail 返回草稿不存在，按稳定 Message-ID 做唯一精确 Sent 匹配；找到则持久化 `sent`，否则 `send_state_unknown`，上游查询失败保留原状态。写操作明确返回 `draft_already_sent` / `draft_missing`，不会创建副本或重发；读取缺失 managed draft 返回 `draft: null` 与登记状态。发送已 claim/已完成的恢复与重放不再依赖 Gmail 草稿仍存在，发送阶段 404 也只做 Sent 对账。复用现有状态，无 schema migration、后台同步或权限变更；本轮全目标/全特性 locked 测试 241 项通过（212 library、5 HTTP、24 REST/MCP），格式和严格 Clippy 通过；部署预检发现 Git 归档历史 migration 的 CRLF 与生产 LF 差异，镜像构建阶段统一 CRLF→LF 并保留末行字节边界，以兼容生产 SQLx checksum；不改变 schema。容器及部署验收另行记录，真实 Gmail 人工发送仍待垃圾邮箱验收。
+- 2026-10-20 人工发送草稿对账：读取已登记 Gmail draft ID 或操作 managed draft 时，若 Gmail 返回草稿不存在，按稳定 Message-ID 做唯一精确 Sent 匹配；找到则持久化 `sent`，否则 `send_state_unknown`，上游查询失败保留原状态。写操作明确返回 `draft_already_sent` / `draft_missing`，不会创建副本或重发；读取缺失 managed draft 返回 `draft: null` 与登记状态。发送已 claim/已完成的恢复与重放不再依赖 Gmail 草稿仍存在，发送阶段 404 也只做 Sent 对账。复用现有状态，无 schema migration、后台同步或权限变更；本轮全目标/全特性 locked 测试 241 项通过（212 library、5 HTTP、24 REST/MCP），格式和严格 Clippy 通过；部署验收另行记录，真实 Gmail 人工发送仍待垃圾邮箱验收。
 
 - 2026-10-04 发布修正 `v0.1.2`：`v0.1.1` 的 [Release #2](https://github.com/Michael-YS/agent-gmail-connector/actions/runs/37231908556) 双架构均在 OpenAPI 全文快照测试失败：快照包含包版本，升级版本即改变哈希。测试现独立断言实际版本与 Cargo 一致，仅将快照中的版本归一化至原基线 0.1.0，保留其余契约严格比较；生产接口未修改。保留失败标签，Cargo/锁文件同步 0.1.2，新标签发布与签名待 Actions 验收，未部署生产。
 
