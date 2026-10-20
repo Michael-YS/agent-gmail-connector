@@ -31,7 +31,10 @@ use crate::{
     database::{Database, DatabaseError},
     domain::{
         access::{AccessKey, KeyPublicId, parse_credential},
-        delivery::{DraftVersion, ManagedDraft, SendConfirmation, SendOutcome, SendPreview},
+        delivery::{
+            DraftVersion, ManagedDraft, ManagedDraftState, SendConfirmation, SendOutcome,
+            SendPreview,
+        },
         identity::{ConnectionId, GmailConnection, User, UserId, UserRole},
         mailbox::{
             AttachmentInfo, EmailAddress, MAX_HTTP_ATTACHMENT_BYTES, MAX_MCP_ATTACHMENT_BYTES,
@@ -997,7 +1000,33 @@ async fn draft_get_payload(
     connection: ConnectionId,
     draft_id: &str,
 ) -> Result<Value, AdapterError> {
-    let draft = state.adapter.get_draft(connection, draft_id).await?;
+    let draft = match state.adapter.get_draft(connection, draft_id).await {
+        Ok(draft) => draft,
+        Err(AdapterError::NotFound) => {
+            let managed = managed_draft_for_gmail(state, connection, draft_id)
+                .await
+                .ok_or(AdapterError::NotFound)?;
+            let lock = draft_lock(state, managed.id).await;
+            let _guard = lock.lock().await;
+            let mut managed = state
+                .drafts
+                .read()
+                .await
+                .get(&managed.id)
+                .cloned()
+                .unwrap_or(managed);
+            let message_id = reconcile_missing_draft(state, &mut managed).await?;
+            return Ok(json!({
+                "connection_id":connection,
+                "draft":null,
+                "managed_by_agentmail":true,
+                "version":managed.version,
+                "managed_draft":managed,
+                "gmail_message_id":message_id,
+            }));
+        }
+        Err(error) => return Err(error),
+    };
     let managed = managed_draft_for_gmail(state, connection, &draft.id).await;
     Ok(json!({
         "connection_id":connection,
@@ -1259,16 +1288,78 @@ fn draft_fingerprint_content(draft: &MailDraft) -> Vec<u8> {
     .expect("draft fingerprint JSON serializes")
 }
 
+// A missing draft can have been sent or discarded in Gmail. Only an exact Sent
+// match proves delivery; absence must never make the draft writable again.
+async fn reconcile_missing_draft(
+    state: &AppState,
+    managed: &mut ManagedDraft,
+) -> Result<Option<String>, AdapterError> {
+    if !matches!(
+        managed.state,
+        ManagedDraftState::Active | ManagedDraftState::SendStateUnknown
+    ) {
+        return Ok(None);
+    }
+    let message_id = state
+        .adapter
+        .find_sent_message(managed.connection_id, &managed.message_id)
+        .await?;
+    let mut reconciled = managed.clone();
+    reconciled.state = if message_id.is_some() {
+        ManagedDraftState::Sent
+    } else {
+        ManagedDraftState::SendStateUnknown
+    };
+    if let Some(repository) = &state.repository {
+        repository
+            .update_draft(&reconciled, &managed.version)
+            .await
+            .map_err(|_| AdapterError::Unavailable)?;
+    }
+    state
+        .drafts
+        .write()
+        .await
+        .insert(reconciled.id, reconciled.clone());
+    *managed = reconciled;
+    Ok(message_id)
+}
+
 async fn refresh_managed_draft(
     state: &AppState,
     managed: &mut ManagedDraft,
     headers: &HeaderMap,
 ) -> Result<MailDraft, Box<Response>> {
-    let remote = state
+    let remote = match state
         .adapter
         .get_draft(managed.connection_id, &managed.gmail_draft_id)
         .await
-        .map_err(|error| Box::new(adapter_response(error, headers)))?;
+    {
+        Ok(remote) => remote,
+        Err(AdapterError::NotFound) => {
+            reconcile_missing_draft(state, managed)
+                .await
+                .map_err(|error| Box::new(adapter_response(error, headers)))?;
+            let (code, message) = match managed.state {
+                ManagedDraftState::Sent => (
+                    "draft_already_sent",
+                    "draft has already been sent; do not recreate or resend",
+                ),
+                ManagedDraftState::SendStateUnknown => (
+                    "draft_missing",
+                    "draft is missing; delivery is unconfirmed; do not recreate or resend",
+                ),
+                _ => ("invalid_state", "draft is no longer writable"),
+            };
+            return Err(Box::new(error_response(
+                StatusCode::CONFLICT,
+                code,
+                message,
+                headers,
+            )));
+        }
+        Err(error) => return Err(Box::new(adapter_response(error, headers))),
+    };
     if remote.stable_message_id != managed.message_id {
         return Err(Box::new(error_response(
             StatusCode::CONFLICT,
@@ -2301,7 +2392,9 @@ async fn send_draft_authorized(
     if let Err(response) = draft_for_connection(&draft, cid, &headers) {
         return *response;
     }
-    if let Err(response) = refresh_managed_draft(state, &mut draft, &headers).await {
+    if draft.state == ManagedDraftState::Active
+        && let Err(response) = refresh_managed_draft(state, &mut draft, &headers).await
+    {
         return *response;
     }
     let now = Utc::now();
@@ -2422,9 +2515,7 @@ async fn send_draft_authorized(
             gmail_message_id: message_id,
         },
         Err(AdapterError::Timeout) => SendOutcome::StateUnknown,
-        Err(AdapterError::NotFound) => SendOutcome::Failed {
-            code: "upstream_not_found".to_owned(),
-        },
+        Err(AdapterError::NotFound) => reconcile_sent_outcome(state, cid, &draft.message_id).await,
         Err(AdapterError::InvalidInput) => SendOutcome::Failed {
             code: "invalid_draft".to_owned(),
         },
@@ -2525,7 +2616,9 @@ async fn send_draft_durable(
     if let Err(response) = draft_for_connection(&draft, connection_id, headers) {
         return *response;
     }
-    if let Err(response) = refresh_managed_draft(state, &mut draft, headers).await {
+    if draft.state == ManagedDraftState::Active
+        && let Err(response) = refresh_managed_draft(state, &mut draft, headers).await
+    {
         return *response;
     }
     let now = Utc::now();
@@ -2618,6 +2711,7 @@ async fn send_draft_durable(
                 },
                 Err(
                     AdapterError::Timeout
+                    | AdapterError::NotFound
                     | AdapterError::Unavailable
                     | AdapterError::RateLimited { .. },
                 ) => reconcile_sent_outcome(state, connection_id, &draft.message_id).await,
@@ -3119,7 +3213,7 @@ async fn openapi() -> impl IntoResponse {
         json!({"openapi":"3.1.0","info":{"title":"AgentMail API","version":env!("CARGO_PKG_VERSION")},"paths":paths,"components":{"securitySchemes":{"bearerAuth":{"type":"http","scheme":"bearer","bearerFormat":"AgentMail Access Key"}},"responses":{"BadRequest":{"description":"Invalid request","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ErrorResponse"}}}},"Unauthorized":{"description":"Missing or invalid Bearer Access Key","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ErrorResponse"}}}},"Forbidden":{"description":"Access denied","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ErrorResponse"}}}},"NotFound":{"description":"Resource not found","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ErrorResponse"}}}},"Conflict":{"description":"Conflict","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ErrorResponse"}}}},"RateLimited":{"description":"Rate limited","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ErrorResponse"}}}},"Unavailable":{"description":"Upstream unavailable","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ErrorResponse"}}}}},"schemas":{
         "Uuid":{"type":"string","format":"uuid"},"Email":{"type":"string","format":"email"},"Connection":{"type":"object","required":["connection_id","email","status","granted_scopes"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"email":{"$ref":"#/components/schemas/Email"},"status":{"type":"string"},"granted_scopes":{"type":"array","items":{"type":"string"}}}},"ConnectionsResponse":{"type":"object","required":["connections"],"properties":{"connections":{"type":"array","items":{"$ref":"#/components/schemas/Connection"}}}},
         "AttachmentInfo":{"type":"object","required":["id","filename","content_type","size_bytes","inline"],"properties":{"id":{"type":"string"},"filename":{"type":"string"},"content_type":{"type":"string"},"size_bytes":{"type":"integer","minimum":0},"inline":{"type":"boolean"}}},"MessageMetadata":{"type":"object","required":["id","to","cc","subject","snippet","attachments"],"properties":{"id":{"type":"string"},"thread_id":{"type":["string","null"]},"sent_at":{"type":["string","null"]},"from":{"anyOf":[{"$ref":"#/components/schemas/Email"},{"type":"null"}]},"to":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"cc":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"subject":{"type":"string"},"snippet":{"type":"string"},"attachments":{"type":"array","items":{"$ref":"#/components/schemas/AttachmentInfo"}}}},"MessageSearchResult":{"type":"object","required":["connection_id","messages","next_cursor"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"messages":{"type":"array","items":{"$ref":"#/components/schemas/MessageMetadata"}},"next_cursor":{"type":["string","null"]}}},"MessageResponse":{"type":"object","required":["connection_id","message","untrusted_email_content"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"message":{"type":"object"},"untrusted_email_content":{"const":true}}},"ThreadResponse":{"type":"object","required":["connection_id","thread_id","messages","untrusted_email_content"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"thread_id":{"type":"string"},"messages":{"type":"array","items":{"type":"object"}},"untrusted_email_content":{"const":true}}},
-        "MailDraft":{"type":"object","required":["id","stable_message_id","subject","body","to","cc","bcc","attachments"],"properties":{"id":{"type":"string"},"stable_message_id":{"type":"string"},"thread_id":{"type":["string","null"]},"subject":{"type":"string"},"body":{"type":"string"},"to":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"cc":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"bcc":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"attachments":{"type":"array","items":{"$ref":"#/components/schemas/AttachmentInfo"}},"html_body":{"type":["string","null"]}}},"ManagedDraft":{"type":"object","required":["id","connection_id","gmail_draft_id","message_id","version","state"],"properties":{"id":{"$ref":"#/components/schemas/Uuid"},"connection_id":{"$ref":"#/components/schemas/Uuid"},"gmail_draft_id":{"type":"string"},"message_id":{"type":"string"},"version":{"type":"string"},"state":{"type":"string"}}},"DraftRequest":{"type":"object","properties":{"kind":{"type":"string","enum":["new","reply","reply_all","forward"],"default":"new"},"source_message_id":{"type":["string","null"]},"subject":{"type":"string"},"body":{"type":"string"},"to":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"cc":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"bcc":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"thread_id":{"type":["string","null"]},"expected_version":{"type":["string","null"]},"include_attachments":{"type":"boolean","default":true}}},"DraftMultipartRequest":{"type":"object","required":["metadata"],"properties":{"metadata":{"$ref":"#/components/schemas/DraftRequest"},"attachments":{"type":"array","items":{"type":"string","format":"binary"}}}},"DraftResponse":{"type":"object","required":["connection_id","draft","managed_by_agentmail","version"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"draft":{"$ref":"#/components/schemas/MailDraft"},"managed_by_agentmail":{"type":"boolean"},"version":{"type":["string","null"]}}},"DraftsResponse":{"type":"object","required":["connection_id","drafts"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"drafts":{"type":"array","items":{"$ref":"#/components/schemas/DraftResponse"}}}},"DraftMutationResponse":{"allOf":[{"$ref":"#/components/schemas/DraftResponse"},{"type":"object","properties":{"managed_draft":{"$ref":"#/components/schemas/ManagedDraft"}}}]},"DeletedResponse":{"type":"object","required":["connection_id","deleted"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"deleted":{"const":true}}},"SendRequest":{"type":"object","required":["confirmation_token"],"properties":{"confirmation_token":{"type":"string"}}},"PrepareSendResponse":{"type":"object","required":["connection_id","draft_id","confirmation_token","expires_at","preview"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"draft_id":{"$ref":"#/components/schemas/Uuid"},"confirmation_token":{"type":"string","writeOnly":true},"expires_at":{"type":"string","format":"date-time"},"preview":{"type":"object"}}},"SendResponse":{"type":"object"},"ErrorResponse":{"type":"object","required":["error"],"properties":{"error":{"type":"object","required":["code","message","request_id","retryable"],"properties":{"code":{"type":"string"},"message":{"type":"string"},"request_id":{"type":"string"},"retryable":{"type":"boolean"},"retry_after_seconds":{"type":["integer","null"]}}}}}
+        "MailDraft":{"type":"object","required":["id","stable_message_id","subject","body","to","cc","bcc","attachments"],"properties":{"id":{"type":"string"},"stable_message_id":{"type":"string"},"thread_id":{"type":["string","null"]},"subject":{"type":"string"},"body":{"type":"string"},"to":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"cc":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"bcc":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"attachments":{"type":"array","items":{"$ref":"#/components/schemas/AttachmentInfo"}},"html_body":{"type":["string","null"]}}},"ManagedDraft":{"type":"object","required":["id","connection_id","gmail_draft_id","message_id","version","state"],"properties":{"id":{"$ref":"#/components/schemas/Uuid"},"connection_id":{"$ref":"#/components/schemas/Uuid"},"gmail_draft_id":{"type":"string"},"message_id":{"type":"string"},"version":{"type":"string"},"state":{"type":"string"}}},"DraftRequest":{"type":"object","properties":{"kind":{"type":"string","enum":["new","reply","reply_all","forward"],"default":"new"},"source_message_id":{"type":["string","null"]},"subject":{"type":"string"},"body":{"type":"string"},"to":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"cc":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"bcc":{"type":"array","items":{"$ref":"#/components/schemas/Email"}},"thread_id":{"type":["string","null"]},"expected_version":{"type":["string","null"]},"include_attachments":{"type":"boolean","default":true}}},"DraftMultipartRequest":{"type":"object","required":["metadata"],"properties":{"metadata":{"$ref":"#/components/schemas/DraftRequest"},"attachments":{"type":"array","items":{"type":"string","format":"binary"}}}},"DraftResponse":{"type":"object","required":["connection_id","draft","managed_by_agentmail","version"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"draft":{"anyOf":[{"$ref":"#/components/schemas/MailDraft"},{"type":"null"}]},"managed_by_agentmail":{"type":"boolean"},"version":{"type":["string","null"]},"managed_draft":{"$ref":"#/components/schemas/ManagedDraft"},"gmail_message_id":{"type":["string","null"]}}},"DraftsResponse":{"type":"object","required":["connection_id","drafts"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"drafts":{"type":"array","items":{"$ref":"#/components/schemas/DraftResponse"}}}},"DraftMutationResponse":{"allOf":[{"$ref":"#/components/schemas/DraftResponse"},{"type":"object","properties":{"managed_draft":{"$ref":"#/components/schemas/ManagedDraft"}}}]},"DeletedResponse":{"type":"object","required":["connection_id","deleted"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"deleted":{"const":true}}},"SendRequest":{"type":"object","required":["confirmation_token"],"properties":{"confirmation_token":{"type":"string"}}},"PrepareSendResponse":{"type":"object","required":["connection_id","draft_id","confirmation_token","expires_at","preview"],"properties":{"connection_id":{"$ref":"#/components/schemas/Uuid"},"draft_id":{"$ref":"#/components/schemas/Uuid"},"confirmation_token":{"type":"string","writeOnly":true},"expires_at":{"type":"string","format":"date-time"},"preview":{"type":"object"}}},"SendResponse":{"type":"object"},"ErrorResponse":{"type":"object","required":["error"],"properties":{"error":{"type":"object","required":["code","message","request_id","retryable"],"properties":{"code":{"type":"string"},"message":{"type":"string"},"request_id":{"type":"string"},"retryable":{"type":"boolean"},"retry_after_seconds":{"type":["integer","null"]}}}}}
     }},"x-agentmail-mcp":"The canonical /mcp endpoint uses stateless Streamable HTTP; /mcp-compat is the legacy JSON-RPC compatibility surface."}),
     )
 }
@@ -3510,7 +3604,7 @@ async fn mcp_http_response(id: Value, response: Response, headers: &HeaderMap) -
         "reauth_required" => -32005,
         "forbidden" => -32006,
         "upstream_rate_limited" | "rate_limited" => -32029,
-        "draft_changed" | "invalid_state" => -32009,
+        "draft_changed" | "invalid_state" | "draft_already_sent" | "draft_missing" => -32009,
         "idempotency_key_conflict" | "idempotency_in_progress" => -32009,
         _ if status == StatusCode::BAD_REQUEST => -32602,
         _ => -32003,
@@ -4536,6 +4630,9 @@ mod tests {
     struct TimeoutThenReconcileAdapter {
         inner: FakeGmailAdapter,
         fail_next_create: AtomicBool,
+        fail_reconcile: AtomicBool,
+        remove_on_send: AtomicBool,
+        send_not_found: AtomicBool,
         send_calls: AtomicUsize,
         reconcile_calls: AtomicUsize,
     }
@@ -4616,11 +4713,18 @@ mod tests {
         }
         async fn send_draft(
             &self,
-            _connection: ConnectionId,
-            _draft_id: &str,
+            connection: ConnectionId,
+            draft_id: &str,
         ) -> Result<String, AdapterError> {
             self.send_calls.fetch_add(1, Ordering::SeqCst);
-            Err(AdapterError::Timeout)
+            if self.remove_on_send.load(Ordering::SeqCst) {
+                self.inner.delete_draft(connection, draft_id).await?;
+            }
+            if self.send_not_found.load(Ordering::SeqCst) {
+                Err(AdapterError::NotFound)
+            } else {
+                Err(AdapterError::Timeout)
+            }
         }
         async fn find_sent_message(
             &self,
@@ -4628,6 +4732,9 @@ mod tests {
             _stable_message_id: &str,
         ) -> Result<Option<String>, AdapterError> {
             self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_reconcile.load(Ordering::SeqCst) {
+                return Err(AdapterError::Unavailable);
+            }
             Ok(Some("reconciled-message".into()))
         }
     }
@@ -5173,6 +5280,213 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manually_sent_draft_is_reconciled_on_every_operation_without_sending() {
+        for operation in ["get", "prepare-send", "update", "delete", "send"] {
+            let (state, credential, connection, other) = persisted_state().await;
+            let app = router(state.clone());
+            let (_, created) = json_request(
+                &app,
+                Method::POST,
+                format!("/api/v1/connections/{connection}/drafts"),
+                &credential,
+                json!({"subject":"manual","body":"body","to":["to@example.com"]}),
+            )
+            .await;
+            let id: crate::domain::delivery::DraftId =
+                serde_json::from_value(created["managed_draft"]["id"].clone()).unwrap();
+            let gmail_id = created["draft"]["id"].as_str().unwrap();
+            let (_, prepared) = json_request(
+                &app,
+                Method::POST,
+                format!("/api/v1/connections/{connection}/drafts/{id}/prepare-send"),
+                &credential,
+                json!({}),
+            )
+            .await;
+            // Gmail has removed the draft; only its exact Sent match remains.
+            let adapter = Arc::new(TimeoutThenReconcileAdapter::default());
+            let restarted = AppState::new(state.database.clone(), adapter.clone());
+            let app = router(restarted.clone());
+            let (forbidden, _) = json_request(
+                &app,
+                Method::GET,
+                format!("/api/v1/connections/{other}/drafts/{gmail_id}"),
+                &credential,
+                json!({}),
+            )
+            .await;
+            assert_eq!(forbidden, StatusCode::FORBIDDEN);
+            assert_eq!(adapter.reconcile_calls.load(Ordering::SeqCst), 0);
+            let base = format!("/api/v1/connections/{connection}/drafts");
+            let (method, uri, body) = match operation {
+                "get" => (Method::GET, format!("{base}/{gmail_id}"), json!({})),
+                "update" => (
+                    Method::PATCH,
+                    format!("{base}/{id}"),
+                    json!({"expected_version":created["managed_draft"]["version"],"body":"edited"}),
+                ),
+                "delete" => (
+                    Method::DELETE,
+                    format!(
+                        "{base}/{id}?expected_version={}",
+                        created["managed_draft"]["version"].as_str().unwrap()
+                    ),
+                    json!({}),
+                ),
+                "send" => (
+                    Method::POST,
+                    format!("{base}/{id}/send"),
+                    json!({"confirmation_token":prepared["confirmation_token"]}),
+                ),
+                _ => (Method::POST, format!("{base}/{id}/prepare-send"), json!({})),
+            };
+            let (status, result) = json_request(&app, method, uri, &credential, body).await;
+            if operation == "get" {
+                assert_eq!(status, StatusCode::OK);
+                assert!(result["draft"].is_null());
+                assert_eq!(result["managed_draft"]["state"], "sent");
+                assert_eq!(result["gmail_message_id"], "reconciled-message");
+            } else {
+                assert_eq!(status, StatusCode::CONFLICT, "{operation}: {result}");
+                assert_eq!(result["error"]["code"], "draft_already_sent");
+            }
+            let repository = state.repository.as_ref().unwrap();
+            assert_eq!(
+                repository.get_draft(id).await.unwrap().unwrap().state,
+                ManagedDraftState::Sent
+            );
+            // The old confirmation cannot send, including after another restart.
+            let app = router(AppState::new(state.database.clone(), adapter.clone()));
+            let (status, _) = json_request(
+                &app,
+                Method::POST,
+                format!("{base}/{id}/send"),
+                &credential,
+                json!({"confirmation_token":prepared["confirmation_token"]}),
+            )
+            .await;
+            assert!(!status.is_success());
+            assert_eq!(adapter.send_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(adapter.reconcile_calls.load(Ordering::SeqCst), 1);
+            assert!(
+                adapter
+                    .inner
+                    .list_drafts(connection)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_draft_is_unknown_until_sent_match_and_unmanaged_stays_not_found() {
+        let (state, credential, connection, _) = persisted_state().await;
+        let app = router(state.clone());
+        let (_, created) = json_request(
+            &app,
+            Method::POST,
+            format!("/api/v1/connections/{connection}/drafts"),
+            &credential,
+            json!({"subject":"discarded","body":"body","to":["to@example.com"]}),
+        )
+        .await;
+        let id: crate::domain::delivery::DraftId =
+            serde_json::from_value(created["managed_draft"]["id"].clone()).unwrap();
+        let gmail_id = created["draft"]["id"].as_str().unwrap();
+        state
+            .adapter
+            .delete_draft(connection, gmail_id)
+            .await
+            .unwrap();
+        let (status, result) = json_request(
+            &app,
+            Method::GET,
+            format!("/api/v1/connections/{connection}/drafts/{gmail_id}"),
+            &credential,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result["managed_draft"]["state"], "send_state_unknown");
+        assert!(result["gmail_message_id"].is_null());
+        let (status, result) = json_request(
+            &app,
+            Method::POST,
+            format!("/api/v1/connections/{connection}/drafts/{id}/prepare-send"),
+            &credential,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(result["error"]["code"], "draft_missing");
+        let repository = state.repository.as_ref().unwrap();
+        assert_eq!(
+            repository.get_draft(id).await.unwrap().unwrap().state,
+            ManagedDraftState::SendStateUnknown
+        );
+        let (status, _) = json_request(
+            &app,
+            Method::GET,
+            format!("/api/v1/connections/{connection}/drafts/unmanaged"),
+            &credential,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let adapter = Arc::new(TimeoutThenReconcileAdapter::default());
+        let app = router(AppState::new(state.database.clone(), adapter.clone()));
+        let (status, result) = json_request(&app, Method::POST, "/mcp-compat".into(), &credential,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"drafts.get","arguments":{"connection_id":connection,"draft_id":gmail_id}}})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            result["result"]["structuredContent"]["managed_draft"]["state"],
+            "sent"
+        );
+        assert_eq!(adapter.send_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_sent_lookup_does_not_change_managed_state() {
+        let (state, credential, connection, _) = persisted_state().await;
+        let app = router(state.clone());
+        let (_, created) = json_request(
+            &app,
+            Method::POST,
+            format!("/api/v1/connections/{connection}/drafts"),
+            &credential,
+            json!({"subject":"lookup failure","body":"body","to":["to@example.com"]}),
+        )
+        .await;
+        let id = serde_json::from_value(created["managed_draft"]["id"].clone()).unwrap();
+        let adapter = Arc::new(TimeoutThenReconcileAdapter::default());
+        adapter.fail_reconcile.store(true, Ordering::SeqCst);
+        let app = router(AppState::new(state.database.clone(), adapter.clone()));
+        let (status, _) = json_request(
+            &app,
+            Method::POST,
+            format!("/api/v1/connections/{connection}/drafts/{id}/prepare-send"),
+            &credential,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            state
+                .repository
+                .as_ref()
+                .unwrap()
+                .get_draft(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ManagedDraftState::Active
+        );
+        assert_eq!(adapter.send_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn durable_confirmation_survives_restart_and_replays_first_result() {
         let (state, credential, connection, _) = persisted_state().await;
         let app = router(state.clone());
@@ -5265,13 +5579,6 @@ mod tests {
         ));
 
         let adapter = Arc::new(TimeoutThenReconcileAdapter::default());
-        adapter
-            .inner
-            .insert_draft(
-                connection,
-                serde_json::from_value(created["draft"].clone()).unwrap(),
-            )
-            .await;
         let restarted = AppState::new(state.database.clone(), adapter.clone());
         let (status, result) = json_request(
             &router(restarted),
@@ -5293,66 +5600,69 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_reconciles_once_and_replay_never_sends_again() {
-        let (state, credential, connection, _) = persisted_state().await;
-        let app = router(state.clone());
-        let (_, created) = json_request(
-            &app,
-            Method::POST,
-            format!("/api/v1/connections/{connection}/drafts"),
-            &credential,
-            json!({"subject":"timeout","body":"body","to":["to@example.com"]}),
-        )
-        .await;
-        let draft_id = created["managed_draft"]["id"].as_str().unwrap();
-        let (_, prepared) = json_request(
-            &app,
-            Method::POST,
-            format!("/api/v1/connections/{connection}/drafts/{draft_id}/prepare-send"),
-            &credential,
-            json!({}),
-        )
-        .await;
-        let token = prepared["confirmation_token"].as_str().unwrap();
-        let adapter = Arc::new(TimeoutThenReconcileAdapter::default());
-        adapter
-            .inner
-            .insert_draft(
-                connection,
-                serde_json::from_value(created["draft"].clone()).unwrap(),
+        for not_found in [false, true] {
+            let (state, credential, connection, _) = persisted_state().await;
+            let app = router(state.clone());
+            let (_, created) = json_request(
+                &app,
+                Method::POST,
+                format!("/api/v1/connections/{connection}/drafts"),
+                &credential,
+                json!({"subject":"timeout","body":"body","to":["to@example.com"]}),
             )
             .await;
-        let restarted = AppState::new(state.database.clone(), adapter.clone());
-        let restarted_app = router(restarted);
-        let request = json!({"confirmation_token":token});
-        let (status, first) = json_request(
-            &restarted_app,
-            Method::POST,
-            format!("/api/v1/connections/{connection}/drafts/{draft_id}/send"),
-            &credential,
-            request.clone(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            first["outcome"],
-            json!({"Sent":{"gmail_message_id":"reconciled-message"}})
-        );
-        assert_eq!(adapter.send_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(adapter.reconcile_calls.load(Ordering::SeqCst), 1);
+            let draft_id = created["managed_draft"]["id"].as_str().unwrap();
+            let (_, prepared) = json_request(
+                &app,
+                Method::POST,
+                format!("/api/v1/connections/{connection}/drafts/{draft_id}/prepare-send"),
+                &credential,
+                json!({}),
+            )
+            .await;
+            let token = prepared["confirmation_token"].as_str().unwrap();
+            let adapter = Arc::new(TimeoutThenReconcileAdapter::default());
+            adapter.remove_on_send.store(true, Ordering::SeqCst);
+            adapter.send_not_found.store(not_found, Ordering::SeqCst);
+            adapter
+                .inner
+                .insert_draft(
+                    connection,
+                    serde_json::from_value(created["draft"].clone()).unwrap(),
+                )
+                .await;
+            let restarted = AppState::new(state.database.clone(), adapter.clone());
+            let restarted_app = router(restarted);
+            let request = json!({"confirmation_token":token});
+            let (status, first) = json_request(
+                &restarted_app,
+                Method::POST,
+                format!("/api/v1/connections/{connection}/drafts/{draft_id}/send"),
+                &credential,
+                request.clone(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                first["outcome"],
+                json!({"Sent":{"gmail_message_id":"reconciled-message"}})
+            );
+            assert_eq!(adapter.send_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(adapter.reconcile_calls.load(Ordering::SeqCst), 1);
 
-        let (_, replay) = json_request(
-            &restarted_app,
-            Method::POST,
-            format!("/api/v1/connections/{connection}/drafts/{draft_id}/send"),
-            &credential,
-            request,
-        )
-        .await;
-        assert_eq!(replay["replayed"], true);
-        assert_eq!(adapter.send_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(adapter.reconcile_calls.load(Ordering::SeqCst), 1);
-        let repository = state.repository.as_ref().unwrap();
-        let counts: Vec<i64> = sqlx::query_scalar(
+            let (_, replay) = json_request(
+                &restarted_app,
+                Method::POST,
+                format!("/api/v1/connections/{connection}/drafts/{draft_id}/send"),
+                &credential,
+                request,
+            )
+            .await;
+            assert_eq!(replay["replayed"], true);
+            assert_eq!(adapter.send_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(adapter.reconcile_calls.load(Ordering::SeqCst), 1);
+            let repository = state.repository.as_ref().unwrap();
+            let counts: Vec<i64> = sqlx::query_scalar(
             "SELECT request_count FROM rate_limit_buckets WHERE bucket_key IN (?,?) ORDER BY bucket_key",
         )
         .bind(format!("send_per_day:{connection}"))
@@ -5360,14 +5670,15 @@ mod tests {
         .fetch_all(repository.pool())
         .await
         .unwrap();
-        assert_eq!(counts, vec![1, 1], "replay must not consume send quota");
-        let send_audits: i64 = sqlx::query_scalar(
+            assert_eq!(counts, vec![1, 1], "replay must not consume send quota");
+            let send_audits: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM audit_events WHERE operation='draft.send' AND result_category='ok'",
         )
         .fetch_one(repository.pool())
         .await
         .unwrap();
-        assert_eq!(send_audits, 2, "initial send and replay are both audited");
+            assert_eq!(send_audits, 2, "initial send and replay are both audited");
+        }
     }
 
     #[tokio::test]

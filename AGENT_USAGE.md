@@ -152,6 +152,16 @@ REST 返回 `outcome`；MCP 成功结果在 `structuredContent` 中包含同样�
 
 可用 `messages.search` 的 Gmail 查询 `in:sent rfc822msgid:<原稳定Message-ID>` 做只读核对。找到匹配是已发送的证据；暂时查不到不是未发送的证据。未解决的不确定状态交给用户，不以盲重发结束任务。
 
+### 人工在 Gmail 发送或丢弃草稿
+
+可以让 agent 创建草稿，再由人工在 Gmail 编辑、审核并发送。服务没有后台同步；后续 `drafts.get`（使用原 Gmail draft ID）或 managed draft 写操作发现草稿不存在时，会按登记的稳定 Message-ID 查询 Sent，只接受唯一、header 精确匹配且带 `SENT` 标签的结果。
+
+- 找到：持久化 `sent`；写操作返回 HTTP 409 `draft_already_sent`，不要重建或重发。
+- 查不到或匹配不唯一：持久化 `send_state_unknown`；写操作返回 HTTP 409 `draft_missing`，不能推断已删除或未发送。后续只读查询可以再次对账。
+- 查询 Gmail 失败：返回上游错误，保留原状态，不把查询失败当成已发送或已删除。
+
+上述缺失草稿的 `drafts.get` 返回 `draft: null`、`managed_by_agentmail: true` 和 `managed_draft`（包含 `state`）；`gmail_message_id` 仅在本次对账找到消息时有值，其他情况可为 null，不能据此否定已持久化的 `sent`。草稿列表只列 Gmail 当前存在的草稿。非 managed 草稿不存在时仍返回 404。人工编辑若改变 Message-ID，旧登记身份可能无法精确对账，此时停留在未知状态，交给人工核对。不要让 agent 和人工同时修改或发送同一草稿。
+
 ## 8. REST 路由速查
 
 下表的相对路径都位于 `/api/v1/connections/{connection_id}` 下；唯独列 Connection 是 `GET /api/v1/connections`。
@@ -189,6 +199,7 @@ REST 错误格式通常为 `{"error":{"code":"...","message":"...","request_id":
 | MCP 403 `Host header is not allowed` | 实例的 MCP Host 白名单与入口域名不匹配；请管理员核对 `PUBLIC_BASE_URL` 和代理 Host 转发。不要伪造 Host、关闭 Host 校验或切换到旧式 SSE 绕过 |
 | 403 `reauth_required` | 请人类在 Panel 重新授权 Gmail；agent 不接管 OAuth callback |
 | 409 `draft_changed` / conflict | 重新只读核对当前草稿；内容变化必须重新确认，不强行覆盖 |
+| 409 `draft_already_sent` / `draft_missing` | 已发送或去向未确认；停止写操作，不重建、不重发，可用原 Gmail draft ID 查询登记状态 |
 | `invalid_confirmation` | Token 无效、过期或绑定已改变；先核对是否已有发送记录，不直接重发 |
 | 429 / `rate_limited` | 按 `Retry-After` / `retry_after_seconds` 退避，禁止紧循环 |
 | 5xx / `upstream_unavailable` | 读取可有限退避重试；写入先判断是否可能已生效，发送一律保守处理 |

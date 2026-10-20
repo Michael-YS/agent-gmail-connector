@@ -1170,7 +1170,7 @@ async fn openapi_describes_every_rest_route_and_write_contract() {
     ));
     assert_eq!(
         openapi_digest,
-        "3aef9a061147245c77c098706f1e3e340d26090f990856b6489453dae5ee3909"
+        "022643d2582a6fb5877708eb3416d0a104f6e40fec38a0dcc6c77887348f0c2c"
     );
     let expected = [
         ("/api/v1/connections", &["get"][..]),
@@ -1230,6 +1230,13 @@ async fn openapi_describes_every_rest_route_and_write_contract() {
     );
     assert!(document["components"]["schemas"]["AttachmentInfo"].is_object());
     assert!(document["components"]["schemas"]["PrepareSendResponse"].is_object());
+    let draft = &document["components"]["schemas"]["DraftResponse"]["properties"];
+    assert_eq!(draft["draft"]["anyOf"][1]["type"], "null");
+    assert_eq!(
+        draft["managed_draft"]["$ref"],
+        "#/components/schemas/ManagedDraft"
+    );
+    assert_eq!(draft["gmail_message_id"]["type"], json!(["string", "null"]));
     assert!(document["components"]["responses"]["RateLimited"].is_object());
 }
 
